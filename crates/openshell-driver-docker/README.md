@@ -32,9 +32,26 @@ contract:
 | `apparmor=unconfined` | Avoids Docker's default profile blocking required mount operations. |
 | `restart_policy = unless-stopped` | Keeps managed sandboxes resumable across daemon or gateway restarts. |
 | `PidsLimit` | Enforces the sandbox PID budget at the Docker cgroup layer. Set `[openshell.drivers.docker].sandbox_pids_limit = 0` to inherit the Docker/runtime default. |
+| `workspace_volume_name` | Optional Docker named volume mounted at `workspace_volume_mount_path`. Disabled when empty; intended for managed persistent sandbox state without host bind mounts. |
 | CDI GPU request | Uses the sandbox `gpu_device` value when set; otherwise requests all NVIDIA GPUs when the sandbox spec asks for GPU support and daemon CDI support is detected. |
 
 The agent child process does not retain these supervisor privileges.
+
+## Persistent Workspace Volume
+
+Docker sandboxes are ephemeral by default. To attach a managed Docker named
+volume, configure:
+
+```toml
+[openshell.drivers.docker]
+workspace_volume_name = "aegis-org-agent-runtime"
+workspace_volume_mount_path = "/sandbox/.aegis/runtimes"
+```
+
+The mount path must be `/sandbox` or a descendant of `/sandbox`. The driver
+does not expose arbitrary host bind mounts; callers that need labels, retention,
+or explicit lifecycle ownership should create/manage the named volume outside the
+driver and configure the gateway to attach it.
 
 ## Supervisor Binary Resolution
 

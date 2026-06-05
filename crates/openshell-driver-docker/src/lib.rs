@@ -69,6 +69,7 @@ const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 const DOCKER_NETWORK_DRIVER: &str = "bridge";
+const DEFAULT_WORKSPACE_VOLUME_MOUNT_PATH: &str = "/sandbox";
 
 /// Default image holding the Linux `openshell-sandbox` binary. The gateway
 /// pulls this image and extracts the binary to a host-side cache when no
@@ -176,6 +177,17 @@ pub struct DockerComputeConfig {
     ///
     /// Set to `0` to leave Docker's runtime/default PID limit unchanged.
     pub sandbox_pids_limit: i64,
+
+    /// Optional Docker named volume mounted into each sandbox container.
+    ///
+    /// This is intentionally a named volume, not a host bind mount. Leave empty
+    /// to keep Docker sandboxes ephemeral.
+    pub workspace_volume_name: String,
+
+    /// Container path for `workspace_volume_name`.
+    ///
+    /// Must be `/sandbox` or a descendant of `/sandbox`.
+    pub workspace_volume_mount_path: String,
 }
 
 impl Default for DockerComputeConfig {
@@ -194,6 +206,8 @@ impl Default for DockerComputeConfig {
             host_gateway_ip: String::new(),
             ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
+            workspace_volume_name: String::new(),
+            workspace_volume_mount_path: DEFAULT_WORKSPACE_VOLUME_MOUNT_PATH.to_string(),
         }
     }
 }
@@ -221,6 +235,8 @@ struct DockerDriverRuntimeConfig {
     daemon_version: String,
     supports_gpu: bool,
     sandbox_pids_limit: i64,
+    workspace_volume_name: String,
+    workspace_volume_mount_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,6 +296,10 @@ impl DockerComputeDriver {
             .as_ref()
             .is_some_and(|dirs| !dirs.is_empty());
         validate_sandbox_pids_limit(docker_config.sandbox_pids_limit)?;
+        validate_workspace_volume_config(
+            &docker_config.workspace_volume_name,
+            &docker_config.workspace_volume_mount_path,
+        )?;
         let gateway_port = config.bind_address.port();
         if gateway_port == 0 {
             return Err(Error::config(
@@ -327,6 +347,11 @@ impl DockerComputeDriver {
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
                 supports_gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
+                workspace_volume_name: docker_config.workspace_volume_name.trim().to_string(),
+                workspace_volume_mount_path: docker_config
+                    .workspace_volume_mount_path
+                    .trim()
+                    .to_string(),
             },
             events: broadcast::channel(WATCH_BUFFER).0,
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -1534,7 +1559,23 @@ fn build_binds(
             SANDBOX_TOKEN_MOUNT_PATH
         ));
     }
+    if let Some(bind) = workspace_volume_bind(config) {
+        binds.push(bind);
+    }
     Ok(binds)
+}
+
+fn workspace_volume_bind(config: &DockerDriverRuntimeConfig) -> Option<String> {
+    let name = config.workspace_volume_name.trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "{}:{}:rw",
+        name,
+        config.workspace_volume_mount_path.trim()
+    ))
 }
 
 fn sandbox_token_host_path(
@@ -2063,6 +2104,51 @@ fn validate_sandbox_pids_limit(value: i64) -> CoreResult<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_workspace_volume_config(name: &str, mount_path: &str) -> CoreResult<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(());
+    }
+
+    if !valid_docker_volume_name(name) {
+        return Err(Error::config(
+            "docker workspace_volume_name must contain only ASCII letters, digits, '.', '_' or '-' and must not contain path separators or ':'",
+        ));
+    }
+
+    let mount_path = mount_path.trim();
+    if !valid_workspace_volume_mount_path(mount_path) {
+        return Err(Error::config(
+            "docker workspace_volume_mount_path must be /sandbox or a descendant path without '.', '..', empty segments, ':' or null bytes",
+        ));
+    }
+
+    Ok(())
+}
+
+fn valid_docker_volume_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains(':')
+}
+
+fn valid_workspace_volume_mount_path(path: &str) -> bool {
+    if path != "/sandbox" && !path.starts_with("/sandbox/") {
+        return false;
+    }
+    if path.contains(':') || path.as_bytes().contains(&0) {
+        return false;
+    }
+
+    path.split('/')
+        .skip(1)
+        .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
 }
 
 fn docker_pids_limit(value: i64) -> Result<Option<i64>, Status> {

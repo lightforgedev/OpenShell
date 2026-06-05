@@ -76,6 +76,8 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         daemon_version: "28.0.0".to_string(),
         supports_gpu: false,
         sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
+        workspace_volume_name: String::new(),
+        workspace_volume_mount_path: DEFAULT_WORKSPACE_VOLUME_MOUNT_PATH.to_string(),
     }
 }
 
@@ -520,6 +522,40 @@ fn build_binds_uses_docker_tls_directory() {
         targets
             .iter()
             .all(|target| target.starts_with(TLS_MOUNT_DIR) || target == SUPERVISOR_MOUNT_PATH)
+    );
+}
+
+#[test]
+fn build_binds_adds_configured_workspace_volume() {
+    let mut config = runtime_config();
+    config.workspace_volume_name = "aegis-org-agent-runtime".to_string();
+    config.workspace_volume_mount_path = "/sandbox/.aegis/runtimes".to_string();
+
+    let binds = build_binds(&test_sandbox(), &config).unwrap();
+
+    assert!(binds.contains(&"aegis-org-agent-runtime:/sandbox/.aegis/runtimes:rw".to_string()));
+}
+
+#[test]
+fn workspace_volume_config_validates_name_and_mount_path() {
+    assert!(validate_workspace_volume_config("", "/not/used").is_ok());
+    assert!(validate_workspace_volume_config("aegis-org_agent.runtime-1", "/sandbox").is_ok());
+    assert!(
+        validate_workspace_volume_config("aegis-org_agent.runtime-1", "/sandbox/.aegis/runtimes")
+            .is_ok()
+    );
+
+    let bad_name = validate_workspace_volume_config("aegis/state", "/sandbox").unwrap_err();
+    assert!(bad_name.to_string().contains("workspace_volume_name"));
+
+    let bad_path = validate_workspace_volume_config("aegis-state", "/etc/openshell").unwrap_err();
+    assert!(bad_path.to_string().contains("workspace_volume_mount_path"));
+
+    let traversal = validate_workspace_volume_config("aegis-state", "/sandbox/../etc").unwrap_err();
+    assert!(
+        traversal
+            .to_string()
+            .contains("workspace_volume_mount_path")
     );
 }
 
