@@ -5,17 +5,18 @@
 
 #![allow(clippy::result_large_err)]
 
-use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, CreateImageInfo,
     DeviceRequest, EndpointSettings, HostConfig, NetworkCreateRequest, NetworkingConfig,
-    ProgressDetail, RestartPolicy, RestartPolicyNameEnum, SystemInfo,
+    ProgressDetail, RestartPolicy, RestartPolicyNameEnum, SystemInfo, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
-    ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, StopContainerOptionsBuilder,
+    ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, RemoveVolumeOptionsBuilder,
+    StopContainerOptionsBuilder, UploadToContainerOptionsBuilder,
 };
+use bollard::{Docker, body_full};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use openshell_core::config::{
@@ -64,6 +65,8 @@ const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
 const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
 const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
 const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
+const SANDBOX_TOKEN_AUTH_DIR: &str = "/etc/openshell/auth";
+const SANDBOX_TOKEN_INIT_AUTH_DIR: &str = "/auth";
 const SANDBOX_COMMAND: &str = "sleep infinity";
 const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
@@ -547,20 +550,34 @@ impl DockerComputeDriver {
             .map_err(|status| {
                 DockerProvisioningFailure::new("ImagePullFailed", status.message())
             })?;
-        let token_file_created = write_sandbox_token_file(sandbox, &self.config)
+        let token_volume_created = self
+            .write_sandbox_token_volume(sandbox, &template.image)
             .await
             .map_err(|status| {
                 DockerProvisioningFailure::new("SandboxTokenWriteFailed", status.message())
             })?;
 
         let container_name = container_name_for_sandbox(sandbox);
-        let create_body = build_container_create_body(sandbox, &self.config).map_err(|status| {
-            if token_file_created {
-                cleanup_sandbox_token_file(sandbox, &self.config);
+        let create_body = match build_container_create_body(sandbox, &self.config) {
+            Ok(create_body) => create_body,
+            Err(status) => {
+                if token_volume_created
+                    && let Err(cleanup_err) = self.cleanup_sandbox_token_volume(sandbox).await
+                {
+                    warn!(
+                        sandbox_id = %sandbox.id,
+                        error = %cleanup_err,
+                        "Failed to clean up Docker sandbox token volume after create body failure"
+                    );
+                }
+                return Err(DockerProvisioningFailure::new(
+                    "ContainerCreateFailed",
+                    status.message(),
+                ));
             }
-            DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
-        })?;
-        self.docker
+        };
+        if let Err(err) = self
+            .docker
             .create_container(
                 Some(
                     CreateContainerOptionsBuilder::default()
@@ -570,15 +587,21 @@ impl DockerComputeDriver {
                 create_body,
             )
             .await
-            .map_err(|err| {
-                if token_file_created {
-                    cleanup_sandbox_token_file(sandbox, &self.config);
-                }
-                DockerProvisioningFailure::from_status(
-                    "ContainerCreateFailed",
-                    create_status_from_docker_error("create docker sandbox container", err),
-                )
-            })?;
+        {
+            if token_volume_created
+                && let Err(cleanup_err) = self.cleanup_sandbox_token_volume(sandbox).await
+            {
+                warn!(
+                    sandbox_id = %sandbox.id,
+                    error = %cleanup_err,
+                    "Failed to clean up Docker sandbox token volume after create failure"
+                );
+            }
+            return Err(DockerProvisioningFailure::from_status(
+                "ContainerCreateFailed",
+                create_status_from_docker_error("create docker sandbox container", err),
+            ));
+        }
         self.publish_docker_progress(
             &sandbox.id,
             "Created",
@@ -602,8 +625,14 @@ impl DockerComputeDriver {
                     "Failed to clean up Docker container after start failure"
                 );
             }
-            if token_file_created {
-                cleanup_sandbox_token_file(sandbox, &self.config);
+            if token_volume_created
+                && let Err(cleanup_err) = self.cleanup_sandbox_token_volume(sandbox).await
+            {
+                warn!(
+                    sandbox_id = %sandbox.id,
+                    error = %cleanup_err,
+                    "Failed to clean up Docker sandbox token volume after start failure"
+                );
             }
             return Err(DockerProvisioningFailure::from_status(
                 "ContainerStartFailed",
@@ -657,11 +686,13 @@ impl DockerComputeDriver {
                     .await
                 {
                     Ok(()) => {
-                        cleanup_sandbox_token_file(&record.sandbox, &self.config);
+                        self.cleanup_sandbox_token_volume_best_effort(&record.sandbox)
+                            .await;
                         return Ok(true);
                     }
                     Err(err) if is_not_found_error(&err) => {
-                        cleanup_sandbox_token_file(&record.sandbox, &self.config);
+                        self.cleanup_sandbox_token_volume_best_effort(&record.sandbox)
+                            .await;
                         return Ok(true);
                     }
                     Err(err) => {
@@ -684,11 +715,13 @@ impl DockerComputeDriver {
             .await
         {
             Ok(()) => {
-                cleanup_sandbox_token_file_for_delete(sandbox_id, pending.as_ref(), &self.config);
+                self.cleanup_sandbox_token_volume_for_delete(sandbox_id, pending.as_ref())
+                    .await;
                 Ok(true)
             }
             Err(err) if is_not_found_error(&err) => {
-                cleanup_sandbox_token_file_for_delete(sandbox_id, pending.as_ref(), &self.config);
+                self.cleanup_sandbox_token_volume_for_delete(sandbox_id, pending.as_ref())
+                    .await;
                 Ok(pending.is_some())
             }
             Err(err) => Err(internal_status("delete docker sandbox container", err)),
@@ -704,7 +737,8 @@ impl DockerComputeDriver {
                 if let Some(task) = record.task {
                     task.abort();
                 }
-                cleanup_sandbox_token_file(&record.sandbox, &self.config);
+                self.cleanup_sandbox_token_volume_best_effort(&record.sandbox)
+                    .await;
                 self.publish_deleted(record.sandbox.id);
                 return Ok(());
             }
@@ -899,7 +933,7 @@ impl DockerComputeDriver {
         sandbox: &DriverSandbox,
         failure: &DockerProvisioningFailure,
     ) {
-        cleanup_sandbox_token_file(sandbox, &self.config);
+        self.cleanup_sandbox_token_volume_best_effort(sandbox).await;
         let snapshot = pending_sandbox_snapshot(
             sandbox,
             &self.config.sandbox_namespace,
@@ -926,6 +960,177 @@ impl DockerComputeDriver {
             ),
         );
         self.publish_sandbox_snapshot(snapshot);
+    }
+
+    async fn write_sandbox_token_volume(
+        &self,
+        sandbox: &DriverSandbox,
+        image: &str,
+    ) -> Result<bool, Status> {
+        let Some(spec) = sandbox.spec.as_ref() else {
+            return Ok(false);
+        };
+        if spec.sandbox_token.is_empty() {
+            return Ok(false);
+        }
+
+        let volume_name = sandbox_token_volume_name(sandbox, &self.config);
+        let helper_name = sandbox_token_init_container_name(sandbox, &self.config);
+        let labels = HashMap::from([
+            (
+                LABEL_MANAGED_BY.to_string(),
+                LABEL_MANAGED_BY_VALUE.to_string(),
+            ),
+            (LABEL_SANDBOX_ID.to_string(), sandbox.id.clone()),
+            (LABEL_SANDBOX_NAME.to_string(), sandbox.name.clone()),
+            (
+                LABEL_SANDBOX_NAMESPACE.to_string(),
+                self.config.sandbox_namespace.clone(),
+            ),
+        ]);
+
+        self.docker
+            .create_volume(VolumeCreateRequest {
+                name: Some(volume_name.clone()),
+                labels: Some(labels.clone()),
+                ..Default::default()
+            })
+            .await
+            .map_err(|err| internal_status("create docker sandbox token volume", err))?;
+
+        if let Err(err) = self
+            .docker
+            .remove_container(
+                &helper_name,
+                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+            )
+            .await
+            && !is_not_found_error(&err)
+        {
+            self.cleanup_sandbox_token_volume_by_id(&sandbox.id).await?;
+            return Err(internal_status(
+                "remove stale docker sandbox token init container",
+                err,
+            ));
+        }
+
+        let create_body = ContainerCreateBody {
+            image: Some(image.to_string()),
+            user: Some("0".to_string()),
+            cmd: Some(vec!["true".to_string()]),
+            labels: Some(labels),
+            host_config: Some(HostConfig {
+                binds: Some(vec![format!(
+                    "{volume_name}:{SANDBOX_TOKEN_INIT_AUTH_DIR}:rw"
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        if let Err(err) = self
+            .docker
+            .create_container(
+                Some(
+                    CreateContainerOptionsBuilder::default()
+                        .name(helper_name.as_str())
+                        .build(),
+                ),
+                create_body,
+            )
+            .await
+        {
+            self.cleanup_sandbox_token_volume_by_id(&sandbox.id).await?;
+            return Err(internal_status(
+                "create docker sandbox token init container",
+                err,
+            ));
+        }
+
+        let archive = build_sandbox_token_archive(&spec.sandbox_token)?;
+        let upload = self
+            .docker
+            .upload_to_container(
+                &helper_name,
+                Some(
+                    UploadToContainerOptionsBuilder::default()
+                        .path(SANDBOX_TOKEN_INIT_AUTH_DIR)
+                        .build(),
+                ),
+                body_full(Bytes::from(archive)),
+            )
+            .await;
+
+        let remove_helper = self
+            .docker
+            .remove_container(
+                &helper_name,
+                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+            )
+            .await;
+
+        if let Err(err) = upload {
+            self.cleanup_sandbox_token_volume_by_id(&sandbox.id).await?;
+            return Err(internal_status("write docker sandbox token archive", err));
+        }
+        if let Err(err) = remove_helper
+            && !is_not_found_error(&err)
+        {
+            self.cleanup_sandbox_token_volume_by_id(&sandbox.id).await?;
+            return Err(internal_status(
+                "remove docker sandbox token init container",
+                err,
+            ));
+        }
+
+        Ok(true)
+    }
+
+    async fn cleanup_sandbox_token_volume_best_effort(&self, sandbox: &DriverSandbox) {
+        if let Err(err) = self.cleanup_sandbox_token_volume(sandbox).await {
+            warn!(
+                sandbox_id = %sandbox.id,
+                error = %err,
+                "Failed to clean up Docker sandbox token volume"
+            );
+        }
+    }
+
+    async fn cleanup_sandbox_token_volume_for_delete(
+        &self,
+        sandbox_id: &str,
+        pending: Option<&PendingSandboxRecord>,
+    ) {
+        if let Some(record) = pending {
+            self.cleanup_sandbox_token_volume_best_effort(&record.sandbox)
+                .await;
+        } else if let Err(err) = self.cleanup_sandbox_token_volume_by_id(sandbox_id).await {
+            warn!(
+                sandbox_id,
+                error = %err,
+                "Failed to clean up Docker sandbox token volume"
+            );
+        }
+    }
+
+    async fn cleanup_sandbox_token_volume(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
+        self.cleanup_sandbox_token_volume_by_id(&sandbox.id).await
+    }
+
+    async fn cleanup_sandbox_token_volume_by_id(&self, sandbox_id: &str) -> Result<(), Status> {
+        let volume_name = sandbox_token_volume_name_by_id(sandbox_id, &self.config);
+        match self
+            .docker
+            .remove_volume(
+                &volume_name,
+                Some(RemoveVolumeOptionsBuilder::default().force(true).build()),
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(err) if is_not_found_error(&err) => Ok(()),
+            Err(err) => Err(internal_status("delete docker sandbox token volume", err)),
+        }
     }
 
     async fn publish_container_snapshot(
@@ -1554,9 +1759,9 @@ fn build_binds(
         .is_some_and(|spec| !spec.sandbox_token.is_empty())
     {
         binds.push(format!(
-            "{}:{}:ro,z",
-            sandbox_token_host_path(sandbox, config)?.display(),
-            SANDBOX_TOKEN_MOUNT_PATH
+            "{}:{}:ro",
+            sandbox_token_volume_name(sandbox, config),
+            SANDBOX_TOKEN_AUTH_DIR
         ));
     }
     if let Some(bind) = workspace_volume_bind(config) {
@@ -1578,98 +1783,71 @@ fn workspace_volume_bind(config: &DockerDriverRuntimeConfig) -> Option<String> {
     ))
 }
 
-fn sandbox_token_host_path(
+fn sandbox_token_volume_name(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
-) -> Result<PathBuf, Status> {
-    sandbox_token_host_path_by_id(&sandbox.id, config)
+) -> String {
+    sandbox_token_volume_name_by_id(&sandbox.id, config)
 }
 
-fn sandbox_token_host_path_by_id(
-    sandbox_id: &str,
-    config: &DockerDriverRuntimeConfig,
-) -> Result<PathBuf, Status> {
-    openshell_core::driver_utils::sandbox_token_path(
-        "docker-sandbox-tokens",
-        Some(&config.sandbox_namespace),
-        sandbox_id,
+fn sandbox_token_volume_name_by_id(sandbox_id: &str, config: &DockerDriverRuntimeConfig) -> String {
+    format!(
+        "openshell-token-{}-{}",
+        docker_name_part(&config.sandbox_namespace),
+        docker_name_part(sandbox_id)
     )
-    .map_err(|err| {
-        Status::internal(format!(
-            "resolve sandbox token state directory failed: {err}"
-        ))
-    })
 }
 
-async fn write_sandbox_token_file(
+fn sandbox_token_init_container_name(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
-) -> Result<bool, Status> {
-    let Some(spec) = sandbox.spec.as_ref() else {
-        return Ok(false);
-    };
-    if spec.sandbox_token.is_empty() {
-        return Ok(false);
-    }
-    let path = sandbox_token_host_path(sandbox, config)?;
-    if let Some(parent) = path.parent() {
-        openshell_core::paths::create_dir_restricted(parent).map_err(|err| {
-            Status::internal(format!(
-                "create sandbox token directory {} failed: {err}",
-                parent.display()
-            ))
-        })?;
-    }
-    tokio::fs::write(&path, format!("{}\n", spec.sandbox_token))
-        .await
-        .map_err(|err| {
-            Status::internal(format!(
-                "write sandbox token file {} failed: {err}",
-                path.display()
-            ))
-        })?;
-    openshell_core::paths::set_file_owner_only(&path).map_err(|err| {
-        Status::internal(format!(
-            "restrict sandbox token file {} failed: {err}",
-            path.display()
-        ))
-    })?;
-    Ok(true)
+) -> String {
+    format!(
+        "openshell-token-init-{}-{}",
+        docker_name_part(&config.sandbox_namespace),
+        docker_name_part(&sandbox.id)
+    )
 }
 
-fn cleanup_sandbox_token_file(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) {
-    cleanup_sandbox_token_file_by_id(&sandbox.id, config);
-}
-
-fn cleanup_sandbox_token_file_for_delete(
-    sandbox_id: &str,
-    pending: Option<&PendingSandboxRecord>,
-    config: &DockerDriverRuntimeConfig,
-) {
-    if !sandbox_id.is_empty() {
-        cleanup_sandbox_token_file_by_id(sandbox_id, config);
-    } else if let Some(record) = pending {
-        cleanup_sandbox_token_file(&record.sandbox, config);
+fn docker_name_part(value: &str) -> String {
+    let part: String = value
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-' => ch,
+            _ => '-',
+        })
+        .collect();
+    if part.is_empty() {
+        "default".to_string()
+    } else {
+        part
     }
 }
 
-fn cleanup_sandbox_token_file_by_id(sandbox_id: &str, config: &DockerDriverRuntimeConfig) {
-    let Ok(path) = sandbox_token_host_path_by_id(sandbox_id, config) else {
-        return;
-    };
-    if let Err(err) = std::fs::remove_file(&path)
-        && err.kind() != std::io::ErrorKind::NotFound
+fn build_sandbox_token_archive(token: &str) -> Result<Vec<u8>, Status> {
+    let mut archive = Vec::new();
     {
-        warn!(
-            sandbox_id = %sandbox_id,
-            path = %path.display(),
-            error = %err,
-            "Failed to remove Docker sandbox token file"
-        );
+        let mut builder = tar::Builder::new(&mut archive);
+        let contents = format!("{token}\n");
+        let mut header = tar::Header::new_gnu();
+        header.set_path("sandbox.jwt").map_err(|err| {
+            Status::internal(format!("build sandbox token archive path failed: {err}"))
+        })?;
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o600);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_cksum();
+        builder
+            .append(&header, contents.as_bytes())
+            .map_err(|err| {
+                Status::internal(format!("build sandbox token archive failed: {err}"))
+            })?;
+        builder.finish().map_err(|err| {
+            Status::internal(format!("finish sandbox token archive failed: {err}"))
+        })?;
     }
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::remove_dir(dir);
-    }
+    Ok(archive)
 }
 
 fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) -> Vec<String> {

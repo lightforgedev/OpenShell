@@ -537,6 +537,24 @@ fn build_binds_adds_configured_workspace_volume() {
 }
 
 #[test]
+fn build_binds_mounts_sandbox_token_as_docker_volume() {
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().sandbox_token = "secret.jwt.value".to_string();
+
+    let binds = build_binds(&sandbox, &runtime_config()).unwrap();
+
+    assert!(binds.contains(&format!(
+        "openshell-token-default-{}:{SANDBOX_TOKEN_AUTH_DIR}:ro",
+        sandbox.id
+    )));
+    assert!(
+        !binds
+            .iter()
+            .any(|bind| bind.contains("docker-sandbox-tokens") || bind.contains("sandbox.jwt:"))
+    );
+}
+
+#[test]
 fn workspace_volume_config_validates_name_and_mount_path() {
     assert!(validate_workspace_volume_config("", "/not/used").is_ok());
     assert!(validate_workspace_volume_config("aegis-org_agent.runtime-1", "/sandbox").is_ok());
