@@ -1296,6 +1296,26 @@ enum SandboxCommands {
         policy_only: bool,
     },
 
+    /// Watch sandbox lifecycle snapshots as JSON lines.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Watch {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Exit successfully after observing the Deleting phase.
+        #[arg(long)]
+        exit_on_deleting: bool,
+
+        /// Include public platform events in the stream.
+        #[arg(long)]
+        events: bool,
+
+        /// Idle timeout in seconds while waiting for stream events. 0 disables timeout.
+        #[arg(long, default_value_t = 0)]
+        timeout: u64,
+    },
+
     /// List sandboxes.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List {
@@ -2700,6 +2720,23 @@ async fn main() -> Result<()> {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
                             run::sandbox_get(endpoint, &name, policy_only, &tls).await?;
                         }
+                        SandboxCommands::Watch {
+                            name,
+                            exit_on_deleting,
+                            events,
+                            timeout,
+                        } => {
+                            let name = resolve_sandbox_name(name, &ctx.name)?;
+                            run::sandbox_watch(
+                                endpoint,
+                                &name,
+                                timeout,
+                                exit_on_deleting,
+                                events,
+                                &tls,
+                            )
+                            .await?;
+                        }
                         SandboxCommands::List {
                             limit,
                             offset,
@@ -3757,6 +3794,33 @@ mod tests {
                     ..
                 })
             })
+        ));
+    }
+
+    #[test]
+    fn sandbox_watch_parses_deleting_guard() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "watch",
+            "aegis-governance-phase1",
+            "--exit-on-deleting",
+            "--events",
+            "--timeout",
+            "30",
+        ])
+        .expect("sandbox watch should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Watch {
+                    name: Some(name),
+                    exit_on_deleting: true,
+                    events: true,
+                    timeout: 30,
+                })
+            }) if name == "aegis-governance-phase1"
         ));
     }
 
