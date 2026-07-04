@@ -3,9 +3,13 @@
 
 //! Gateway-owned compute orchestration over a pluggable compute backend.
 
+pub mod driver_config;
+pub mod lease;
 pub mod vm;
 
 pub use openshell_driver_docker::DockerComputeConfig;
+pub use openshell_driver_kubernetes::KubernetesComputeConfig;
+pub use openshell_driver_podman::PodmanComputeConfig;
 pub use vm::VmComputeConfig;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
@@ -15,14 +19,16 @@ use crate::sandbox_watch::SandboxWatchBus;
 use crate::supervisor_session::SupervisorSessionRegistry;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
+use hyper_util::rt::TokioIo;
 use openshell_core::ComputeDriverKind;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
     DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
-    DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest, ListSandboxesRequest,
-    ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
-    watch_sandboxes_event,
+    DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest,
+    GpuResourceRequirements as DriverGpuResourceRequirements, ListSandboxesRequest,
+    ResourceRequirements as DriverSandboxResourceRequirements, ValidateSandboxCreateRequest,
+    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
+    compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
@@ -30,25 +36,29 @@ use openshell_core::proto::{
 };
 use openshell_driver_docker::DockerComputeDriver;
 use openshell_driver_kubernetes::{
-    ComputeDriverService, KubernetesComputeConfig, KubernetesComputeDriver,
+    ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
 };
-use openshell_driver_podman::{
-    ComputeDriverService as PodmanDriverService, PodmanComputeConfig, PodmanComputeDriver,
-};
+use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
-use tonic::transport::Channel;
+#[cfg(unix)]
+use tokio::net::UnixStream;
+use tokio::sync::{Mutex, watch};
+use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status};
-use tracing::{info, warn};
+use tower::service_fn;
+use tracing::{debug, info, warn};
 
 type DriverWatchStream = Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
 type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
+
+const DELETE_PHASE_CAS_RETRY_LIMIT: usize = 3;
 
 #[tonic::async_trait]
 trait ShutdownCleanup: Send + Sync {
@@ -101,11 +111,11 @@ pub use openshell_core::ComputeDriverError as ComputeError;
 #[derive(Debug)]
 pub struct ManagedDriverProcess {
     child: std::sync::Mutex<Option<tokio::process::Child>>,
-    socket_path: std::path::PathBuf,
+    socket_path: PathBuf,
 }
 
 impl ManagedDriverProcess {
-    pub(crate) fn new(child: tokio::process::Child, socket_path: std::path::PathBuf) -> Self {
+    pub(crate) fn new(child: tokio::process::Child, socket_path: PathBuf) -> Self {
         Self {
             child: std::sync::Mutex::new(Some(child)),
             socket_path,
@@ -119,6 +129,35 @@ impl Drop for ManagedDriverProcess {
             let _ = child.take();
         }
         let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+#[derive(Debug)]
+pub struct AcquiredRemoteDriverEndpoint {
+    pub(crate) name: String,
+    pub(crate) channel: Channel,
+    pub(crate) driver_process: Option<Arc<ManagedDriverProcess>>,
+}
+
+impl AcquiredRemoteDriverEndpoint {
+    pub(crate) fn managed_builtin(
+        driver_kind: ComputeDriverKind,
+        channel: Channel,
+        driver_process: Arc<ManagedDriverProcess>,
+    ) -> Self {
+        Self {
+            name: driver_kind.as_str().to_string(),
+            channel,
+            driver_process: Some(driver_process),
+        }
+    }
+
+    pub(crate) fn unmanaged(name: impl Into<String>, channel: Channel) -> Self {
+        Self {
+            name: name.into(),
+            channel,
+            driver_process: None,
+        }
     }
 }
 
@@ -220,7 +259,7 @@ impl ComputeDriver for RemoteComputeDriver {
 #[derive(Clone)]
 pub struct ComputeRuntime {
     driver: SharedComputeDriver,
-    driver_kind: Option<ComputeDriverKind>,
+    driver_name: String,
     shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
     startup_resume: Option<Arc<dyn StartupResume>>,
     _driver_process: Option<Arc<ManagedDriverProcess>>,
@@ -232,6 +271,7 @@ pub struct ComputeRuntime {
     supervisor_sessions: Arc<SupervisorSessionRegistry>,
     sync_lock: Arc<Mutex<()>>,
     gateway_bind_addresses: Vec<SocketAddr>,
+    replica_id: String,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -243,7 +283,7 @@ impl fmt::Debug for ComputeRuntime {
 impl ComputeRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn from_driver(
-        driver_kind: ComputeDriverKind,
+        driver_name: String,
         driver: SharedComputeDriver,
         shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
         startup_resume: Option<Arc<dyn StartupResume>>,
@@ -253,18 +293,24 @@ impl ComputeRuntime {
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
-        _allows_loopback_endpoints: bool,
         gateway_bind_addresses: Vec<SocketAddr>,
     ) -> Result<Self, ComputeError> {
-        let default_image = driver
+        let capabilities = driver
             .get_capabilities(Request::new(GetCapabilitiesRequest {}))
             .await
             .map_err(compute_error_from_status)?
-            .into_inner()
-            .default_image;
+            .into_inner();
+        let driver_kind = driver_name.parse::<ComputeDriverKind>().ok();
+        info!(
+            configured_driver = %driver_name,
+            advertised_driver = %capabilities.driver_name,
+            in_tree = driver_kind.is_some(),
+            "Compute driver connected"
+        );
+        let default_image = capabilities.default_image;
         Ok(Self {
             driver,
-            driver_kind: Some(driver_kind),
+            driver_name,
             shutdown_cleanup,
             startup_resume,
             _driver_process: driver_process,
@@ -276,13 +322,14 @@ impl ComputeRuntime {
             supervisor_sessions,
             sync_lock: Arc::new(Mutex::new(())),
             gateway_bind_addresses,
+            replica_id: lease::replica_id(),
         })
     }
 
-    /// Serializes sandbox object read-modify-write operations within this
-    /// gateway process.
+    /// Serializes sandbox/provider-profile invariant checks and object writes
+    /// within this gateway process.
     ///
-    /// This is a temporary single-gateway guard for full-object sandbox writes.
+    /// This is a temporary single-gateway guard for cross-object invariants.
     /// It is not HA-safe; replace it with DB-backed CAS/resource-version writes
     /// tracked by #1255 before enabling multiple gateway writers.
     pub(crate) async fn sandbox_sync_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
@@ -308,7 +355,7 @@ impl ComputeRuntime {
         let startup_resume: Arc<dyn StartupResume> = driver.clone();
         let driver: SharedComputeDriver = driver;
         Self::from_driver(
-            ComputeDriverKind::Docker,
+            ComputeDriverKind::Docker.as_str().to_string(),
             driver,
             Some(shutdown_cleanup),
             Some(startup_resume),
@@ -318,7 +365,6 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            true,
             gateway_bind_addresses,
         )
         .await
@@ -335,9 +381,9 @@ impl ComputeRuntime {
         let driver = KubernetesComputeDriver::new(config)
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
-        let driver: SharedComputeDriver = Arc::new(ComputeDriverService::new(driver));
+        let driver: SharedComputeDriver = Arc::new(KubernetesDriverService::new(driver));
         Self::from_driver(
-            ComputeDriverKind::Kubernetes,
+            ComputeDriverKind::Kubernetes.as_str().to_string(),
             driver,
             None,
             None,
@@ -347,34 +393,31 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            false,
             Vec::new(),
         )
         .await
     }
 
-    pub(crate) async fn new_remote_vm(
-        channel: Channel,
-        driver_process: Option<Arc<ManagedDriverProcess>>,
+    pub(crate) async fn new_remote_driver(
+        endpoint: AcquiredRemoteDriverEndpoint,
         store: Arc<Store>,
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
-        let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(channel));
+        let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(endpoint.channel));
         Self::from_driver(
-            ComputeDriverKind::Vm,
+            endpoint.name,
             driver,
             None,
             None,
-            driver_process,
+            endpoint.driver_process,
             store,
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            true,
             Vec::new(),
         )
         .await
@@ -393,7 +436,7 @@ impl ComputeRuntime {
             .map_err(|err| ComputeError::Message(err.to_string()))?;
         let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
         Self::from_driver(
-            ComputeDriverKind::Podman,
+            ComputeDriverKind::Podman.as_str().to_string(),
             driver,
             None,
             None,
@@ -403,7 +446,6 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            true,
             Vec::new(),
         )
         .await
@@ -416,7 +458,7 @@ impl ComputeRuntime {
 
     #[must_use]
     pub fn driver_kind(&self) -> Option<ComputeDriverKind> {
-        self.driver_kind
+        self.driver_name.parse().ok()
     }
 
     #[must_use]
@@ -426,7 +468,7 @@ impl ComputeRuntime {
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
         let driver_sandbox =
-            driver_sandbox_from_public(sandbox, self.driver_kind).map_err(|status| *status)?;
+            driver_sandbox_from_public(sandbox, &self.driver_name).map_err(|status| *status)?;
         self.driver
             .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
                 sandbox: Some(driver_sandbox),
@@ -442,7 +484,7 @@ impl ComputeRuntime {
     ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
         let mut driver_sandbox =
-            driver_sandbox_from_public(&sandbox, self.driver_kind).map_err(|status| *status)?;
+            driver_sandbox_from_public(&sandbox, &self.driver_name).map_err(|status| *status)?;
 
         // Create with MustCreate condition to prevent duplicate creation race
         self.sandbox_index.update_from_sandbox(&sandbox);
@@ -537,17 +579,7 @@ impl ComputeRuntime {
 
         let id = sandbox.object_id().to_string();
 
-        // Use CAS to set phase to Deleting
-        // TODO: Accept expected_version from DeleteSandboxRequest for proper client-driven CAS
-        let sandbox = self
-            .store
-            .update_message_cas::<Sandbox, _>(&id, 0, |s| {
-                s.set_phase(SandboxPhase::Deleting as i32);
-            })
-            .await
-            .map_err(|e| {
-                crate::grpc::persistence_error_to_status(e, "set sandbox phase to Deleting")
-            })?;
+        let sandbox = self.set_sandbox_phase_deleting_with_retry(&id).await?;
 
         self.sandbox_index.update_from_sandbox(&sandbox);
         self.sandbox_watch_bus.notify(&id);
@@ -571,15 +603,130 @@ impl ComputeRuntime {
         Ok(deleted)
     }
 
-    pub fn spawn_watchers(&self) {
+    async fn set_sandbox_phase_deleting_with_retry(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Sandbox, Status> {
+        self.set_sandbox_phase_deleting_with_initial_snapshot(sandbox_id, None)
+            .await
+    }
+
+    async fn set_sandbox_phase_deleting_with_initial_snapshot(
+        &self,
+        sandbox_id: &str,
+        mut initial_snapshot: Option<Sandbox>,
+    ) -> Result<Sandbox, Status> {
+        let operation = "set sandbox phase to Deleting";
+
+        for attempt in 1..=DELETE_PHASE_CAS_RETRY_LIMIT {
+            let sandbox = match initial_snapshot.take() {
+                Some(sandbox) => sandbox,
+                None => self
+                    .store
+                    .get_message::<Sandbox>(sandbox_id)
+                    .await
+                    .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+                    .ok_or_else(|| Status::not_found("sandbox not found"))?,
+            };
+
+            match self
+                .write_sandbox_phase_deleting_from_snapshot(sandbox)
+                .await
+            {
+                Ok(sandbox) => {
+                    if attempt > 1 {
+                        debug!(
+                            sandbox_id,
+                            attempt, "Retried sandbox delete phase transition after CAS conflict"
+                        );
+                    }
+                    return Ok(sandbox);
+                }
+                Err(crate::persistence::PersistenceError::Conflict {
+                    current_resource_version,
+                }) => {
+                    let err = crate::persistence::PersistenceError::Conflict {
+                        current_resource_version,
+                    };
+                    if attempt == DELETE_PHASE_CAS_RETRY_LIMIT {
+                        return Err(crate::grpc::persistence_error_to_status(err, operation));
+                    }
+                    debug!(
+                        sandbox_id,
+                        attempt,
+                        current_resource_version,
+                        "Sandbox delete phase transition conflicted; retrying"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                Err(err) => return Err(crate::grpc::persistence_error_to_status(err, operation)),
+            }
+        }
+
+        unreachable!("delete phase retry loop always returns")
+    }
+
+    async fn write_sandbox_phase_deleting_from_snapshot(
+        &self,
+        mut sandbox: Sandbox,
+    ) -> crate::persistence::PersistenceResult<Sandbox> {
+        let id = sandbox.object_id().to_string();
+        let name = sandbox.object_name().to_string();
+        let expected_resource_version = sandbox
+            .metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.resource_version);
+
+        sandbox.set_phase(SandboxPhase::Deleting as i32);
+
+        let labels_json = sandbox
+            .metadata
+            .as_ref()
+            .map(|metadata| &metadata.labels)
+            .filter(|labels| !labels.is_empty())
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| {
+                crate::persistence::PersistenceError::Encode(format!(
+                    "failed to serialize labels: {e}"
+                ))
+            })?;
+
+        let result = self
+            .store
+            .put_if(
+                Sandbox::object_type(),
+                &id,
+                &name,
+                &sandbox.encode_to_vec(),
+                labels_json.as_deref(),
+                WriteCondition::MatchResourceVersion(expected_resource_version),
+            )
+            .await?;
+
+        if let Some(metadata) = sandbox.metadata.as_mut() {
+            metadata.resource_version = result.resource_version;
+        }
+
+        Ok(sandbox)
+    }
+
+    pub fn spawn_watchers(&self, shutdown_rx: watch::Receiver<bool>) {
         let runtime = Arc::new(self.clone());
-        let watch_runtime = runtime.clone();
-        tokio::spawn(async move {
-            watch_runtime.watch_loop().await;
-        });
-        tokio::spawn(async move {
-            runtime.reconcile_loop().await;
-        });
+        if self.store.is_single_replica() {
+            let watch_runtime = runtime.clone();
+            let watch_shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                watch_runtime.watch_loop(watch_shutdown).await;
+            });
+            tokio::spawn(async move {
+                runtime.reconcile_loop(shutdown_rx).await;
+            });
+        } else {
+            tokio::spawn(async move {
+                runtime.lease_coordinator(shutdown_rx).await;
+            });
+        }
     }
 
     pub async fn cleanup_on_shutdown(&self) -> Result<(), String> {
@@ -728,7 +875,103 @@ impl ComputeRuntime {
         }
     }
 
-    async fn watch_loop(self: Arc<Self>) {
+    async fn lease_coordinator(self: Arc<Self>, mut shutdown_rx: watch::Receiver<bool>) {
+        use lease::{LEASE_ACQUIRE_INTERVAL, LEASE_TTL, ReconcilerLease};
+
+        let lease = ReconcilerLease::new(self.store.clone(), self.replica_id.clone(), LEASE_TTL);
+        info!(replica = %lease.replica_id(), "reconciler lease coordinator started");
+
+        loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
+
+            match lease.acquire_or_steal().await {
+                Ok(guard) => {
+                    info!(replica = %lease.replica_id(), "acquired reconciler lease");
+                    self.run_as_holder(&lease, guard, &mut shutdown_rx).await;
+                }
+                Err(e) => {
+                    debug!(
+                        replica = %lease.replica_id(),
+                        error = %e,
+                        "reconciler lease acquisition attempt failed"
+                    );
+                    tokio::select! {
+                        () = tokio::time::sleep(LEASE_ACQUIRE_INTERVAL) => {}
+                        _ = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        info!(replica = %lease.replica_id(), "reconciler lease coordinator stopped");
+    }
+
+    async fn run_as_holder(
+        self: &Arc<Self>,
+        lease: &lease::ReconcilerLease,
+        mut guard: lease::LeaseGuard,
+        shutdown_rx: &mut watch::Receiver<bool>,
+    ) {
+        use lease::LEASE_RENEWAL_INTERVAL;
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+
+        let runtime = self.clone();
+        let watch_cancel = cancel_rx.clone();
+        let watch_handle = tokio::spawn(async move {
+            runtime.watch_loop(watch_cancel).await;
+        });
+
+        let runtime = self.clone();
+        let reconcile_handle = tokio::spawn(async move {
+            runtime.reconcile_loop(cancel_rx).await;
+        });
+
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(LEASE_RENEWAL_INTERVAL) => {
+                    match lease.renew(&mut guard).await {
+                        Ok(()) => {
+                            debug!(replica = %lease.replica_id(), "renewed reconciler lease");
+                        }
+                        Err(e) => {
+                            warn!(
+                                replica = %lease.replica_id(),
+                                error = %e,
+                                "reconciler lease renewal failed — releasing holder role"
+                            );
+                            break;
+                        }
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!(replica = %lease.replica_id(), "shutdown — releasing reconciler lease");
+                        if let Err(e) = lease.release(guard).await {
+                            warn!(error = %e, "failed to release reconciler lease on shutdown");
+                        }
+                        let _ = cancel_tx.send(true);
+                        let _ = watch_handle.await;
+                        let _ = reconcile_handle.await;
+                        return;
+                    }
+                }
+            }
+        }
+
+        let _ = cancel_tx.send(true);
+        let _ = watch_handle.await;
+        let _ = reconcile_handle.await;
+        info!(replica = %lease.replica_id(), "reconciler lease lost — returning to standby");
+    }
+
+    async fn watch_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
             let mut stream = match self
                 .driver
@@ -738,40 +981,55 @@ impl ComputeRuntime {
                 Ok(response) => response.into_inner(),
                 Err(err) => {
                     warn!(error = %err, "Compute driver watch stream failed to start");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_secs(2)) => {}
+                        _ = cancel.changed() => return,
+                    }
                     continue;
                 }
             };
 
             let mut restart = false;
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(event) => {
-                        if let Err(err) = self.apply_watch_event(event).await {
-                            warn!(error = %err, "Failed to apply compute driver event");
+            loop {
+                tokio::select! {
+                    item = stream.next() => {
+                        match item {
+                            Some(Ok(event)) => {
+                                if let Err(err) = self.apply_watch_event(event).await {
+                                    warn!(error = %err, "Failed to apply compute driver event");
+                                }
+                            }
+                            Some(Err(err)) => {
+                                warn!(error = %err, "Compute driver watch stream errored");
+                                restart = true;
+                                break;
+                            }
+                            None => break,
                         }
                     }
-                    Err(err) => {
-                        warn!(error = %err, "Compute driver watch stream errored");
-                        restart = true;
-                        break;
-                    }
+                    _ = cancel.changed() => return,
                 }
             }
 
             if !restart {
                 warn!("Compute driver watch stream ended unexpectedly");
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(2)) => {}
+                _ = cancel.changed() => return,
+            }
         }
     }
 
-    async fn reconcile_loop(self: Arc<Self>) {
+    async fn reconcile_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
             if let Err(err) = self.reconcile_store_with_backend(ORPHAN_GRACE_PERIOD).await {
                 warn!(error = %err, "Store reconciliation sweep failed");
             }
-            tokio::time::sleep(RECONCILE_INTERVAL).await;
+            tokio::select! {
+                () = tokio::time::sleep(RECONCILE_INTERVAL) => {}
+                _ = cancel.changed() => return,
+            }
         }
     }
 
@@ -1250,9 +1508,48 @@ impl ComputeRuntime {
     }
 }
 
+/// Connect to an unmanaged remote compute driver that is already listening on
+/// `socket_path` and return the acquired endpoint.
+///
+/// The gateway does not spawn or own the driver process — the operator is
+/// responsible for placing the driver alongside the gateway and granting the
+/// gateway uid read/write on the socket. The host portion of the URL is
+/// ignored because the connector resolves to the UDS rather than DNS.
+#[cfg(unix)]
+pub async fn connect_remote_compute_driver(
+    name: impl Into<String>,
+    socket_path: &Path,
+) -> Result<AcquiredRemoteDriverEndpoint, ComputeError> {
+    let socket_path: PathBuf = socket_path.to_path_buf();
+    let display_path = socket_path.clone();
+    let channel = Endpoint::from_static("http://[::]:50051")
+        .connect_with_connector(service_fn(move |_: tonic::transport::Uri| {
+            let socket_path = socket_path.clone();
+            async move { UnixStream::connect(socket_path).await.map(TokioIo::new) }
+        }))
+        .await
+        .map_err(|e| {
+            ComputeError::Message(format!(
+                "failed to connect to remote compute driver socket '{}': {e}",
+                display_path.display()
+            ))
+        })?;
+    Ok(AcquiredRemoteDriverEndpoint::unmanaged(name, channel))
+}
+
+#[cfg(not(unix))]
+pub async fn connect_remote_compute_driver(
+    _name: impl Into<String>,
+    _socket_path: &Path,
+) -> Result<AcquiredRemoteDriverEndpoint, ComputeError> {
+    Err(ComputeError::Message(
+        "remote compute driver endpoints require unix domain socket support".to_string(),
+    ))
+}
+
 fn driver_sandbox_from_public(
     sandbox: &Sandbox,
-    driver_kind: Option<ComputeDriverKind>,
+    driver_name: &str,
 ) -> Result<DriverSandbox, Box<Status>> {
     Ok(DriverSandbox {
         id: sandbox.object_id().to_string(),
@@ -1261,7 +1558,7 @@ fn driver_sandbox_from_public(
         spec: sandbox
             .spec
             .as_ref()
-            .map(|spec| driver_sandbox_spec_from_public(spec, driver_kind))
+            .map(|spec| driver_sandbox_spec_from_public(spec, driver_name))
             .transpose()?,
         status: sandbox.status.as_ref().map(driver_status_from_public),
     })
@@ -1269,7 +1566,7 @@ fn driver_sandbox_from_public(
 
 fn driver_sandbox_spec_from_public(
     spec: &SandboxSpec,
-    driver_kind: Option<ComputeDriverKind>,
+    driver_name: &str,
 ) -> Result<DriverSandboxSpec, Box<Status>> {
     Ok(DriverSandboxSpec {
         log_level: spec.log_level.clone(),
@@ -1277,17 +1574,23 @@ fn driver_sandbox_spec_from_public(
         template: spec
             .template
             .as_ref()
-            .map(|template| driver_sandbox_template_from_public(template, driver_kind))
+            .map(|template| driver_sandbox_template_from_public(template, driver_name))
             .transpose()?,
-        gpu: spec.gpu,
-        gpu_device: spec.gpu_device.clone(),
+        resource_requirements: spec.resource_requirements.as_ref().map(|requirements| {
+            DriverSandboxResourceRequirements {
+                gpu: requirements
+                    .gpu
+                    .as_ref()
+                    .map(|gpu| DriverGpuResourceRequirements { count: gpu.count }),
+            }
+        }),
         sandbox_token: String::new(),
     })
 }
 
 fn driver_sandbox_template_from_public(
     template: &SandboxTemplate,
-    driver_kind: Option<ComputeDriverKind>,
+    driver_name: &str,
 ) -> Result<DriverSandboxTemplate, Box<Status>> {
     Ok(DriverSandboxTemplate {
         image: template.image.clone(),
@@ -1296,21 +1599,17 @@ fn driver_sandbox_template_from_public(
         environment: template.environment.clone(),
         resources: extract_typed_resources(&template.resources),
         platform_config: build_platform_config(template),
-        driver_config: select_driver_config(&template.driver_config, driver_kind)?,
+        driver_config: select_driver_config(&template.driver_config, driver_name)?,
     })
 }
 
 fn select_driver_config(
     config: &Option<prost_types::Struct>,
-    driver_kind: Option<ComputeDriverKind>,
+    driver_name: &str,
 ) -> Result<Option<prost_types::Struct>, Box<Status>> {
     let Some(config) = config else {
         return Ok(None);
     };
-    let Some(driver_kind) = driver_kind else {
-        return Ok(None);
-    };
-    let driver_name = driver_kind.as_str();
     let Some(value) = config.fields.get(driver_name) else {
         return Ok(None);
     };
@@ -1367,8 +1666,8 @@ fn extract_typed_resources(
 }
 
 /// Build the opaque `platform_config` Struct from platform-specific public
-/// template fields (`runtime_class_name`, annotations, `volume_claim_templates`)
-/// plus any resource fields beyond CPU/memory.
+/// template fields (`runtime_class_name`, annotations) plus any resource fields
+/// beyond CPU/memory.
 fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Struct> {
     use prost_types::{Struct, Value, value::Kind};
 
@@ -1402,16 +1701,6 @@ fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Stru
                 kind: Some(Kind::StructValue(Struct {
                     fields: annotation_fields,
                 })),
-            },
-        );
-    }
-
-    // Pass through the raw volume_claim_templates Struct as a nested value.
-    if let Some(ref vct) = template.volume_claim_templates {
-        fields.insert(
-            "volume_claim_templates".to_string(),
-            Value {
-                kind: Some(Kind::StructValue(vct.clone())),
             },
         );
     }
@@ -1661,7 +1950,9 @@ fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
 }
 
 fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Option<&SandboxSpec>) {
-    let gpu_requested = spec.is_some_and(|sandbox_spec| sandbox_spec.gpu);
+    let gpu_requested = spec
+        .and_then(|sandbox_spec| sandbox_spec.resource_requirements.as_ref())
+        .is_some_and(|requirements| openshell_core::gpu::sandbox_gpu_requested(Some(requirements)));
     if !gpu_requested {
         return;
     }
@@ -1805,7 +2096,7 @@ impl ComputeDriver for NoopTestDriver {
 pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
     ComputeRuntime {
         driver: Arc::new(NoopTestDriver),
-        driver_kind: None,
+        driver_name: "test".to_string(),
         shutdown_cleanup: None,
         startup_resume: None,
         _driver_process: None,
@@ -1817,6 +2108,7 @@ pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
         supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
         sync_lock: Arc::new(Mutex::new(())),
         gateway_bind_addresses: Vec::new(),
+        replica_id: "test-replica".to_string(),
     }
 }
 
@@ -1858,6 +2150,26 @@ mod tests {
     }
 
     #[test]
+    fn driver_sandbox_spec_from_public_preserves_gpu_requirement() {
+        let public = SandboxSpec {
+            resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                gpu: Some(openshell_core::proto::GpuResourceRequirements { count: Some(2) }),
+            }),
+            ..Default::default()
+        };
+
+        let driver = driver_sandbox_spec_from_public(&public, "test-driver")
+            .expect("driver spec should map");
+
+        let gpu = driver
+            .resource_requirements
+            .as_ref()
+            .and_then(|requirements| requirements.gpu.as_ref())
+            .expect("driver GPU requirement should be set");
+        assert_eq!(gpu.count, Some(2));
+    }
+
+    #[test]
     fn select_driver_config_forwards_only_matching_driver_block() {
         let config = prost_types::Struct {
             fields: [
@@ -1874,8 +2186,7 @@ mod tests {
             .collect(),
         };
 
-        let selected =
-            select_driver_config(&Some(config), Some(ComputeDriverKind::Kubernetes)).unwrap();
+        let selected = select_driver_config(&Some(config), "kubernetes").unwrap();
         let selected = selected.expect("kubernetes config should be selected");
 
         assert!(selected.fields.contains_key("node"));
@@ -1892,10 +2203,25 @@ mod tests {
             .collect(),
         };
 
-        let selected =
-            select_driver_config(&Some(config), Some(ComputeDriverKind::Kubernetes)).unwrap();
+        let selected = select_driver_config(&Some(config), "kubernetes").unwrap();
 
         assert!(selected.is_none());
+    }
+
+    #[test]
+    fn select_driver_config_forwards_named_remote_driver_block() {
+        let config = prost_types::Struct {
+            fields: std::iter::once((
+                "kyma".to_string(),
+                struct_value([("pool", string_value("gpu"))]),
+            ))
+            .collect(),
+        };
+
+        let selected = select_driver_config(&Some(config), "kyma").unwrap();
+        let selected = selected.expect("named remote config should be selected");
+
+        assert!(selected.fields.contains_key("pool"));
     }
 
     #[test]
@@ -1905,8 +2231,7 @@ mod tests {
                 .collect(),
         };
 
-        let err =
-            select_driver_config(&Some(config), Some(ComputeDriverKind::Kubernetes)).unwrap_err();
+        let err = select_driver_config(&Some(config), "kubernetes").unwrap_err();
 
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("template.driver_config.kubernetes"));
@@ -2026,7 +2351,7 @@ mod tests {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
         ComputeRuntime {
             driver,
-            driver_kind: None,
+            driver_name: "test-driver".to_string(),
             shutdown_cleanup: None,
             startup_resume,
             _driver_process: None,
@@ -2038,6 +2363,7 @@ mod tests {
             supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
             sync_lock: Arc::new(Mutex::new(())),
             gateway_bind_addresses: Vec::new(),
+            replica_id: "test-replica".to_string(),
         }
     }
 
@@ -2102,6 +2428,12 @@ mod tests {
             conditions: vec![condition],
             deleting: false,
         }
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_is_single_replica() {
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        assert!(store.is_single_replica());
     }
 
     #[test]
@@ -2356,7 +2688,9 @@ mod tests {
         rewrite_user_facing_conditions(
             &mut status,
             Some(&SandboxSpec {
-                gpu: true,
+                resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                    gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
+                }),
                 ..Default::default()
             }),
         );
@@ -2384,13 +2718,7 @@ mod tests {
             ..Default::default()
         });
 
-        rewrite_user_facing_conditions(
-            &mut status,
-            Some(&SandboxSpec {
-                gpu: false,
-                ..Default::default()
-            }),
-        );
+        rewrite_user_facing_conditions(&mut status, Some(&SandboxSpec::default()));
 
         assert_eq!(status.unwrap().conditions[0].message, original);
     }
@@ -2406,6 +2734,58 @@ mod tests {
             compute_error_from_status(Status::failed_precondition("sandbox agent pod IP is not available")),
             ComputeError::Precondition(message) if message == "sandbox agent pod IP is not available"
         ));
+    }
+
+    #[tokio::test]
+    async fn set_sandbox_phase_deleting_retries_after_stale_snapshot_conflict() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let stale_snapshot = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+
+        runtime
+            .store
+            .update_message_cas::<Sandbox, _>("sb-1", 0, |sandbox| {
+                sandbox.set_current_policy_version(7);
+            })
+            .await
+            .unwrap();
+
+        let updated = runtime
+            .set_sandbox_phase_deleting_with_initial_snapshot("sb-1", Some(stale_snapshot))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            SandboxPhase::try_from(updated.phase()).unwrap(),
+            SandboxPhase::Deleting
+        );
+        assert_eq!(updated.current_policy_version(), 7);
+        assert_eq!(
+            updated
+                .metadata
+                .as_ref()
+                .map_or(0, |metadata| metadata.resource_version),
+            3
+        );
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Deleting
+        );
+        assert_eq!(stored.current_policy_version(), 7);
     }
 
     #[tokio::test]
@@ -2669,7 +3049,9 @@ mod tests {
 
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
-                gpu: true,
+                resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                    gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
+                }),
                 ..Default::default()
             }),
             ..sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning)
@@ -2692,7 +3074,9 @@ mod tests {
             SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Ready
         );
-        assert!(stored.spec.as_ref().is_some_and(|spec| spec.gpu));
+        assert!(stored.spec.as_ref().is_some_and(|spec| {
+            openshell_core::gpu::sandbox_gpu_requested(spec.resource_requirements.as_ref())
+        }));
     }
 
     #[tokio::test]
@@ -3051,6 +3435,103 @@ mod tests {
             config.is_none() || !config.as_ref().unwrap().fields.contains_key("host_users"),
             "unset user_namespaces must not produce host_users"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn remote_compute_driver_forwards_lifecycle_calls_over_uds() {
+        use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("compute-driver.sock");
+        let driver = FakeComputeDriver::new()
+            .with_driver_name("fake-remote-driver")
+            .with_default_image("openshell/sandbox:remote");
+        let _server = driver.serve_uds(&socket_path).unwrap();
+
+        let endpoint = connect_remote_compute_driver("external-test", &socket_path)
+            .await
+            .unwrap();
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let runtime = ComputeRuntime::new_remote_driver(
+            endpoint,
+            store,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+        )
+        .await
+        .unwrap();
+
+        let mut sandbox = sandbox_record("sb-uds", "uds-sandbox", SandboxPhase::Provisioning);
+        sandbox.spec = Some(SandboxSpec {
+            log_level: "debug".to_string(),
+            template: Some(SandboxTemplate {
+                image: "ghcr.io/nvidia/openshell/sandbox:test".to_string(),
+                driver_config: Some(prost_types::Struct {
+                    fields: [
+                        (
+                            "external-test".to_string(),
+                            struct_value([("pool", string_value("ci"))]),
+                        ),
+                        (
+                            "docker".to_string(),
+                            struct_value([("network_mode", string_value("bridge"))]),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        runtime.validate_sandbox_create(&sandbox).await.unwrap();
+        runtime.create_sandbox(sandbox, None).await.unwrap();
+        assert!(runtime.delete_sandbox("uds-sandbox").await.unwrap());
+
+        let calls = driver.calls();
+        assert_eq!(calls.len(), 4, "unexpected calls: {calls:?}");
+        assert!(matches!(calls[0], FakeComputeDriverCall::GetCapabilities));
+
+        let validated = match &calls[1] {
+            FakeComputeDriverCall::ValidateSandboxCreate {
+                sandbox: Some(sandbox),
+            } => sandbox,
+            other => panic!("expected ValidateSandboxCreate call, got {other:?}"),
+        };
+        assert_eq!(validated.id, "sb-uds");
+        assert_eq!(validated.name, "uds-sandbox");
+        let driver_config = validated
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+            .and_then(|template| template.driver_config.as_ref())
+            .expect("selected driver_config should be forwarded");
+        assert!(driver_config.fields.contains_key("pool"));
+        assert!(!driver_config.fields.contains_key("network_mode"));
+
+        let created = match &calls[2] {
+            FakeComputeDriverCall::CreateSandbox {
+                sandbox: Some(sandbox),
+            } => sandbox,
+            other => panic!("expected CreateSandbox call, got {other:?}"),
+        };
+        assert_eq!(created.id, "sb-uds");
+        assert_eq!(created.name, "uds-sandbox");
+
+        match &calls[3] {
+            FakeComputeDriverCall::DeleteSandbox {
+                sandbox_id,
+                sandbox_name,
+            } => {
+                assert_eq!(sandbox_id, "sb-uds");
+                assert_eq!(sandbox_name, "uds-sandbox");
+            }
+            other => panic!("expected DeleteSandbox call, got {other:?}"),
+        }
     }
 
     #[tokio::test]

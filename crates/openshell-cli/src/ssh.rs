@@ -9,8 +9,8 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use openshell_core::ObjectId;
 use openshell_core::forward::{
-    build_proxy_command, find_ssh_forward_pid, format_gateway_url, resolve_ssh_gateway,
-    shell_escape, validate_ssh_session_response, write_forward_pid,
+    ForwardSpec, build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
+    validate_ssh_session_response, write_forward_pid,
 };
 use openshell_core::proto::{
     CreateSshSessionRequest, GetSandboxRequest, SshRelayTarget, TcpForwardFrame, TcpForwardInit,
@@ -25,10 +25,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command as TokioCommand;
+use tokio::net::TcpStream;
+use tokio::process::{Child, Command as TokioCommand};
 use tokio_stream::wrappers::ReceiverStream;
 
-const FOREGROUND_FORWARD_STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(2);
+/// Time budget for the local listener to become reachable after `ssh` starts.
+/// This is a user-visible readiness deadline for both foreground and background
+/// forwards, not a soft cleanup grace period.
+const FORWARD_LISTENER_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
+/// Delay between listener/PID probes within the configured timeout.
+const FORWARD_LISTENER_PROBE_INTERVAL: Duration = Duration::from_millis(50);
+/// Per-attempt connect timeout, so one hung probe cannot consume the whole
+/// grace period.
+const FORWARD_LISTENER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Copy, Debug)]
 pub enum Editor {
@@ -314,13 +323,12 @@ pub async fn sandbox_connect_editor(
 
 /// Forward a local port to a sandbox via SSH.
 ///
-/// When `background` is `true` the SSH process is forked into the background
-/// (using `-f`) and its PID is written to a state file so it can be managed
-/// later via [`stop_forward`] or [`list_forwards`].
+/// Background mode keeps the spawned `ssh -N` child alive and records that PID
+/// for later management via [`stop_forward`] or [`list_forwards`].
 pub async fn sandbox_forward(
     server: &str,
     name: &str,
-    spec: &openshell_core::forward::ForwardSpec,
+    spec: &ForwardSpec,
     background: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -336,57 +344,174 @@ pub async fn sandbox_forward(
         .arg("-L")
         .arg(spec.ssh_forward_arg());
 
-    if background {
-        // SSH -f: fork to background after authentication.
-        command.arg("-f");
-    }
+    command.arg("sandbox");
 
-    command
-        .arg("sandbox")
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+    if background {
+        command
+            .kill_on_drop(false)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+    } else {
+        command
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+    }
 
     let port = spec.port;
 
-    let status = if background {
-        command.status().await.into_diagnostic()?
-    } else {
+    if background {
         let mut child = command.spawn().into_diagnostic()?;
-        if let Ok(status) =
-            tokio::time::timeout(FOREGROUND_FORWARD_STARTUP_GRACE_PERIOD, child.wait()).await
+        let pid = child.id().ok_or_else(|| {
+            miette::miette!("ssh process did not expose a PID for background tracking")
+        })?;
+
+        if let Err(err) = wait_for_forward_start(&mut child, spec)
+            .await
+            .wrap_err("ssh process started but local forward listener was not reachable")
         {
-            status.into_diagnostic()?
-        } else {
-            eprintln!("{}", foreground_forward_started_message(name, spec));
-            child.wait().await.into_diagnostic()?
+            terminate_owned_forward_child(&mut child);
+            return Err(err);
         }
+
+        track_background_forward_or_cleanup(
+            name,
+            port,
+            pid,
+            &session.sandbox_id,
+            &spec.bind_addr,
+            || terminate_owned_forward_child(&mut child),
+        )?;
+        return Ok(());
+    }
+
+    let status = {
+        let mut child = command.spawn().into_diagnostic()?;
+        if let Err(err) = wait_for_forward_start(&mut child, spec).await {
+            let _ = child.kill().await;
+            return Err(err);
+        }
+        eprintln!("{}", foreground_forward_started_message(name, spec));
+        child.wait().await.into_diagnostic()?
     };
 
     if !status.success() {
         return Err(miette::miette!("ssh exited with status {status}"));
     }
 
-    if background {
-        // SSH has forked — find its PID and record it.
-        if let Some(pid) = find_ssh_forward_pid(&session.sandbox_id, port) {
-            write_forward_pid(name, port, pid, &session.sandbox_id, &spec.bind_addr)?;
-        } else {
-            eprintln!(
-                "{} Could not discover backgrounded SSH process; \
-                 forward may be running but is not tracked",
-                "!".yellow(),
-            );
-        }
-    }
-
     Ok(())
 }
 
-fn foreground_forward_started_message(
+/// Wait for the local listener, racing the probe against the `ssh` child
+/// exiting. An early exit (e.g. `ExitOnForwardFailure=yes` tearing down the
+/// session) means forwarding never came up, so it errors instead of waiting
+/// out the grace period.
+async fn wait_for_forward_start(child: &mut Child, spec: &ForwardSpec) -> Result<()> {
+    let listener = wait_for_forward_listener(spec, FORWARD_LISTENER_READINESS_TIMEOUT);
+    tokio::pin!(listener);
+    tokio::select! {
+        result = &mut listener => result,
+        status = child.wait() => {
+            let status = status.into_diagnostic()?;
+            if status.success() {
+                Err(miette::miette!(
+                    "ssh exited before local forward listener opened on {}:{}",
+                    forward_probe_host(spec),
+                    spec.port,
+                ))
+            } else {
+                Err(miette::miette!(
+                    "ssh exited with status {status} before local forward listener opened on {}:{}",
+                    forward_probe_host(spec),
+                    spec.port,
+                ))
+            }
+        }
+    }
+}
+
+/// Poll the local endpoint until a connect succeeds or `wait_for` elapses. The
+/// last probe error is folded into the timeout diagnostic, so a failure reports
+/// why the listener never opened, not just that it timed out.
+async fn wait_for_forward_listener(spec: &ForwardSpec, wait_for: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + wait_for;
+    loop {
+        let probe_error = match probe_forward_listener(spec).await {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(miette::miette!(
+                "local forward listener did not open on {}:{} within {}ms: last probe failed with {probe_error}",
+                forward_probe_host(spec),
+                spec.port,
+                wait_for.as_millis(),
+            ));
+        }
+
+        tokio::time::sleep(FORWARD_LISTENER_PROBE_INTERVAL).await;
+    }
+}
+
+/// One bounded TCP connect to the forward endpoint. Returns a `String` error
+/// rather than a `miette` diagnostic to stay cheap in the poll loop. The
+/// connection only proves reachability and is dropped at once; SSH forwards
+/// this throwaway connect to the sandbox-side target.
+async fn probe_forward_listener(spec: &ForwardSpec) -> std::result::Result<(), String> {
+    match tokio::time::timeout(
+        FORWARD_LISTENER_CONNECT_TIMEOUT,
+        TcpStream::connect((forward_probe_host(spec), spec.port)),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => {
+            drop(stream);
+            Ok(())
+        }
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err(format!(
+            "connect timed out after {}ms",
+            FORWARD_LISTENER_CONNECT_TIMEOUT.as_millis()
+        )),
+    }
+}
+
+/// Resolve the bind address to a connectable host. Wildcard binds (`0.0.0.0`,
+/// `::`, empty) are "any-address" listeners, not valid connect targets, so they
+/// map to the matching loopback. Specific addresses are probed as-is.
+fn forward_probe_host(spec: &ForwardSpec) -> &str {
+    match spec.bind_addr.as_str() {
+        "" | "0.0.0.0" => "127.0.0.1",
+        "::" => "::1",
+        host => host,
+    }
+}
+
+/// Best-effort cleanup for the SSH child this process spawned.
+fn terminate_owned_forward_child(child: &mut Child) {
+    let _ = child.start_kill();
+}
+
+/// Track a verified background forward, cleaning it up if PID-file persistence fails.
+fn track_background_forward_or_cleanup(
     name: &str,
-    spec: &openshell_core::forward::ForwardSpec,
-) -> String {
+    port: u16,
+    pid: u32,
+    sandbox_id: &str,
+    bind_addr: &str,
+    cleanup: impl FnOnce(),
+) -> Result<()> {
+    if let Err(err) = write_forward_pid(name, port, pid, sandbox_id, bind_addr) {
+        cleanup();
+        return Err(err)
+            .wrap_err("local forward listener was reachable but tracking the SSH process failed");
+    }
+    Ok(())
+}
+
+fn foreground_forward_started_message(name: &str, spec: &ForwardSpec) -> String {
     format!(
         "{} Forwarding port {} to sandbox {name}\n  Access at: {}\n  Press Ctrl+C to stop\n  {}",
         "✓".green().bold(),
@@ -1590,7 +1715,7 @@ mod tests {
 
     #[test]
     fn foreground_forward_started_message_includes_port_and_stop_hint() {
-        let spec = openshell_core::forward::ForwardSpec::new(8080);
+        let spec = ForwardSpec::new(8080);
         let message = foreground_forward_started_message("demo", &spec);
         assert!(message.contains("Forwarding port 8080 to sandbox demo"));
         assert!(message.contains("Access at: http://127.0.0.1:8080/"));
@@ -1603,10 +1728,132 @@ mod tests {
 
     #[test]
     fn foreground_forward_started_message_custom_bind_addr() {
-        let spec = openshell_core::forward::ForwardSpec::parse("0.0.0.0:3000").unwrap();
+        let spec = ForwardSpec::parse("0.0.0.0:3000").unwrap();
         let message = foreground_forward_started_message("demo", &spec);
         assert!(message.contains("Forwarding port 3000 to sandbox demo"));
         assert!(message.contains("Access at: http://localhost:3000/"));
+    }
+
+    #[test]
+    fn forward_probe_host_uses_connectable_loopback_for_wildcard_binds() {
+        let ipv4 = ForwardSpec::parse("0.0.0.0:3000").unwrap();
+        let ipv6 = ForwardSpec::parse(":::3000").unwrap();
+        let loopback = ForwardSpec::new(3000);
+
+        assert_eq!(forward_probe_host(&ipv4), "127.0.0.1");
+        assert_eq!(forward_probe_host(&ipv6), "::1");
+        assert_eq!(forward_probe_host(&loopback), "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn wait_for_forward_listener_accepts_ready_listener() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let spec = ForwardSpec::new(port);
+
+        wait_for_forward_listener(&spec, Duration::from_secs(1))
+            .await
+            .unwrap();
+        accept.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_for_forward_listener_rejects_missing_listener() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let spec = ForwardSpec::new(port);
+
+        let err = wait_for_forward_listener(&spec, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        let text = format!("{err:?}");
+        assert!(text.contains("local forward listener did not open"));
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
+    fn track_background_forward_or_cleanup_runs_cleanup_when_pidfile_write_fails() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        // Make forward PID-file writes fail with ENOTDIR after listener readiness.
+        let blocking_file = tmp.path().join("not-a-dir");
+        fs::write(&blocking_file, b"x").unwrap();
+        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &blocking_file);
+        }
+
+        let mut cleaned_up = false;
+        let result =
+            track_background_forward_or_cleanup("demo", 8080, 4242, "sbx-1", "127.0.0.1", || {
+                cleaned_up = true;
+            });
+
+        unsafe {
+            match old_xdg {
+                Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        assert!(
+            result.is_err(),
+            "PID-file write failure must surface as an error"
+        );
+        assert!(
+            cleaned_up,
+            "the owned SSH child must be cleaned up when tracking fails so no \
+             reachable-but-untracked forward is left running"
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
+    fn track_background_forward_or_cleanup_tracks_pid_without_cleanup_on_success() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        }
+
+        let mut cleaned_up = false;
+        let result =
+            track_background_forward_or_cleanup("demo", 8080, 4242, "sbx-1", "127.0.0.1", || {
+                cleaned_up = true;
+            });
+        let pid_file_exists =
+            openshell_core::forward::forward_pid_path("demo", 8080).is_ok_and(|path| path.exists());
+
+        unsafe {
+            match old_xdg {
+                Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        assert!(
+            result.is_ok(),
+            "a writable PID directory must track successfully"
+        );
+        assert!(
+            pid_file_exists,
+            "successful tracking must persist a PID file"
+        );
+        assert!(
+            !cleaned_up,
+            "successful tracking must not terminate the forward process"
+        );
     }
 
     #[test]

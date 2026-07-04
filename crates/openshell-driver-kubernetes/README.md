@@ -15,9 +15,13 @@ credential injection, policy polling, logs, and the gateway relay.
 
 ## Sandbox Resource
 
-The driver works with the `agents.x-k8s.io/v1alpha1` `Sandbox` custom resource.
-Driver events map Kubernetes object state and platform events into the shared
-compute-driver protobuf surface used by the gateway.
+The driver works with the `agents.x-k8s.io` `Sandbox` custom resource. It
+detects the served Sandbox API at runtime, caches the selected API version for
+the gateway process, and uses `v1beta1` when available before falling back to
+`v1alpha1`. Restart the gateway after an in-place Agent Sandbox upgrade so the
+driver can detect served API versions again. Driver events map Kubernetes object
+state and platform events into the shared compute-driver protobuf surface used
+by the gateway.
 
 Kubernetes API calls use explicit timeouts so gRPC handlers do not block
 indefinitely when the API server is slow or unavailable.
@@ -62,9 +66,9 @@ the supervisor's network namespace mount setup on AppArmor-enabled nodes.
 ## GPU Support
 
 When a sandbox requests GPU support, the driver checks node allocatable capacity
-for `nvidia.com/gpu` and requests one GPU resource in the workload spec. The
-sandbox image must provide the user-space libraries needed by the agent
-workload.
+for `nvidia.com/gpu` and requests the configured GPU count in the workload spec.
+When no count is set, the driver requests one GPU resource. The sandbox image
+must provide the user-space libraries needed by the agent workload.
 
 ## Driver Config POC
 
@@ -93,9 +97,10 @@ openshell sandbox create \
 ```
 
 Resource keys use native Kubernetes resource names and quantity strings. The
-POC parser renders the keys listed above and ignores unknown fields.
+POC parser renders the keys listed above and rejects unknown fields.
 `pod.runtime_class_name` maps to PodSpec `runtimeClassName` and overrides the
 driver's configured `default_runtime_class_name`; the typed public
 `SandboxTemplate.runtime_class_name` still takes precedence when set. Use the
-public `gpu` flag for the default GPU request and `driver_config` only for
-additional driver-owned resource details.
+public `--gpu` flag for the default GPU request, pass a count to `--gpu` for
+counted GPU requests, and use `driver_config` only for additional driver-owned
+resource details.

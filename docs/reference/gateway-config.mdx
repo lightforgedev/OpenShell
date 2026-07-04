@@ -98,6 +98,11 @@ guest_tls_ca            = "/etc/openshell/certs/ca.pem"
 guest_tls_cert          = "/etc/openshell/certs/client.pem"
 guest_tls_key           = "/etc/openshell/certs/client-key.pem"
 
+# Optional gRPC rate limit. Both values must be positive to enable the limit.
+# Set either value to 0, or omit both, to disable rate limiting.
+grpc_rate_limit_requests       = 120
+grpc_rate_limit_window_seconds = 60
+
 # Gateway listener TLS (distinct from the per-driver guest_tls_*).
 [openshell.gateway.tls]
 cert_path             = "/etc/openshell/certs/gateway.pem"
@@ -172,6 +177,9 @@ supervisor_image_pull_policy   = "IfNotPresent"
 # Use the image volume on Kubernetes >= 1.35 (GA in 1.36); switch to "init-container"
 # on older clusters or where the ImageVolume feature gate is off.
 supervisor_sideload_method     = "image-volume"
+# "combined" runs networking and process supervision in the sandbox agent
+# container and preserves the existing Kubernetes sandbox behavior.
+supervisor_topology            = "combined"
 grpc_endpoint                  = "https://openshell-gateway.agents.svc:8080"
 ssh_socket_path                = "/run/openshell/ssh.sock"
 client_tls_secret_name         = "openshell-client-tls"
@@ -184,6 +192,17 @@ workspace_default_storage_size = "10Gi"
 # default_runtime_class_name   = "kata-containers"
 # Kubelet clamps projected tokens below 600 seconds. The driver caps values at 86400.
 sa_token_ttl_secs              = 3600
+# Optional SPIFFE Workload API socket mounted into sandbox pods for dynamic
+# provider token grants. Use an absolute path under a dedicated directory;
+# shared roots such as /run, /var, /tmp, and /etc are rejected.
+# Supervisor-to-gateway auth still uses gateway JWTs.
+provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.sock"
+# Explicit sandbox UID/GID for the supervisor container securityContext and
+# PVC init container. When unset, the driver auto-detects from OpenShift SCC
+# namespace annotations (openshift.io/sa.scc.uid-range) if present, falling
+# back to 1000 on non-OpenShift clusters.
+# sandbox_uid = 1500
+# sandbox_gid = 1500
 ```
 
 ### Docker
@@ -208,6 +227,7 @@ sandbox_namespace  = "docker-dev"
 grpc_endpoint      = "https://host.openshell.internal:17670"
 # Skip the image-pull-and-extract step by pointing at a locally built binary.
 supervisor_bin     = "/usr/local/libexec/openshell/openshell-sandbox"
+# When supervisor_bin is omitted, Docker extracts /openshell-sandbox from this image.
 supervisor_image   = "ghcr.io/nvidia/openshell/supervisor:latest"
 guest_tls_ca       = "/etc/openshell/certs/ca.pem"
 guest_tls_cert     = "/etc/openshell/certs/client.pem"
@@ -215,6 +235,10 @@ guest_tls_key      = "/etc/openshell/certs/client-key.pem"
 network_name       = "openshell-docker"
 host_gateway_ip    = "172.17.0.1"
 ssh_socket_path    = "/run/openshell/ssh.sock"
+# Unsafe operator override. Host bind mounts, including Docker local-driver
+# bind-backed volumes, expose gateway-host paths inside sandboxes and can
+# negate OpenShell isolation and filesystem controls.
+enable_bind_mounts = false
 # Set to 0 to leave Docker's runtime default unchanged.
 sandbox_pids_limit = 2048
 ```
@@ -250,8 +274,16 @@ supervisor_image        = "ghcr.io/nvidia/openshell/supervisor:latest"
 guest_tls_ca            = "/etc/openshell/certs/ca.pem"
 guest_tls_cert          = "/etc/openshell/certs/client.pem"
 guest_tls_key           = "/etc/openshell/certs/client-key.pem"
+# Unsafe operator override. Host bind mounts, including Podman local-driver
+# bind-backed volumes, expose gateway-host paths inside sandboxes and can
+# negate OpenShell isolation and filesystem controls.
+enable_bind_mounts      = false
 # Set to 0 to leave Podman's runtime default unchanged.
 sandbox_pids_limit      = 2048
+# Health check interval in seconds. Lower values detect readiness faster
+# but increase process churn (each check spawns a conmon subprocess).
+# Set to 0 to disable health checks entirely. Default: 10.
+health_check_interval_secs = 10
 ```
 
 ### MicroVM
@@ -283,4 +315,28 @@ overlay_disk_mib = 4096
 guest_tls_ca     = "/var/lib/openshell/guest-tls/ca.pem"
 guest_tls_cert   = "/var/lib/openshell/guest-tls/client.pem"
 guest_tls_key    = "/var/lib/openshell/guest-tls/client-key.pem"
+# Resolved sandbox UID/GID for the rootfs /etc/passwd entry.
+# Defaults to 10001 when unset; matching GID is used if sandbox_gid is empty.
+# sandbox_uid = 20001
+```
+
+### Extension Driver
+
+Extension drivers run outside the gateway and expose the
+`compute_driver.proto` gRPC service on a Unix socket. Use a non-reserved driver
+name; built-in names such as `vm`, `docker`, `podman`, and `kubernetes` cannot
+be selected through unmanaged socket endpoints. The selected driver name is the
+key used for driver-owned sandbox config such as `template.driver_config.<name>`.
+
+```toml
+[openshell]
+version = 1
+
+[openshell.gateway]
+bind_address    = "127.0.0.1:17670"
+log_level       = "info"
+compute_drivers = ["kyma"]
+
+[openshell.drivers.kyma]
+socket_path = "/run/openshell/kyma-compute-driver.sock"
 ```

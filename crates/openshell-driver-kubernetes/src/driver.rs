@@ -3,12 +3,13 @@
 
 //! Kubernetes compute driver.
 
+use super::AppArmorProfile;
 use crate::config::{
-    AppArmorProfile, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE,
+    DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID, DEFAULT_WORKSPACE_STORAGE_SIZE,
     KubernetesComputeConfig, SupervisorSideloadMethod,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
-use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node};
+use k8s_openapi::api::core::v1::{Event as KubeEventObj, Namespace, Node};
 use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams};
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
@@ -17,6 +18,7 @@ use kube::{Client, Error as KubeError};
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, SUPERVISOR_IMAGE_BINARY_PATH,
 };
+use openshell_core::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
@@ -25,14 +27,17 @@ use openshell_core::proto::compute::v1::{
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
     DriverSandbox as Sandbox, DriverSandboxSpec as SandboxSpec,
     DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
-    GetCapabilitiesResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
-    WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
+    GetCapabilitiesResponse, GpuResourceRequirements, WatchSandboxesDeletedEvent,
+    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent,
+    watch_sandboxes_event,
 };
+use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{OnceCell, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
 
@@ -43,6 +48,8 @@ pub type WatchStream =
 pub enum KubernetesDriverError {
     #[error("sandbox already exists")]
     AlreadyExists,
+    #[error("{0}")]
+    InvalidArgument(String),
     #[error("{0}")]
     Precondition(String),
     #[error("{0}")]
@@ -62,6 +69,7 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
     fn from(err: KubernetesDriverError) -> Self {
         match err {
             KubernetesDriverError::AlreadyExists => Self::AlreadyExists,
+            KubernetesDriverError::InvalidArgument(m) => Self::InvalidArgument(m),
             KubernetesDriverError::Precondition(m) => Self::Precondition(m),
             KubernetesDriverError::Message(m) => Self::Message(m),
         }
@@ -74,11 +82,18 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
 const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
 
 const SANDBOX_GROUP: &str = "agents.x-k8s.io";
-const SANDBOX_VERSION: &str = "v1alpha1";
+const SANDBOX_VERSION_V1BETA1: &str = "v1beta1";
+const SANDBOX_VERSION_V1ALPHA1: &str = "v1alpha1";
+const SANDBOX_VERSIONS: &[&str] = &[SANDBOX_VERSION_V1BETA1, SANDBOX_VERSION_V1ALPHA1];
 pub const SANDBOX_KIND: &str = "Sandbox";
 
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
-const GPU_RESOURCE_QUANTITY: &str = "1";
+const SPIFFE_WORKLOAD_API_VOLUME_NAME: &str = "spiffe-workload-api";
+
+struct AgentSandboxApi {
+    api: Api<DynamicObject>,
+    resource: ApiResource,
+}
 
 // This POC treats the selected Struct as a driver-local typed schema. Once the
 // Kubernetes shape stabilizes, these serde structs may move to driver-local
@@ -87,14 +102,38 @@ const GPU_RESOURCE_QUANTITY: &str = "1";
 // translation layer; the RFC boundary is Struct at the gateway, typed config in
 // the selected driver.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct KubernetesSandboxDriverConfig {
     pod: KubernetesPodDriverConfig,
     containers: KubernetesDriverContainersConfig,
 }
 
+impl KubernetesSandboxDriverConfig {
+    fn from_sandbox(sandbox: &Sandbox) -> Result<Self, String> {
+        let Some(template) = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+        else {
+            return Ok(Self::default());
+        };
+
+        Self::from_template(template)
+    }
+
+    fn from_template(template: &SandboxTemplate) -> Result<Self, String> {
+        let Some(config) = template.driver_config.as_ref() else {
+            return Ok(Self::default());
+        };
+
+        let json = serde_json::Value::Object(struct_to_json_object(config));
+        serde_json::from_value(json)
+            .map_err(|err| format!("invalid kubernetes driver_config: {err}"))
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct KubernetesPodDriverConfig {
     node_selector: BTreeMap<String, String>,
     runtime_class_name: String,
@@ -103,19 +142,19 @@ struct KubernetesPodDriverConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct KubernetesDriverContainersConfig {
     agent: KubernetesContainerDriverConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct KubernetesContainerDriverConfig {
     resources: KubernetesContainerResourceConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct KubernetesContainerResourceConfig {
     requests: BTreeMap<String, String>,
     limits: BTreeMap<String, String>,
@@ -160,6 +199,7 @@ const WORKSPACE_SENTINEL: &str = ".workspace-initialized";
 pub struct KubernetesComputeDriver {
     client: Client,
     watch_client: Client,
+    sandbox_api_version: Arc<OnceCell<&'static str>>,
     config: KubernetesComputeConfig,
 }
 
@@ -174,29 +214,38 @@ impl std::fmt::Debug for KubernetesComputeDriver {
 }
 
 impl KubernetesComputeDriver {
-    pub async fn new(config: KubernetesComputeConfig) -> Result<Self, KubeError> {
+    pub async fn new(config: KubernetesComputeConfig) -> Result<Self, KubernetesDriverError> {
+        config
+            .validate_provider_spiffe_workload_api_socket_path()
+            .map_err(KubernetesDriverError::Precondition)?;
+        config
+            .validate_sandbox_identity_config()
+            .map_err(KubernetesDriverError::Precondition)?;
         let base_config = match kube::Config::incluster() {
             Ok(c) => c,
             Err(_) => kube::Config::infer()
                 .await
-                .map_err(kube::Error::InferConfig)?,
+                .map_err(kube::Error::InferConfig)
+                .map_err(KubernetesDriverError::from_kube)?,
         };
 
         let mut kube_config = base_config.clone();
         kube_config.connect_timeout = Some(Duration::from_secs(10));
         kube_config.read_timeout = Some(Duration::from_secs(30));
         kube_config.write_timeout = Some(Duration::from_secs(30));
-        let client = Client::try_from(kube_config)?;
+        let client = Client::try_from(kube_config).map_err(KubernetesDriverError::from_kube)?;
 
         let mut watch_kube_config = base_config;
         watch_kube_config.connect_timeout = Some(Duration::from_secs(10));
         watch_kube_config.read_timeout = None;
         watch_kube_config.write_timeout = Some(Duration::from_secs(30));
-        let watch_client = Client::try_from(watch_kube_config)?;
+        let watch_client =
+            Client::try_from(watch_kube_config).map_err(KubernetesDriverError::from_kube)?;
 
         Ok(Self {
             client,
             watch_client,
+            sandbox_api_version: Arc::new(OnceCell::new()),
             config,
         })
     }
@@ -221,16 +270,139 @@ impl KubernetesComputeDriver {
         &self.config.ssh_socket_path
     }
 
-    fn watch_api(&self) -> Api<DynamicObject> {
-        let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, SANDBOX_VERSION, SANDBOX_KIND);
+    fn agent_sandbox_api(&self, client: Client, sandbox_api_version: &str) -> AgentSandboxApi {
+        let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, sandbox_api_version, SANDBOX_KIND);
         let resource = ApiResource::from_gvk(&gvk);
-        Api::namespaced_with(self.watch_client.clone(), &self.config.namespace, &resource)
+        let api = Api::namespaced_with(client, &self.config.namespace, &resource);
+        AgentSandboxApi { api, resource }
     }
 
-    fn api(&self) -> Api<DynamicObject> {
-        let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, SANDBOX_VERSION, SANDBOX_KIND);
-        let resource = ApiResource::from_gvk(&gvk);
-        Api::namespaced_with(self.client.clone(), &self.config.namespace, &resource)
+    async fn supported_agent_sandbox_api(&self, client: Client) -> Result<AgentSandboxApi, String> {
+        let sandbox_api_version = self.supported_sandbox_api_version(client.clone()).await?;
+        Ok(self.agent_sandbox_api(client, sandbox_api_version))
+    }
+
+    async fn supported_sandbox_api_version(&self, client: Client) -> Result<&'static str, String> {
+        self.sandbox_api_version
+            .get_or_try_init(
+                || async move { self.detect_supported_sandbox_api_version(client).await },
+            )
+            .await
+            .copied()
+    }
+
+    async fn detect_supported_sandbox_api_version(
+        &self,
+        client: Client,
+    ) -> Result<&'static str, String> {
+        for sandbox_api_version in SANDBOX_VERSIONS {
+            let agent_sandbox_api = self.agent_sandbox_api(client.clone(), sandbox_api_version);
+            match tokio::time::timeout(
+                KUBE_API_TIMEOUT,
+                agent_sandbox_api.api.list(&ListParams::default().limit(1)),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    debug!(
+                        namespace = %self.config.namespace,
+                        sandbox_api_version = %sandbox_api_version,
+                        "Selected Agent Sandbox API version"
+                    );
+                    return Ok(sandbox_api_version);
+                }
+                Ok(Err(err)) if should_try_next_sandbox_api_version(&err) => {
+                    debug!(
+                        namespace = %self.config.namespace,
+                        sandbox_api_version = %sandbox_api_version,
+                        error = %err,
+                        "Sandbox API version is not available; trying next supported version"
+                    );
+                }
+                Ok(Err(err)) => return Err(err.to_string()),
+                Err(_elapsed) => {
+                    return Err(format!(
+                        "timed out after {}s waiting for Kubernetes API",
+                        KUBE_API_TIMEOUT.as_secs()
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "no supported Agent Sandbox API version is available; tried {}",
+            SANDBOX_VERSIONS.join(", ")
+        ))
+    }
+
+    /// Resolve sandbox UID/GID from config or `OpenShift` SCC namespace annotations.
+    ///
+    /// Returns `(uid, gid, ns_annotations_map)`:
+    /// - If `sandbox_uid` is set in config, returns that (with fallback GID)
+    /// - Otherwise fetches the target namespace and checks for
+    ///   `openshift.io/sa.scc.uid-range` / `openshift.io/sa.scc.supplemental-groups`
+    ///   annotations.
+    /// - If neither config nor `OpenShift` is found, returns `(1000, 1000, {})` as defaults.
+    async fn resolve_sandbox_identity(&self) -> (u32, u32, BTreeMap<String, String>) {
+        // Explicit config takes priority — skip namespace lookup entirely.
+        if self.config.sandbox_uid.is_some() {
+            let uid = self.config.resolve_sandbox_uid(None);
+            let gid = self.config.resolve_sandbox_gid(uid, None);
+            return (uid, gid, BTreeMap::new());
+        }
+
+        // Try to read namespace annotations for OpenShift SCC.
+        // Namespace is namespaced so Api::all works (it's cluster-scoped but
+        // can list all namespaces) and we filter by name, or use Api::namespaced.
+        let ns_api: Api<Namespace> = Api::all(self.client.clone());
+        match tokio::time::timeout(KUBE_API_TIMEOUT, ns_api.get(self.config.namespace.as_str()))
+            .await
+        {
+            Ok(Ok(ns)) => {
+                let anns = ns.metadata.annotations.unwrap_or_default();
+                tracing::info!(
+                    namespace = %self.config.namespace,
+                    uid_range = ?anns.get(crate::config::ANNOTATION_SCC_UID_RANGE),
+                    sup_groups = ?anns.get(crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS),
+                    "Resolved namespace annotations for sandbox identity"
+                );
+                let uid = self.config.resolve_sandbox_uid(Some(&anns));
+                // Explicit sandbox_gid config wins; SCC annotation only applies when not set.
+                let baseline_gid = self.config.resolve_sandbox_gid(uid, None);
+                let gid = self.config.sandbox_gid.map_or_else(
+                    || {
+                        anns.get(crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS)
+                            .and_then(|sup_range| {
+                                KubernetesComputeConfig::from_open_shift_supplemental_groups(
+                                    sup_range,
+                                )
+                            })
+                            .unwrap_or(baseline_gid)
+                    },
+                    |_| baseline_gid,
+                );
+                tracing::info!(uid, gid, "Resolved sandbox identity");
+                (uid, gid, anns)
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    namespace = %self.config.namespace,
+                    error = %e,
+                    "Failed to fetch namespace for SCC annotations, falling back to defaults"
+                );
+                let uid = DEFAULT_SANDBOX_UID;
+                let gid = self.config.resolve_sandbox_gid(uid, None);
+                (uid, gid, BTreeMap::new())
+            }
+            Err(_) => {
+                tracing::warn!(
+                    namespace = %self.config.namespace,
+                    "Namespace fetch timed out, falling back to defaults"
+                );
+                let uid = DEFAULT_SANDBOX_UID;
+                let gid = self.config.resolve_sandbox_gid(uid, None);
+                (uid, gid, BTreeMap::new())
+            }
+        }
     }
 
     async fn has_gpu_capacity(&self) -> Result<bool, KubeError> {
@@ -245,8 +417,14 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
-        let gpu_requested = sandbox.spec.as_ref().is_some_and(|spec| spec.gpu);
-        if gpu_requested
+        let _ = KubernetesSandboxDriverConfig::from_sandbox(sandbox)
+            .map_err(tonic::Status::invalid_argument)?;
+        let gpu_requirements = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| driver_gpu_requirements(spec.resource_requirements.as_ref()));
+        validate_gpu_request(gpu_requirements)?;
+        if gpu_requirements.is_some()
             && !self.has_gpu_capacity().await.map_err(|err| {
                 tonic::Status::internal(format!("check GPU node capacity failed: {err}"))
             })?
@@ -265,8 +443,10 @@ impl KubernetesComputeDriver {
             "Fetching sandbox from Kubernetes"
         );
 
-        let api = self.api();
-        match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(name)).await {
+        let agent_sandbox_api = self
+            .supported_agent_sandbox_api(self.client.clone())
+            .await?;
+        match tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.get(name)).await {
             Ok(Ok(obj)) => sandbox_from_object(&self.config.namespace, obj).map(Some),
             Ok(Err(KubeError::Api(err))) if err.code == 404 => {
                 debug!(sandbox_name = %name, "Sandbox not found in Kubernetes");
@@ -300,8 +480,15 @@ impl KubernetesComputeDriver {
             "Listing sandboxes from Kubernetes"
         );
 
-        let api = self.api();
-        match tokio::time::timeout(KUBE_API_TIMEOUT, api.list(&ListParams::default())).await {
+        let agent_sandbox_api = self
+            .supported_agent_sandbox_api(self.client.clone())
+            .await?;
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            agent_sandbox_api.api.list(&ListParams::default()),
+        )
+        .await
+        {
             Ok(Ok(list)) => {
                 let mut sandboxes = list
                     .items
@@ -337,7 +524,17 @@ impl KubernetesComputeDriver {
         }
     }
 
+    #[allow(clippy::similar_names)]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
+        let _ = KubernetesSandboxDriverConfig::from_sandbox(sandbox)
+            .map_err(KubernetesDriverError::InvalidArgument)?;
+        let gpu_requirements = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| driver_gpu_requirements(spec.resource_requirements.as_ref()));
+        validate_gpu_request(gpu_requirements).map_err(|status| {
+            KubernetesDriverError::InvalidArgument(status.message().to_string())
+        })?;
         let name = sandbox.name.as_str();
         info!(
             sandbox_id = %sandbox.id,
@@ -346,15 +543,14 @@ impl KubernetesComputeDriver {
             "Creating sandbox in Kubernetes"
         );
 
-        let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, SANDBOX_VERSION, SANDBOX_KIND);
-        let resource = ApiResource::from_gvk(&gvk);
-        let mut obj = DynamicObject::new(name, &resource);
-        obj.metadata = ObjectMeta {
-            name: Some(name.to_string()),
-            namespace: Some(self.config.namespace.clone()),
-            labels: Some(sandbox_labels(sandbox)),
-            ..Default::default()
-        };
+        let agent_sandbox_api = self
+            .supported_agent_sandbox_api(self.client.clone())
+            .await
+            .map_err(KubernetesDriverError::Message)?;
+
+        // Resolve sandbox UID/GID from config or OpenShift SCC namespace annotations.
+        let (resolved_uid, resolved_gid, ns_annotations) = self.resolve_sandbox_identity().await;
+
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
             image_pull_policy: &self.config.image_pull_policy,
@@ -374,11 +570,47 @@ impl KubernetesComputeDriver {
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
             default_runtime_class_name: &self.config.default_runtime_class_name,
             sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
+            provider_spiffe_enabled: self.config.provider_spiffe_enabled(),
+            provider_spiffe_workload_api_socket_path: &self
+                .config
+                .provider_spiffe_workload_api_socket_path,
+            sandbox_uid: resolved_uid,
+            sandbox_gid: resolved_gid,
         };
-        obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
-        let api = self.api();
 
-        match tokio::time::timeout(KUBE_API_TIMEOUT, api.create(&PostParams::default(), &obj)).await
+        let mut obj = DynamicObject::new(name, &agent_sandbox_api.resource);
+        // Copy only the SCC-related annotations onto the Sandbox CR for
+        // traceability. Copying the full namespace annotation map exposes
+        // unrelated cluster metadata and can fail with oversized annotations.
+        let scc_annotations: BTreeMap<String, String> = [
+            crate::config::ANNOTATION_SCC_UID_RANGE,
+            crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS,
+        ]
+        .iter()
+        .filter_map(|key| {
+            ns_annotations
+                .get(*key)
+                .map(|v| ((*key).to_string(), v.clone()))
+        })
+        .collect();
+        obj.metadata = ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(self.config.namespace.clone()),
+            labels: Some(sandbox_labels(sandbox)),
+            annotations: if scc_annotations.is_empty() {
+                None
+            } else {
+                Some(scc_annotations)
+            },
+            ..Default::default()
+        };
+
+        obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            agent_sandbox_api.api.create(&PostParams::default(), &obj),
+        )
+        .await
         {
             Ok(Ok(_result)) => {
                 info!(
@@ -419,9 +651,14 @@ impl KubernetesComputeDriver {
             "Deleting sandbox from Kubernetes"
         );
 
-        let api = self.api();
-        match tokio::time::timeout(KUBE_API_TIMEOUT, api.delete(name, &DeleteParams::default()))
-            .await
+        let agent_sandbox_api = self
+            .supported_agent_sandbox_api(self.client.clone())
+            .await?;
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            agent_sandbox_api.api.delete(name, &DeleteParams::default()),
+        )
+        .await
         {
             Ok(Ok(_response)) => {
                 info!(sandbox_name = %name, "Sandbox deleted from Kubernetes");
@@ -454,8 +691,10 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn sandbox_exists(&self, name: &str) -> Result<bool, String> {
-        let api = self.api();
-        match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(name)).await {
+        let agent_sandbox_api = self
+            .supported_agent_sandbox_api(self.client.clone())
+            .await?;
+        match tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.get(name)).await {
             Ok(Ok(_)) => Ok(true),
             Ok(Err(KubeError::Api(err))) if err.code == 404 => Ok(false),
             Ok(Err(err)) => Err(err.to_string()),
@@ -470,9 +709,12 @@ impl KubernetesComputeDriver {
     #[allow(clippy::unused_async)]
     pub async fn watch_sandboxes(&self) -> Result<WatchStream, String> {
         let namespace = self.config.namespace.clone();
-        let sandbox_api = self.watch_api();
+        let agent_sandbox_api = self
+            .supported_agent_sandbox_api(self.watch_client.clone())
+            .await?;
         let event_api: Api<KubeEventObj> = Api::namespaced(self.watch_client.clone(), &namespace);
-        let mut sandbox_stream = watcher::watcher(sandbox_api, watcher::Config::default()).boxed();
+        let mut sandbox_stream =
+            watcher::watcher(agent_sandbox_api.api, watcher::Config::default()).boxed();
         let mut event_stream = watcher::watcher(event_api, watcher::Config::default()).boxed();
         let (tx, rx) = mpsc::channel(256);
 
@@ -594,6 +836,22 @@ impl KubernetesComputeDriver {
 
         Ok(Box::pin(ReceiverStream::new(rx)))
     }
+}
+
+fn should_try_next_sandbox_api_version(err: &KubeError) -> bool {
+    // Kubernetes returns a structured 404 for some missing API resources and a
+    // raw "404 page not found" body for others. Both mean the probed
+    // group/version is unavailable and the next supported Sandbox API version
+    // should be tried.
+    matches!(err, KubeError::Api(api) if api.code == 404)
+}
+
+fn validate_gpu_request(
+    gpu_requirements: Option<&GpuResourceRequirements>,
+) -> Result<(), tonic::Status> {
+    let _ =
+        effective_driver_gpu_count(gpu_requirements).map_err(tonic::Status::invalid_argument)?;
+    Ok(())
 }
 
 fn sandbox_labels(sandbox: &Sandbox) -> BTreeMap<String, String> {
@@ -769,7 +1027,7 @@ fn extract_image_size(message: &str) -> Option<u64> {
 }
 
 /// Path where the supervisor binary is mounted inside the agent container.
-const SUPERVISOR_MOUNT_PATH: &str = "/opt/openshell/bin";
+const SUPERVISOR_MOUNT_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_DIR;
 
 /// Name of the volume used to side-load the supervisor binary.
 const SUPERVISOR_VOLUME_NAME: &str = "openshell-supervisor-bin";
@@ -862,11 +1120,14 @@ fn supervisor_init_container(
 /// In both cases, the agent container gets a command override to run the
 /// side-loaded binary and `runAsUser: 0` so it can create network namespaces,
 /// set up the proxy, and configure Landlock/seccomp.
+#[allow(clippy::similar_names)]
 fn apply_supervisor_sideload(
     pod_template: &mut serde_json::Value,
     supervisor_image: &str,
     supervisor_image_pull_policy: &str,
     method: SupervisorSideloadMethod,
+    sandbox_uid: u32,
+    sandbox_gid: u32,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
@@ -946,6 +1207,23 @@ fn apply_supervisor_sideload(
         if let Some(volume_mounts) = volume_mounts {
             volume_mounts.push(supervisor_volume_mount());
         }
+
+        // Inject resolved sandbox UID/GID as environment variables so the
+        // supervisor can use them directly without /etc/passwd lookups.
+        let env = container
+            .entry("env")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(env) = env {
+            env.push(serde_json::json!({
+                "name": openshell_core::sandbox_env::SANDBOX_UID.to_string(),
+                "value": sandbox_uid.to_string(),
+            }));
+            env.push(serde_json::json!({
+                "name": openshell_core::sandbox_env::SANDBOX_GID.to_string(),
+                "value": sandbox_gid.to_string(),
+            }));
+        }
     }
 }
 
@@ -968,10 +1246,20 @@ fn apply_workspace_persistence(
     pod_template: &mut serde_json::Value,
     image: &str,
     image_pull_policy: &str,
+    sandbox_gid: u32,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
     };
+
+    // fsGroup is a pod-level field — it instructs kubelet to chown mounted
+    // volumes to this GID. It is invalid at the container securityContext level.
+    let pod_sc = spec
+        .entry("securityContext")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(pod_sc_obj) = pod_sc.as_object_mut() {
+        pod_sc_obj.insert("fsGroup".to_string(), serde_json::json!(sandbox_gid));
+    }
 
     // 1. Add workspace volume mount to the agent container
     let containers = spec.get_mut("containers").and_then(|v| v.as_array_mut());
@@ -1030,7 +1318,9 @@ fn apply_workspace_persistence(
             "name": WORKSPACE_INIT_CONTAINER_NAME,
             "image": image,
             "command": ["sh", "-c", copy_cmd],
-            "securityContext": { "runAsUser": 0 },
+            "securityContext": {
+                "runAsUser": 0,
+            },
             "volumeMounts": [{
                 "name": WORKSPACE_VOLUME_NAME,
                 "mountPath": WORKSPACE_INIT_MOUNT_PATH
@@ -1090,6 +1380,12 @@ struct SandboxPodParams<'a> {
     /// Lifetime (seconds) of the projected `ServiceAccount` token used
     /// for the bootstrap `IssueSandboxToken` exchange.
     sa_token_ttl_secs: i64,
+    provider_spiffe_enabled: bool,
+    provider_spiffe_workload_api_socket_path: &'a str,
+    /// Resolved sandbox UID for supervisor `runAsUser` and env var.
+    sandbox_uid: u32,
+    /// Resolved sandbox GID for PVC init container operations.
+    sandbox_gid: u32,
 }
 
 impl Default for SandboxPodParams<'_> {
@@ -1113,6 +1409,10 @@ impl Default for SandboxPodParams<'_> {
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
             default_runtime_class_name: "",
             sa_token_ttl_secs: 3600,
+            provider_spiffe_enabled: false,
+            provider_spiffe_workload_api_socket_path: "",
+            sandbox_uid: DEFAULT_SANDBOX_UID,
+            sandbox_gid: DEFAULT_SANDBOX_UID,
         }
     }
 }
@@ -1129,18 +1429,8 @@ fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String,
 }
 
 fn kubernetes_driver_config(template: &SandboxTemplate) -> KubernetesSandboxDriverConfig {
-    let Some(config) = template.driver_config.as_ref() else {
-        return KubernetesSandboxDriverConfig::default();
-    };
-
-    let json = serde_json::Value::Object(proto_struct_to_json_object(config));
-    match serde_json::from_value(json) {
-        Ok(config) => config,
-        Err(err) => {
-            warn!(error = %err, "Ignoring invalid Kubernetes driver_config");
-            KubernetesSandboxDriverConfig::default()
-        }
-    }
+    KubernetesSandboxDriverConfig::from_template(template)
+        .expect("validated Kubernetes driver_config")
 }
 
 fn sandbox_to_k8s_spec(
@@ -1149,23 +1439,18 @@ fn sandbox_to_k8s_spec(
 ) -> serde_json::Value {
     let mut root = serde_json::Map::new();
 
-    // Determine early whether the user provided custom volumeClaimTemplates.
-    // When they haven't, we inject a default workspace VCT and corresponding
-    // init container + volume mount so sandbox data persists.  We need this
-    // flag before building the podTemplate because the workspace persistence
-    // transforms are applied inside sandbox_template_to_k8s.
-    let user_has_vct = spec
-        .and_then(|s| s.template.as_ref())
-        .and_then(|t| platform_config_struct(t, "volume_claim_templates"))
-        .is_some();
-    let inject_workspace = !user_has_vct;
-
     if let Some(spec) = spec {
         let pod_env = spec_pod_env(Some(spec));
         if let Some(template) = spec.template.as_ref() {
             root.insert(
                 "podTemplate".to_string(),
-                sandbox_template_to_k8s(template, spec.gpu, &pod_env, inject_workspace, params),
+                sandbox_template_to_k8s_with_gpu_requirements(
+                    template,
+                    driver_gpu_requirements(spec.resource_requirements.as_ref()),
+                    &pod_env,
+                    true,
+                    params,
+                ),
             );
             if !template.agent_socket_path.is_empty() {
                 root.insert(
@@ -1173,33 +1458,24 @@ fn sandbox_to_k8s_spec(
                     serde_json::json!(template.agent_socket_path),
                 );
             }
-            if let Some(volume_templates) =
-                platform_config_struct(template, "volume_claim_templates")
-            {
-                root.insert("volumeClaimTemplates".to_string(), volume_templates);
-            }
         }
     }
 
-    // Inject the default workspace volumeClaimTemplate when the user didn't
-    // provide their own.
-    if inject_workspace {
-        root.insert(
-            "volumeClaimTemplates".to_string(),
-            default_workspace_volume_claim_templates(params.workspace_default_storage_size),
-        );
-    }
+    root.insert(
+        "volumeClaimTemplates".to_string(),
+        default_workspace_volume_claim_templates(params.workspace_default_storage_size),
+    );
 
     // podTemplate is required by the Kubernetes CRD - ensure it's always present
     if !root.contains_key("podTemplate") {
         let pod_env = spec_pod_env(spec);
         root.insert(
             "podTemplate".to_string(),
-            sandbox_template_to_k8s(
+            sandbox_template_to_k8s_with_gpu_requirements(
                 &SandboxTemplate::default(),
-                spec.is_some_and(|s| s.gpu),
+                driver_gpu_requirements(spec.and_then(|s| s.resource_requirements.as_ref())),
                 &pod_env,
-                inject_workspace,
+                true,
                 params,
             ),
         );
@@ -1210,6 +1486,7 @@ fn sandbox_to_k8s_spec(
     )
 }
 
+#[cfg(test)]
 fn sandbox_template_to_k8s(
     template: &SandboxTemplate,
     gpu: bool,
@@ -1217,11 +1494,45 @@ fn sandbox_template_to_k8s(
     inject_workspace: bool,
     params: &SandboxPodParams<'_>,
 ) -> serde_json::Value {
+    let gpu_requirements = gpu.then_some(GpuResourceRequirements { count: None });
+    sandbox_template_to_k8s_with_gpu_requirements(
+        template,
+        gpu_requirements.as_ref(),
+        spec_environment,
+        inject_workspace,
+        params,
+    )
+}
+
+fn sandbox_template_to_k8s_with_gpu_requirements(
+    template: &SandboxTemplate,
+    gpu_requirements: Option<&GpuResourceRequirements>,
+    spec_environment: &std::collections::HashMap<String, String>,
+    inject_workspace: bool,
+    params: &SandboxPodParams<'_>,
+) -> serde_json::Value {
     let driver_config = kubernetes_driver_config(template);
 
     let mut metadata = serde_json::Map::new();
-    if !template.labels.is_empty() {
-        metadata.insert("labels".to_string(), serde_json::json!(template.labels));
+    let mut pod_labels = template
+        .labels
+        .iter()
+        .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+        .collect::<serde_json::Map<String, serde_json::Value>>();
+    if params.provider_spiffe_enabled {
+        pod_labels.insert(
+            LABEL_MANAGED_BY.to_string(),
+            serde_json::Value::String(LABEL_MANAGED_BY_VALUE.to_string()),
+        );
+        if !params.sandbox_id.is_empty() {
+            pod_labels.insert(
+                LABEL_SANDBOX_ID.to_string(),
+                serde_json::Value::String(params.sandbox_id.to_string()),
+            );
+        }
+    }
+    if !pod_labels.is_empty() {
+        metadata.insert("labels".to_string(), serde_json::Value::Object(pod_labels));
     }
     // Carry the sandbox UUID as a pod annotation so the gateway can resolve
     // a projected SA token claim (pod name + uid) back to a sandbox identity
@@ -1278,7 +1589,7 @@ fn sandbox_template_to_k8s(
 
     if use_user_namespaces {
         spec.insert("hostUsers".to_string(), serde_json::json!(false));
-        if gpu {
+        if gpu_requirements.is_some() {
             warn!(
                 "GPU sandbox with user namespaces enabled — \
                  NVIDIA device plugin compatibility is unverified"
@@ -1336,6 +1647,7 @@ fn sandbox_template_to_k8s(
         params.grpc_endpoint,
         params.ssh_socket_path,
         !params.client_tls_secret_name.is_empty(),
+        provider_spiffe_socket_path(params),
     );
 
     container.insert("env".to_string(), serde_json::Value::Array(env));
@@ -1358,15 +1670,22 @@ fn sandbox_template_to_k8s(
     }
     container.insert("securityContext".to_string(), security_context);
 
-    // Mount client TLS secret for mTLS to the server, plus the projected
-    // ServiceAccount token used to bootstrap the sandbox's gateway JWT
-    // via `IssueSandboxToken`.
+    // Mount client TLS secret for mTLS to the server. Gateway identity uses
+    // the projected ServiceAccount bootstrap token. Provider token grants may
+    // additionally mount the SPIFFE Workload API socket.
     let mut volume_mounts: Vec<serde_json::Value> = Vec::new();
     if !params.client_tls_secret_name.is_empty() {
         volume_mounts.push(serde_json::json!({
             "name": "openshell-client-tls",
             "mountPath": "/etc/openshell-tls/client",
             "readOnly": true
+        }));
+    }
+    if params.provider_spiffe_enabled {
+        volume_mounts.push(serde_json::json!({
+            "name": SPIFFE_WORKLOAD_API_VOLUME_NAME,
+            "mountPath": spiffe_socket_mount_path(params.provider_spiffe_workload_api_socket_path),
+            "readOnly": true,
         }));
     }
     volume_mounts.push(serde_json::json!({
@@ -1379,7 +1698,7 @@ fn sandbox_template_to_k8s(
         serde_json::Value::Array(volume_mounts),
     );
 
-    if let Some(resources) = container_resources(template, gpu) {
+    if let Some(resources) = container_resources(template, gpu_requirements) {
         container.insert("resources".to_string(), resources);
     }
     apply_agent_driver_resources(&mut container, &driver_config.containers.agent.resources);
@@ -1395,6 +1714,15 @@ fn sandbox_template_to_k8s(
         volumes.push(serde_json::json!({
             "name": "openshell-client-tls",
             "secret": { "secretName": params.client_tls_secret_name, "defaultMode": 256 }
+        }));
+    }
+    if params.provider_spiffe_enabled {
+        volumes.push(serde_json::json!({
+            "name": SPIFFE_WORKLOAD_API_VOLUME_NAME,
+            "csi": {
+                "driver": "csi.spiffe.io",
+                "readOnly": true
+            }
         }));
     }
     // Projected ServiceAccountToken volume — kubelet writes a short-lived
@@ -1440,13 +1768,20 @@ fn sandbox_template_to_k8s(
         params.supervisor_image,
         params.supervisor_image_pull_policy,
         params.supervisor_sideload_method,
+        params.sandbox_uid,
+        params.sandbox_gid,
     );
 
     // Inject workspace persistence (init container + PVC volume mount) so
     // that /sandbox data survives pod rescheduling.  Skipped when the user
     // provides custom volumeClaimTemplates to avoid conflicts.
     if inject_workspace {
-        apply_workspace_persistence(&mut result, image, params.image_pull_policy);
+        apply_workspace_persistence(
+            &mut result,
+            image,
+            params.image_pull_policy,
+            params.sandbox_gid,
+        );
     }
 
     result
@@ -1548,7 +1883,10 @@ fn app_armor_profile_to_k8s(profile: &AppArmorProfile) -> serde_json::Value {
     value
 }
 
-fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_json::Value> {
+fn container_resources(
+    template: &SandboxTemplate,
+    gpu_requirements: Option<&GpuResourceRequirements>,
+) -> Option<serde_json::Value> {
     // Start from the raw resources passthrough in platform_config (preserves
     // custom resource types like GPU limits that users set via the public API
     // Struct), then overlay the typed DriverResourceRequirements on top.
@@ -1581,8 +1919,9 @@ fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_js
         apply("requests", "memory", memory_request);
     }
 
-    if gpu {
-        apply_gpu_limit(&mut resources);
+    if let Some(gpu) = gpu_requirements {
+        let quantity = gpu.count.unwrap_or(1).to_string();
+        apply_gpu_limit(&mut resources, &quantity);
     }
     if resources.as_object().is_some_and(serde_json::Map::is_empty) {
         None
@@ -1591,10 +1930,10 @@ fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_js
     }
 }
 
-fn apply_gpu_limit(resources: &mut serde_json::Value) {
+fn apply_gpu_limit(resources: &mut serde_json::Value, quantity: &str) {
     let Some(resources_obj) = resources.as_object_mut() else {
         *resources = serde_json::json!({});
-        return apply_gpu_limit(resources);
+        return apply_gpu_limit(resources, quantity);
     };
 
     let limits = resources_obj
@@ -1602,13 +1941,10 @@ fn apply_gpu_limit(resources: &mut serde_json::Value) {
         .or_insert_with(|| serde_json::json!({}));
     let Some(limits_obj) = limits.as_object_mut() else {
         *limits = serde_json::json!({});
-        return apply_gpu_limit(resources);
+        return apply_gpu_limit(resources, quantity);
     };
 
-    limits_obj.insert(
-        GPU_RESOURCE_NAME.to_string(),
-        serde_json::json!(GPU_RESOURCE_QUANTITY),
-    );
+    limits_obj.insert(GPU_RESOURCE_NAME.to_string(), serde_json::json!(quantity));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1621,10 +1957,22 @@ fn build_env_list(
     grpc_endpoint: &str,
     ssh_socket_path: &str,
     tls_enabled: bool,
+    provider_spiffe_socket_path: Option<&str>,
 ) -> Vec<serde_json::Value> {
     let mut env = existing_env.cloned().unwrap_or_default();
     apply_env_map(&mut env, template_environment);
     apply_env_map(&mut env, spec_environment);
+    let mut user_env = template_environment.clone();
+    user_env.extend(spec_environment.clone());
+    if !user_env.is_empty()
+        && let Ok(json) = serde_json::to_string(&user_env)
+    {
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::USER_ENVIRONMENT,
+            &json,
+        );
+    }
     apply_required_env(
         &mut env,
         sandbox_id,
@@ -1632,6 +1980,7 @@ fn build_env_list(
         grpc_endpoint,
         ssh_socket_path,
         tls_enabled,
+        provider_spiffe_socket_path,
     );
     env
 }
@@ -1654,6 +2003,7 @@ fn apply_required_env(
     grpc_endpoint: &str,
     ssh_socket_path: &str,
     tls_enabled: bool,
+    provider_spiffe_socket_path: Option<&str>,
 ) {
     upsert_env(env, openshell_core::sandbox_env::SANDBOX_ID, sandbox_id);
     upsert_env(env, openshell_core::sandbox_env::SANDBOX, sandbox_name);
@@ -1702,6 +2052,28 @@ fn apply_required_env(
         openshell_core::sandbox_env::K8S_SA_TOKEN_FILE,
         "/var/run/secrets/openshell/token",
     );
+    if let Some(socket_path) = provider_spiffe_socket_path {
+        upsert_env(
+            env,
+            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+            socket_path,
+        );
+    }
+}
+
+fn provider_spiffe_socket_path<'a>(params: &'a SandboxPodParams<'a>) -> Option<&'a str> {
+    params
+        .provider_spiffe_enabled
+        .then_some(params.provider_spiffe_workload_api_socket_path)
+}
+
+fn spiffe_socket_mount_path(socket_path: &str) -> String {
+    std::path::Path::new(socket_path)
+        .parent()
+        .and_then(std::path::Path::to_str)
+        .filter(|path| !path.is_empty() && *path != "/")
+        .expect("provider SPIFFE socket path should be validated before pod rendering")
+        .to_string()
 }
 
 fn upsert_env(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {
@@ -1740,44 +2112,13 @@ fn platform_config_bool(template: &SandboxTemplate, key: &str) -> Option<bool> {
 fn platform_config_struct(template: &SandboxTemplate, key: &str) -> Option<serde_json::Value> {
     let config = template.platform_config.as_ref()?;
     let value = config.fields.get(key)?;
-    let json = proto_value_to_json(value);
+    let json = value_to_json(value);
     // Return None for null/empty objects so callers can distinguish
     // "field absent" from "field present but empty".
     match &json {
         serde_json::Value::Null => None,
         serde_json::Value::Object(m) if m.is_empty() => None,
         _ => Some(json),
-    }
-}
-
-fn proto_struct_to_json_object(
-    config: &prost_types::Struct,
-) -> serde_json::Map<String, serde_json::Value> {
-    config
-        .fields
-        .iter()
-        .map(|(key, value)| (key.clone(), proto_value_to_json(value)))
-        .collect()
-}
-
-fn proto_value_to_json(value: &prost_types::Value) -> serde_json::Value {
-    match value.kind.as_ref() {
-        Some(prost_types::value::Kind::NumberValue(num)) => serde_json::Number::from_f64(*num)
-            .map_or(serde_json::Value::Null, serde_json::Value::Number),
-        Some(prost_types::value::Kind::StringValue(val)) => serde_json::Value::String(val.clone()),
-        Some(prost_types::value::Kind::BoolValue(val)) => serde_json::Value::Bool(*val),
-        Some(prost_types::value::Kind::StructValue(val)) => {
-            let mut map = serde_json::Map::new();
-            for (key, value) in &val.fields {
-                map.insert(key.clone(), proto_value_to_json(value));
-            }
-            serde_json::Value::Object(map)
-        }
-        Some(prost_types::value::Kind::ListValue(list)) => {
-            let values = list.values.iter().map(proto_value_to_json).collect();
-            serde_json::Value::Array(values)
-        }
-        Some(prost_types::value::Kind::NullValue(_)) | None => serde_json::Value::Null,
     }
 }
 
@@ -1852,6 +2193,7 @@ mod tests {
         PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
         PROGRESS_COMPLETE_STEP_KEY,
     };
+    use openshell_core::proto::compute::v1::{GpuResourceRequirements, ResourceRequirements};
     use prost_types::{Struct, Value, value::Kind};
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
@@ -1892,8 +2234,36 @@ mod tests {
         }
     }
 
+    fn kube_api_error(code: u16, message: &str) -> KubeError {
+        KubeError::Api(kube::core::ErrorResponse {
+            status: if code == 404 {
+                "404 Not Found".to_string()
+            } else {
+                "Failure".to_string()
+            },
+            message: message.to_string(),
+            reason: "Failed to parse error data".to_string(),
+            code,
+        })
+    }
+
     #[test]
-    fn driver_config_ignores_invalid_shape() {
+    fn sandbox_api_version_probe_retries_on_structured_and_raw_404() {
+        let structured = kube_api_error(404, "could not find the requested resource");
+        assert!(should_try_next_sandbox_api_version(&structured));
+
+        let raw = kube_api_error(404, "404 page not found\n");
+        assert!(should_try_next_sandbox_api_version(&raw));
+    }
+
+    #[test]
+    fn sandbox_api_version_probe_keeps_non_404_errors() {
+        let err = kube_api_error(403, "sandboxes.agents.x-k8s.io is forbidden");
+        assert!(!should_try_next_sandbox_api_version(&err));
+    }
+
+    #[test]
+    fn driver_config_rejects_invalid_shape() {
         let template = SandboxTemplate {
             driver_config: Some(json_struct(serde_json::json!({
                 "pod": "not-an-object"
@@ -1901,11 +2271,65 @@ mod tests {
             ..SandboxTemplate::default()
         };
 
-        let config = kubernetes_driver_config(&template);
+        let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
 
-        assert!(config.pod.node_selector.is_empty());
-        assert!(config.containers.agent.resources.requests.is_empty());
-        assert!(config.containers.agent.resources.limits.is_empty());
+        assert!(err.contains("invalid kubernetes driver_config"));
+    }
+
+    #[test]
+    fn driver_config_rejects_unknown_fields() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "cdi_devices": ["nvidia.com/gpu=0"]
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
+
+        assert!(err.contains("unknown field"));
+    }
+
+    #[test]
+    fn driver_config_from_sandbox_rejects_unknown_fields() {
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    driver_config: Some(json_struct(serde_json::json!({
+                        "gpu_device_ids": ["0000:2d:00.0"]
+                    }))),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = KubernetesSandboxDriverConfig::from_sandbox(&sandbox).unwrap_err();
+        assert!(err.contains("unknown field"));
+        assert!(err.contains("gpu_device_ids"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_gpu_count() {
+        let sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                resource_requirements: Some(ResourceRequirements {
+                    gpu: Some(GpuResourceRequirements { count: Some(0) }),
+                }),
+                ..SandboxSpec::default()
+            }),
+            ..Sandbox::default()
+        };
+
+        let gpu_requirements = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| driver_gpu_requirements(spec.resource_requirements.as_ref()));
+        let err = validate_gpu_request(gpu_requirements).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("gpu count must be greater than 0"));
     }
 
     #[test]
@@ -1975,6 +2399,8 @@ mod tests {
             "custom-image:latest",
             "IfNotPresent",
             SupervisorSideloadMethod::InitContainer,
+            1500, // sandbox_uid
+            1500, // sandbox_gid
         );
 
         let sc = &pod_template["spec"]["containers"][0]["securityContext"];
@@ -2004,6 +2430,8 @@ mod tests {
             "supervisor-image:latest",
             "IfNotPresent",
             SupervisorSideloadMethod::InitContainer,
+            1000, // sandbox_uid
+            1000, // sandbox_gid
         );
 
         let sc = &pod_template["spec"]["containers"][0]["securityContext"];
@@ -2029,6 +2457,8 @@ mod tests {
             "supervisor-image:latest",
             "IfNotPresent",
             SupervisorSideloadMethod::InitContainer,
+            1000, // sandbox_uid
+            1000, // sandbox_gid
         );
 
         // Volume should be an emptyDir
@@ -2103,6 +2533,8 @@ mod tests {
             "supervisor-image:latest",
             "IfNotPresent",
             SupervisorSideloadMethod::ImageVolume,
+            1000, // sandbox_uid
+            1000, // sandbox_gid
         );
 
         let volumes = pod_template["spec"]["volumes"]
@@ -2157,6 +2589,8 @@ mod tests {
             "supervisor-image:latest",
             "",
             SupervisorSideloadMethod::ImageVolume,
+            1000, // sandbox_uid
+            1000, // sandbox_gid
         );
 
         let volume = &pod_template["spec"]["volumes"][0];
@@ -2185,6 +2619,7 @@ mod tests {
             "https://endpoint:8080",
             "0.0.0.0:2222",
             true, // tls_enabled
+            None,
         );
 
         // Extract the TLS-related env vars
@@ -2232,7 +2667,27 @@ mod tests {
         );
         assert_eq!(
             pod_template["spec"]["containers"][0]["resources"]["limits"][GPU_RESOURCE_NAME],
-            serde_json::json!(GPU_RESOURCE_QUANTITY)
+            serde_json::json!("1")
+        );
+    }
+
+    #[test]
+    fn gpu_count_sandbox_adds_requested_gpu_limit() {
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            let gpu_requirements = GpuResourceRequirements { count: Some(2) };
+            sandbox_template_to_k8s_with_gpu_requirements(
+                &SandboxTemplate::default(),
+                Some(&gpu_requirements),
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["resources"]["limits"][GPU_RESOURCE_NAME],
+            serde_json::json!("2")
         );
     }
 
@@ -2498,10 +2953,7 @@ mod tests {
 
         let limits = &pod_template["spec"]["containers"][0]["resources"]["limits"];
         assert_eq!(limits["cpu"], serde_json::json!("2"));
-        assert_eq!(
-            limits[GPU_RESOURCE_NAME],
-            serde_json::json!(GPU_RESOURCE_QUANTITY)
-        );
+        assert_eq!(limits[GPU_RESOURCE_NAME], serde_json::json!("1"));
     }
 
     #[test]
@@ -2631,6 +3083,7 @@ mod tests {
             &mut pod_template,
             "openshell/sandbox:latest",
             "IfNotPresent",
+            1000, // sandbox_gid
         );
 
         // Init container
@@ -2641,6 +3094,7 @@ mod tests {
         assert_eq!(init_containers[0]["name"], WORKSPACE_INIT_CONTAINER_NAME);
         assert_eq!(init_containers[0]["image"], "openshell/sandbox:latest");
         assert_eq!(init_containers[0]["imagePullPolicy"], "IfNotPresent");
+        // init container always runs as root to handle PVC root directory permissions
         assert_eq!(init_containers[0]["securityContext"]["runAsUser"], 0);
 
         // Init container mounts PVC at temp path, not /sandbox
@@ -2684,7 +3138,12 @@ mod tests {
             }
         });
 
-        apply_workspace_persistence(&mut pod_template, "my-custom-image:v2", "IfNotPresent");
+        apply_workspace_persistence(
+            &mut pod_template,
+            "my-custom-image:v2",
+            "IfNotPresent",
+            1000,
+        );
 
         let init_image = pod_template["spec"]["initContainers"][0]["image"]
             .as_str()
@@ -2706,7 +3165,7 @@ mod tests {
             }
         });
 
-        apply_workspace_persistence(&mut pod_template, "img:latest", "Always");
+        apply_workspace_persistence(&mut pod_template, "img:latest", "Always", 1000);
 
         let cmd = pod_template["spec"]["initContainers"][0]["command"]
             .as_array()
@@ -3067,6 +3526,51 @@ mod tests {
         assert_eq!(
             pod_template["spec"]["imagePullSecrets"],
             serde_json::json!([{ "name": "regcred" }])
+        );
+    }
+
+    #[test]
+    fn provider_spiffe_mounts_csi_socket_and_keeps_sa_token_bootstrap() {
+        let params = SandboxPodParams {
+            sandbox_id: "sandbox-123",
+            sandbox_name: "sandbox",
+            provider_spiffe_enabled: true,
+            provider_spiffe_workload_api_socket_path: "/spiffe-workload-api/spire-agent.sock",
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        let env = pod_template["spec"]["containers"][0]["env"]
+            .as_array()
+            .expect("env");
+        assert!(env.iter().any(|e| {
+            e["name"] == openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET
+                && e["value"] == "/spiffe-workload-api/spire-agent.sock"
+        }));
+        assert!(env.iter().any(|e| {
+            e["name"] == openshell_core::sandbox_env::K8S_SA_TOKEN_FILE
+                && e["value"] == "/var/run/secrets/openshell/token"
+        }));
+
+        let volumes = pod_template["spec"]["volumes"].as_array().expect("volumes");
+        assert!(volumes.iter().any(|volume| {
+            volume["name"] == SPIFFE_WORKLOAD_API_VOLUME_NAME
+                && volume["csi"]["driver"] == "csi.spiffe.io"
+        }));
+        assert!(volumes.iter().any(|volume| {
+            volume["name"] == "openshell-sa-token"
+                && volume["projected"]["sources"][0]["serviceAccountToken"]["path"] == "token"
+        }));
+
+        assert_eq!(
+            pod_template["metadata"]["labels"][LABEL_MANAGED_BY],
+            serde_json::json!(LABEL_MANAGED_BY_VALUE)
         );
     }
 

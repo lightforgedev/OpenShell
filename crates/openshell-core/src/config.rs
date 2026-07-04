@@ -4,6 +4,7 @@
 //! Configuration management for `OpenShell` components.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 #[cfg(unix)]
 use std::io::{Read, Write};
@@ -13,7 +14,6 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
-#[cfg(unix)]
 use std::time::Duration;
 
 // ── Public default constants ────────────────────────────────────────────
@@ -68,6 +68,27 @@ impl ComputeDriverKind {
             Self::Podman => "podman",
         }
     }
+}
+
+/// Normalize a configured compute driver name.
+///
+/// Built-in driver names and custom remote driver names share the same
+/// selection namespace. The normalized value is lowercase ASCII and may contain
+/// letters, digits, `-`, and `_`.
+pub fn normalize_compute_driver_name(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("compute driver name cannot be empty".to_string());
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err(format!(
+            "invalid compute driver name '{value}'. use ASCII letters, digits, '-' or '_'"
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
 }
 
 impl fmt::Display for ComputeDriverKind {
@@ -319,14 +340,6 @@ pub struct Config {
     /// When `None`, the dedicated metrics listener is disabled.
     pub metrics_bind_address: Option<SocketAddr>,
 
-    /// Additional bind addresses that serve the same multiplexed gRPC/HTTP
-    /// surface as `bind_address`.
-    ///
-    /// Compute drivers may register extra listeners during startup so that
-    /// sandbox workloads can call back into the gateway over an interface
-    /// that the operator-supplied `bind_address` does not expose.
-    pub extra_bind_addresses: Vec<SocketAddr>,
-
     /// Log level (trace, debug, info, warn, error).
     pub log_level: String,
 
@@ -359,10 +372,31 @@ pub struct Config {
     /// The config shape allows multiple drivers so the gateway can evolve
     /// toward multi-backend routing. Current releases require exactly one
     /// configured driver.
-    pub compute_drivers: Vec<ComputeDriverKind>,
+    pub compute_drivers: Vec<String>,
+
+    /// Operator-provided endpoints for named remote compute drivers.
+    ///
+    /// This is populated by CLI/env inputs such as `--compute-driver-socket`.
+    /// TOML-authored endpoints live under `[openshell.drivers.<name>]` and are
+    /// resolved by the gateway config loader.
+    pub compute_driver_endpoints: BTreeMap<String, PathBuf>,
 
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
     pub ssh_session_ttl_secs: u64,
+
+    /// Maximum gRPC requests allowed per rate-limit window.
+    ///
+    /// When paired with [`Self::grpc_rate_limit_window_secs`], positive values
+    /// enable gateway-wide gRPC request rate limiting. `None` or `0` disables
+    /// the limit.
+    pub grpc_rate_limit_requests: Option<u64>,
+
+    /// gRPC rate-limit window length in seconds.
+    ///
+    /// When paired with [`Self::grpc_rate_limit_requests`], positive values
+    /// enable gateway-wide gRPC request rate limiting. `None` or `0` disables
+    /// the limit.
+    pub grpc_rate_limit_window_secs: Option<u64>,
 
     /// Browser-facing sandbox service routing configuration.
     pub service_routing: ServiceRoutingConfig,
@@ -537,7 +571,6 @@ impl Config {
             bind_address: default_bind_address(),
             health_bind_address: None,
             metrics_bind_address: None,
-            extra_bind_addresses: Vec::new(),
             log_level: default_log_level(),
             tls,
             oidc: None,
@@ -546,7 +579,10 @@ impl Config {
             gateway_jwt: None,
             database_url: String::new(),
             compute_drivers: vec![],
+            compute_driver_endpoints: BTreeMap::new(),
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
+            grpc_rate_limit_requests: None,
+            grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),
         }
     }
@@ -570,19 +606,6 @@ impl Config {
         self
     }
 
-    /// Append an extra listener address to the multiplex service.
-    ///
-    /// Duplicate entries (matching `bind_address` or any existing entry) are
-    /// silently dropped so callers can naively push driver-derived addresses
-    /// without checking for collisions.
-    #[must_use]
-    pub fn with_extra_bind_address(mut self, addr: SocketAddr) -> Self {
-        if addr != self.bind_address && !self.extra_bind_addresses.contains(&addr) {
-            self.extra_bind_addresses.push(addr);
-        }
-        self
-    }
-
     /// Create a new configuration with the given log level.
     #[must_use]
     pub fn with_log_level(mut self, level: impl Into<String>) -> Self {
@@ -599,11 +622,27 @@ impl Config {
 
     /// Create a new configuration with the configured compute drivers.
     #[must_use]
-    pub fn with_compute_drivers<I>(mut self, drivers: I) -> Self
+    pub fn with_compute_drivers<I, D>(mut self, drivers: I) -> Self
     where
-        I: IntoIterator<Item = ComputeDriverKind>,
+        I: IntoIterator<Item = D>,
+        D: ToString,
     {
-        self.compute_drivers = drivers.into_iter().collect();
+        self.compute_drivers = drivers
+            .into_iter()
+            .map(|driver| driver.to_string())
+            .collect();
+        self
+    }
+
+    /// Register a Unix domain socket endpoint for a named remote driver.
+    #[must_use]
+    pub fn with_compute_driver_endpoint(
+        mut self,
+        name: impl Into<String>,
+        socket: impl Into<PathBuf>,
+    ) -> Self {
+        self.compute_driver_endpoints
+            .insert(name.into(), socket.into());
         self
     }
 
@@ -614,6 +653,29 @@ impl Config {
         self
     }
 
+    /// Set the gateway-wide gRPC request rate limit.
+    #[must_use]
+    pub const fn with_grpc_rate_limit(
+        mut self,
+        requests: Option<u64>,
+        window_secs: Option<u64>,
+    ) -> Self {
+        self.grpc_rate_limit_requests = requests;
+        self.grpc_rate_limit_window_secs = window_secs;
+        self
+    }
+
+    /// Return the effective gRPC rate limit, if fully configured and enabled.
+    #[must_use]
+    pub fn grpc_rate_limit(&self) -> Option<(u64, Duration)> {
+        let requests = self.grpc_rate_limit_requests?;
+        let window_secs = self.grpc_rate_limit_window_secs?;
+        if requests == 0 || window_secs == 0 {
+            None
+        } else {
+            Some((requests, Duration::from_secs(window_secs)))
+        }
+    }
     /// Set the OIDC configuration for JWT-based authentication.
     #[must_use]
     pub fn with_oidc(mut self, oidc: OidcConfig) -> Self {
@@ -728,8 +790,8 @@ mod tests {
     use super::is_reachable_unix_socket;
     use super::{
         ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayJwtConfig, detect_driver,
-        docker_host_unix_socket_path, is_unix_socket, podman_socket_candidates_from_env,
-        podman_socket_responds,
+        docker_host_unix_socket_path, is_unix_socket, normalize_compute_driver_name,
+        podman_socket_candidates_from_env, podman_socket_responds,
     };
     #[cfg(unix)]
     use std::io::{Read as _, Write as _};
@@ -737,6 +799,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     #[test]
     fn compute_driver_kind_parses_supported_values() {
@@ -762,6 +825,18 @@ mod tests {
     fn compute_driver_kind_rejects_unknown_values() {
         let err = "firecracker".parse::<ComputeDriverKind>().unwrap_err();
         assert!(err.contains("unsupported compute driver 'firecracker'"));
+    }
+
+    #[test]
+    fn compute_driver_name_normalization_accepts_builtin_and_custom_names() {
+        assert_eq!(normalize_compute_driver_name(" VM ").unwrap(), "vm");
+        assert_eq!(
+            normalize_compute_driver_name("Kyma_GPU-1").unwrap(),
+            "kyma_gpu-1"
+        );
+
+        let err = normalize_compute_driver_name("kyma/gpu").unwrap_err();
+        assert!(err.contains("invalid compute driver name"));
     }
 
     #[test]
@@ -792,6 +867,29 @@ mod tests {
         .expect("gateway JWT config should deserialize with default ttl");
 
         assert_eq!(cfg.ttl_secs, 0);
+    }
+
+    #[test]
+    fn grpc_rate_limit_requires_positive_pair() {
+        assert!(Config::new(None).grpc_rate_limit().is_none());
+        assert!(
+            Config::new(None)
+                .with_grpc_rate_limit(Some(10), None)
+                .grpc_rate_limit()
+                .is_none()
+        );
+        assert!(
+            Config::new(None)
+                .with_grpc_rate_limit(Some(0), Some(60))
+                .grpc_rate_limit()
+                .is_none()
+        );
+        assert_eq!(
+            Config::new(None)
+                .with_grpc_rate_limit(Some(10), Some(60))
+                .grpc_rate_limit(),
+            Some((10, Duration::from_secs(60)))
+        );
     }
 
     #[test]

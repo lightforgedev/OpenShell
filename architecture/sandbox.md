@@ -14,7 +14,12 @@ Each sandbox workload has two trust levels:
 | Agent child | Runs as an unprivileged user with filesystem, process, and network restrictions applied. |
 
 The supervisor keeps enough privilege to manage the sandbox, but the agent child
-loses that privilege before user code runs.
+loses that privilege before user code runs. On Linux, child setup clears the
+capability bounding set during privilege drop so later execs cannot regain
+container-granted capabilities. This is fail-closed: the supervisor retains
+`CAP_SETPCAP` solely to perform the clear, and spawning the workload or SSH shell
+aborts unless the bounding set ends up empty. A `setpcap` `EPERM` is tolerated
+only when the set is already empty; any other outcome fails the spawn.
 
 ## Startup Flow
 
@@ -49,6 +54,17 @@ paths, such as proxy support files or GPU device paths when a GPU is present.
 All ordinary agent egress is routed through the sandbox proxy. The proxy
 identifies the calling binary, checks trust-on-first-use binary identity, rejects
 unsafe internal destinations, and evaluates the active policy.
+For inspected HTTP traffic, the proxy can enforce REST method/path rules,
+WebSocket upgrade and text-message rules, GraphQL operation rules, and
+MCP method, tool, and supported params rules or generic JSON-RPC method rules
+on sandbox-to-server request bodies. MCP and JSON-RPC inspection buffers up to
+the endpoint `mcp.max_body_bytes` or `json_rpc.max_body_bytes` limit. MCP
+`tools/call` tool names are checked against the spec-recommended syntax by
+default before policy evaluation, with a per-endpoint `mcp.strict_tool_names`
+compatibility opt-out. Generic JSON-RPC policies do not support `params`
+matchers; generic JSON-RPC rules match only the method.
+JSON-RPC responses and server-to-client MCP messages on response or SSE streams
+are relayed but are not currently parsed for policy enforcement.
 
 `https://inference.local` is special. It bypasses OPA network policy and is
 handled by the inference interception path:
@@ -70,9 +86,60 @@ agent process and SSH child processes. Driver-controlled environment variables
 override template values so sandbox images cannot spoof identity, callback, or
 relay settings.
 
+Supervisor bootstrap identity is not inherited by agent child processes. When
+provider token grants mount a SPIFFE Workload API socket, the socket path must
+live under a dedicated directory. Children also enter a private mount namespace
+where that socket directory is hidden before privilege drop.
+
 Credential placeholders in proxied HTTP requests can be resolved by the proxy
-when policy allows the target endpoint. Secrets must not be logged in OCSF or
-plain tracing output.
+when policy allows the target endpoint. For GCP providers, a loopback metadata
+server inside the network namespace serves placeholders to SDKs that bypass the
+proxy (e.g. Go's `cloud.google.com/go/compute/metadata`). Secrets must not be
+logged in OCSF or plain tracing output. The supervisor uses revision-scoped
+placeholders for rotating provider credentials; provider environment keys
+beginning with `v<digits>_` are reserved for that placeholder namespace.
+
+Provider profiles can also declare dynamic token grants. For matching HTTP
+endpoints, the supervisor obtains a SPIFFE JWT-SVID from the local Workload API,
+exchanges it for an OAuth2 access token, caches the token, and injects it as an
+`Authorization: Bearer` header before forwarding the request. Token grant
+endpoints are HTTPS-only except for loopback and Kubernetes service DNS hosts,
+and returned access tokens must be bearer-compatible before they are cached or
+injected. Token response lifetimes are capped and cached with an expiry margin
+unless a profile supplies an explicit cache TTL override.
+
+For AWS endpoints that require request-level signing, the proxy supports SigV4
+re-signing. When `credential_signing: sigv4` is set on an L7 endpoint, the proxy
+strips the client's placeholder-based AWS auth headers, re-signs with real
+credentials from the provider, and forwards the request upstream. The signing
+mode is auto-detected from the client SDK's `x-amz-content-sha256` header:
+
+- **Signed body** (hex hash): buffers the request body (up to 10 MiB), computes
+  its SHA-256, and includes the hash in the signature. Used by Bedrock and most
+  AWS services.
+- **Streaming unsigned** (`STREAMING-UNSIGNED-PAYLOAD-TRAILER`): signs headers
+  only and streams the body through without buffering. Used by S3 uploads with
+  `aws-chunked` encoding.
+- **Unsigned payload** (`UNSIGNED-PAYLOAD`): signs headers only with no body
+  hash. Used by S3 over HTTPS for non-chunked requests.
+
+Chunk-signed streaming modes (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD` and other
+`STREAMING-*` variants) are rejected — the proxy cannot reproduce per-chunk
+signatures. Use `sigv4:no_body` for those clients.
+
+Two explicit overrides are available: `credential_signing: sigv4:body` (always
+buffer and hash) and `sigv4:no_body` (always unsigned). The `Expect:
+100-continue` header is handled within the SigV4 path so clients like boto3
+transmit the body before the proxy forwards to upstream.
+
+The AWS region is extracted from the endpoint hostname. For non-standard
+endpoints (VPC endpoints, custom proxies), set `signing_region` in the policy
+endpoint to provide an explicit override. The proxy rejects requests when
+neither hostname extraction nor `signing_region` yields a region.
+
+`credential_signing` and `request_body_credential_rewrite` are mutually
+exclusive on the same endpoint. The policy validator rejects policies that
+set both.
 
 ## Connect and Logs
 

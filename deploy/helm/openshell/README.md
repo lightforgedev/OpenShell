@@ -56,20 +56,26 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-gateway.yaml`](ci/values-gateway.yaml) - gateway-only configuration
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
-- [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - HA gateway test overlay with bundled PostgreSQL
+- [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - CI overlay for multi-replica external PostgreSQL testing
+- [`ci/values-spire.yaml`](ci/values-spire.yaml) - SPIFFE/SPIRE provider token grants
+- [`ci/values-spire-stack.yaml`](ci/values-spire-stack.yaml) - SPIRE hardened chart values for local development
 
 ### Database backend
 
-By default, OpenShell uses SQLite:
+By default, OpenShell uses SQLite and runs the gateway as a StatefulSet so the
+database is backed by a per-pod PVC:
 
 ```yaml
 server:
   dbUrl: "sqlite:/var/openshell/openshell.db"
-postgres:
-  enabled: false
 ```
 
 #### External PostgreSQL
+
+Use external PostgreSQL when the gateway should connect to a database managed
+outside this chart. The OpenShell chart does not deploy a database; install
+PostgreSQL separately using the chart, operator, or managed service that fits
+your environment, then pass the connection URI through a Secret.
 
 Create a Secret containing the PostgreSQL connection URI if one does not
 already exist:
@@ -84,20 +90,14 @@ Then install the chart pointing at that Secret:
 ```bash
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
   -n openshell \
+  --set workload.kind=deployment \
   --set server.externalDbSecret=my-pg-credentials
 ```
 
-#### Bundled PostgreSQL
-
-Deploy a PostgreSQL instance alongside the gateway using the bundled
-Bitnami subchart. A random password is generated automatically:
-
-```bash
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
-  --set postgres.enabled=true
-```
-
-To set an explicit password, add `--set postgres.auth.password=my-secret-password`.
+Use `workload.kind=deployment` for external database-backed multi-replica
+gateways. `workload.kind=statefulset` is still available for single-replica
+SQLite installs and for operators who explicitly need StatefulSet identity or
+storage semantics.
 
 #### OpenShift
 
@@ -123,6 +123,17 @@ sandbox JWT signing Secret. This precedence applies even if
 external non-cert-manager TLS source manages TLS and you pre-create the sandbox
 JWT signing Secret.
 
+## SPIFFE/SPIRE provider token grants
+
+Set `server.providerTokenGrants.spiffe.enabled=true` to let sandbox supervisors
+use SPIFFE JWT-SVIDs for dynamic provider token grants. The chart keeps
+supervisor-to-gateway authentication on gateway-minted sandbox JWTs and passes
+the SPIFFE Workload API socket path to the Kubernetes driver so sandbox pods can
+mount the SPIFFE CSI socket.
+
+For local development, uncomment the SPIRE Helm releases in `skaffold.yaml` and
+add `ci/values-spire.yaml` to the OpenShell release values files.
+
 ## Values
 
 | Key | Type | Default | Description |
@@ -140,8 +151,9 @@ JWT signing Secret.
 | grpcRoute.gateway.className | string | `"eg"` | GatewayClass to reference. Envoy Gateway installs one named "eg". |
 | grpcRoute.gateway.create | bool | `false` | When true, a Gateway resource is created in the release namespace. Set to false and provide name/namespace to attach to a pre-existing Gateway. |
 | grpcRoute.gateway.listener.allowedRoutes | string | `"Same"` | "Same" restricts attached routes to the release namespace; "All" allows any namespace. |
-| grpcRoute.gateway.listener.port | int | `80` | Listener port for the generated Gateway resource. |
-| grpcRoute.gateway.listener.protocol | string | `"HTTP"` | Listener protocol for the generated Gateway resource. |
+| grpcRoute.gateway.listener.port | int | `80` | Listener port for the generated Gateway resource. Use 443 with protocol HTTPS. |
+| grpcRoute.gateway.listener.protocol | string | `"HTTP"` | Listener protocol for the generated Gateway resource: HTTP or HTTPS. HTTPS terminates TLS at the Envoy Gateway listener; pair it with server.disableTls=true so Envoy forwards plaintext to the gateway pod, and use OIDC for client identity (the gateway never sees the client cert). |
+| grpcRoute.gateway.listener.tls.certificateRefs | list | `[]` | certificateRefs for the HTTPS listener. Required when protocol is HTTPS. Each entry needs a `name` pointing at a kubernetes.io/tls Secret in the Gateway's namespace. May reference a cert-manager-issued Secret or the existing openshell-server-tls Secret (its SANs must include the external hostname). |
 | grpcRoute.gateway.name | string | `""` | Name of the Gateway resource. Defaults to the chart fullname. |
 | grpcRoute.gateway.namespace | string | `""` | Namespace of the Gateway referenced by the GRPCRoute parentRef. Defaults to the release namespace. |
 | grpcRoute.hostnames | list | `[]` | Hostnames the GRPCRoute matches on. Leave empty to match all hosts. |
@@ -159,12 +171,6 @@ JWT signing Secret.
 | podLabels | object | `{}` | Extra labels to add to the gateway pod. |
 | podLifecycle.terminationGracePeriodSeconds | int | `5` | Grace period, in seconds, before Kubernetes terminates the gateway pod. |
 | podSecurityContext.fsGroup | int | `1000` | fsGroup assigned to the gateway pod. |
-| postgres.auth.database | string | `"openshell"` |  |
-| postgres.auth.password | string | `""` |  |
-| postgres.auth.username | string | `"openshell"` |  |
-| postgres.enabled | bool | `false` | Deploy the bundled Bitnami PostgreSQL subchart. |
-| postgres.primary.persistence.enabled | bool | `true` |  |
-| postgres.serviceBindings.enabled | bool | `true` |  |
 | probes.liveness.failureThreshold | int | `3` | Liveness probe failure threshold before the container is restarted. |
 | probes.liveness.initialDelaySeconds | int | `2` | Liveness probe initial delay, in seconds. |
 | probes.liveness.periodSeconds | int | `5` | Liveness probe period, in seconds. |
@@ -176,7 +182,7 @@ JWT signing Secret.
 | probes.startup.failureThreshold | int | `30` | Startup probe failure threshold before the container is killed. |
 | probes.startup.periodSeconds | int | `2` | Startup probe period, in seconds. |
 | probes.startup.timeoutSeconds | int | `1` | Startup probe timeout, in seconds. |
-| replicaCount | int | `1` | Number of OpenShell gateway replicas. |
+| replicaCount | int | `1` | Number of OpenShell gateway replicas. Values greater than 1 require server.externalDbSecret because the default SQLite backend is per pod. |
 | resources | object | `{}` | Gateway pod resource requests and limits. |
 | sandboxServiceAccount.annotations | object | `{}` | Annotations to add to the generated sandbox service account. |
 | sandboxServiceAccount.create | bool | `true` | Create a service account for sandbox pods. |
@@ -194,6 +200,8 @@ JWT signing Secret.
 | server.enableUserNamespaces | bool | `false` | Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox pods. Requires Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), plus a supporting container runtime and Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host UID and capabilities become namespaced. |
 | server.externalDbSecret | string | `""` | Name of a pre-existing Opaque Secret containing a PostgreSQL connection URI (key: uri). When set, the gateway reads OPENSHELL_DB_URL from this Secret instead of using dbUrl. The Secret must contain a `uri` key, e.g. postgresql://user:pass@host:5432/dbname. |
 | server.grpcEndpoint | string | `""` | gRPC endpoint sandboxes call back into the gateway. Leave empty to derive it from the chart fullname, release namespace, service port, and disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080. Override only when sandboxes must reach the gateway via a different hostname (e.g. an external ingress or a host alias). |
+| server.grpcRateLimit.requests | int | `0` | Maximum gRPC requests allowed per window. Must be positive (alongside windowSeconds) to enable rate limiting; 0 (default) disables it. |
+| server.grpcRateLimit.windowSeconds | int | `0` | gRPC rate-limit window length in seconds. Must be positive (alongside requests) to enable rate limiting; 0 (default) disables it. |
 | server.hostGatewayIP | string | `""` | Host gateway IP for sandbox pod hostAliases. When set, sandbox pods get hostAliases entries mapping host.docker.internal and host.openshell.internal to this IP, allowing them to reach services running on the Docker host. Auto-detected by the cluster entrypoint script. |
 | server.logLevel | string | `"info"` | Gateway log level. |
 | server.oidc.adminRole | string | `""` | Role name for admin access. Leave empty (with userRole also empty) for authentication-only mode. Both must be set or both empty. |
@@ -204,6 +212,8 @@ JWT signing Secret.
 | server.oidc.rolesClaim | string | `""` | Dot-separated path to the roles array in the JWT claims. Keycloak: "realm_access.roles", Entra ID: "roles", Okta: "groups". |
 | server.oidc.scopesClaim | string | `""` | Dot-separated path to the scopes array in the JWT claims. |
 | server.oidc.userRole | string | `""` | Role name for standard user access. |
+| server.providerTokenGrants.spiffe.enabled | bool | `false` | Mount the SPIFFE Workload API socket into sandbox pods for dynamic provider token grants. |
+| server.providerTokenGrants.spiffe.workloadApiSocketPath | string | `"/spiffe-workload-api/spire-agent.sock"` | Path to the SPIFFE Workload API socket mounted into sandbox pods. |
 | server.sandboxImage | string | `"ghcr.io/nvidia/openshell-community/sandboxes/base:latest"` | Default sandbox image used when requests do not specify one. |
 | server.sandboxImagePullPolicy | string | `""` | Kubernetes imagePullPolicy for sandbox pods. Empty = Kubernetes default (Always for :latest, IfNotPresent otherwise). Set to "Always" for dev clusters so new images are picked up without manual eviction. |
 | server.sandboxImagePullSecrets | list | `[]` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
@@ -228,7 +238,10 @@ JWT signing Secret.
 | supervisor.image.repository | string | `"ghcr.io/nvidia/openshell/supervisor"` | Supervisor image repository. |
 | supervisor.image.tag | string | `""` | Supervisor image tag. Defaults to the chart appVersion when empty. |
 | supervisor.sideloadMethod | string | `""` | How the supervisor binary is delivered into sandbox pods. Empty (default) = auto-detect from cluster version:   K8s >= v1.35 -> "image-volume" (ImageVolume enabled by default; GA in v1.36)   K8s < v1.35 -> "init-container" (copies via init container + emptyDir) On K8s v1.33-v1.34 with the ImageVolume feature gate manually enabled, set this to "image-volume" explicitly. |
+| supervisor.topology | string | `"combined"` | Supervisor pod topology for Kubernetes sandboxes. "combined" runs networking and process supervision in the agent container. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
+| workload.allowMultiReplicaStatefulSet | bool | `false` | Allow replicaCount > 1 while rendering a StatefulSet. Prefer workload.kind=deployment for external database-backed multi-replica gateways; this override exists for operators who explicitly require StatefulSet identity or storage semantics. |
+| workload.kind | string | `"statefulset"` | Gateway workload controller kind. Use `statefulset` for the default SQLite database, or `deployment` when server.externalDbSecret points at an external database. |
 
 ----------------------------------------------
 Autogenerated from chart metadata using [helm-docs v1.14.2](https://github.com/norwoodj/helm-docs/releases/v1.14.2)

@@ -9,8 +9,9 @@ use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, CreateImageInfo,
-    DeviceRequest, EndpointSettings, HostConfig, NetworkCreateRequest, NetworkingConfig,
-    ProgressDetail, RestartPolicy, RestartPolicyNameEnum, SystemInfo,
+    DeviceRequest, EndpointSettings, HostConfig, Mount, MountTmpfsOptions, MountTypeEnum,
+    MountVolumeOptions, NetworkCreateRequest, NetworkingConfig, ProgressDetail, RestartPolicy,
+    RestartPolicyNameEnum, SystemInfo,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -21,11 +22,15 @@ use futures::{Stream, StreamExt};
 use openshell_core::config::{
     DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_SANDBOX_PIDS_LIMIT, DEFAULT_STOP_TIMEOUT_SECS,
 };
+use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
     LABEL_SANDBOX_NAMESPACE, SUPERVISOR_IMAGE_BINARY_PATH, supervisor_image_should_refresh,
 };
-use openshell_core::gpu::cdi_gpu_device_ids;
+use openshell_core::gpu::{
+    CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
+    effective_driver_gpu_count, validate_specific_gpu_device_request,
+};
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
@@ -34,14 +39,17 @@ use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DriverCondition, DriverPlatformEvent, DriverSandbox, DriverSandboxStatus,
     DriverSandboxTemplate, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
-    GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest,
-    StopSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
-    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
-    WatchSandboxesRequest, WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver,
-    watch_sandboxes_event,
+    GetSandboxResponse, GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse,
+    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
+    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
+    compute_driver_server::ComputeDriver, watch_sandboxes_event,
+};
+use openshell_core::proto_struct::{
+    deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
 use openshell_core::{Config, Error, Result as CoreResult};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -59,11 +67,11 @@ const WATCH_BUFFER: usize = 128;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const WATCH_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-const SUPERVISOR_MOUNT_PATH: &str = "/opt/openshell/bin/openshell-sandbox";
-const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
-const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
-const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
-const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
+const SUPERVISOR_MOUNT_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
+const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
+const TLS_CERT_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CERT_MOUNT_PATH;
+const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PATH;
+const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
 const SANDBOX_COMMAND: &str = "sleep infinity";
 const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
@@ -72,7 +80,8 @@ const DOCKER_NETWORK_DRIVER: &str = "bridge";
 
 /// Default image holding the Linux `openshell-sandbox` binary. The gateway
 /// pulls this image and extracts the binary to a host-side cache when no
-/// explicit `supervisor_bin` override or local build is available.
+/// explicit `supervisor_bin`, configured `supervisor_image`, sibling binary,
+/// or local build is available.
 const DEFAULT_DOCKER_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
 
 /// Return the default `ghcr.io/nvidia/openshell/supervisor:<tag>` reference
@@ -148,10 +157,9 @@ pub struct DockerComputeConfig {
     /// Optional override for the Linux `openshell-sandbox` binary mounted into containers.
     pub supervisor_bin: Option<PathBuf>,
 
-    /// Optional override for the image the gateway pulls to extract the
-    /// Linux `openshell-sandbox` binary when no explicit binary path or
-    /// local build is available. Defaults to
-    /// `ghcr.io/nvidia/openshell/supervisor:<gateway-image-tag>`.
+    /// Optional image used to extract the Linux `openshell-sandbox` binary.
+    /// Ignored when `supervisor_bin` is set. See `resolve_supervisor_bin` for
+    /// the full resolution order.
     pub supervisor_image: Option<String>,
 
     /// Host-side CA certificate for Docker sandbox mTLS.
@@ -176,6 +184,11 @@ pub struct DockerComputeConfig {
     ///
     /// Set to `0` to leave Docker's runtime/default PID limit unchanged.
     pub sandbox_pids_limit: i64,
+
+    /// Allow sandbox requests to attach host bind mounts through
+    /// `template.driver_config`.
+    #[serde(default)]
+    pub enable_bind_mounts: bool,
 }
 
 impl Default for DockerComputeConfig {
@@ -194,6 +207,7 @@ impl Default for DockerComputeConfig {
             host_gateway_ip: String::new(),
             ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
+            enable_bind_mounts: false,
         }
     }
 }
@@ -220,7 +234,9 @@ struct DockerDriverRuntimeConfig {
     guest_tls: Option<DockerGuestTlsPaths>,
     daemon_version: String,
     supports_gpu: bool,
+    allow_all_default_gpu: bool,
     sandbox_pids_limit: i64,
+    enable_bind_mounts: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,6 +255,7 @@ pub struct DockerComputeDriver {
     events: broadcast::Sender<WatchSandboxesEvent>,
     pending: Arc<Mutex<HashMap<String, PendingSandboxRecord>>>,
     supervisor_readiness: Arc<dyn SupervisorReadiness>,
+    gpu_selector: Arc<CdiGpuDefaultSelector>,
 }
 
 struct PendingSandboxRecord {
@@ -256,6 +273,78 @@ struct DockerProvisioningFailure {
 struct DockerResourceLimits {
     nano_cpus: Option<i64>,
     memory_bytes: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct DockerSandboxDriverConfig {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_empty_string_list"
+    )]
+    cdi_devices: Option<Vec<String>>,
+    mounts: Vec<DockerDriverMountConfig>,
+}
+
+struct ValidatedDockerSandbox<'a> {
+    template: &'a DriverSandboxTemplate,
+    driver_config: DockerSandboxDriverConfig,
+    gpu_requirements: Option<&'a GpuResourceRequirements>,
+}
+
+impl DockerSandboxDriverConfig {
+    fn from_template(template: &DriverSandboxTemplate) -> Result<Self, String> {
+        let Some(config) = template.driver_config.as_ref() else {
+            return Ok(Self::default());
+        };
+
+        serde_json::from_value(struct_to_json_value(config))
+            .map_err(|err| format!("invalid docker driver_config: {err}"))
+    }
+}
+
+use openshell_core::driver_mounts::SelinuxLabel;
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum DockerDriverMountConfig {
+    Bind {
+        source: String,
+        target: String,
+        #[serde(default = "default_true")]
+        read_only: bool,
+        #[serde(default)]
+        selinux_label: Option<SelinuxLabel>,
+    },
+    Volume {
+        source: String,
+        target: String,
+        #[serde(default = "default_true")]
+        read_only: bool,
+        #[serde(default)]
+        subpath: Option<String>,
+    },
+    Tmpfs {
+        target: String,
+        #[serde(default)]
+        options: Vec<String>,
+        #[serde(default)]
+        size_bytes: Option<f64>,
+        #[serde(default)]
+        mode: Option<f64>,
+    },
+    Image {
+        source: String,
+        target: String,
+        #[serde(default = "default_true")]
+        read_only: bool,
+        #[serde(default)]
+        subpath: Option<String>,
+    },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 type WatchStream =
@@ -279,6 +368,8 @@ impl DockerComputeDriver {
             .cdi_spec_dirs
             .as_ref()
             .is_some_and(|dirs| !dirs.is_empty());
+        let cdi_gpu_inventory = docker_cdi_gpu_inventory(&info);
+        let allow_all_default_gpu = docker_info_reports_wsl2(&info);
         validate_sandbox_pids_limit(docker_config.sandbox_pids_limit)?;
         let gateway_port = config.bind_address.port();
         if gateway_port == 0 {
@@ -326,11 +417,17 @@ impl DockerComputeDriver {
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
                 supports_gpu,
+                allow_all_default_gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
+                enable_bind_mounts: docker_config.enable_bind_mounts,
             },
             events: broadcast::channel(WATCH_BUFFER).0,
             pending: Arc::new(Mutex::new(HashMap::new())),
             supervisor_readiness,
+            gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
+                cdi_gpu_inventory,
+                allow_all_default_gpu,
+            )),
         };
 
         let poll_driver = driver.clone();
@@ -357,10 +454,19 @@ impl DockerComputeDriver {
         )
     }
 
+    #[cfg(test)]
     fn validate_sandbox(
         sandbox: &DriverSandbox,
         config: &DockerDriverRuntimeConfig,
     ) -> Result<(), Status> {
+        let _ = Self::validated_sandbox(sandbox, config)?;
+        Ok(())
+    }
+
+    fn validated_sandbox<'a>(
+        sandbox: &'a DriverSandbox,
+        config: &DockerDriverRuntimeConfig,
+    ) -> Result<ValidatedDockerSandbox<'a>, Status> {
         let spec = sandbox
             .spec
             .as_ref()
@@ -370,12 +476,26 @@ impl DockerComputeDriver {
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
 
+        Self::validate_sandbox_template_base(template)?;
+        let _ = docker_resource_limits(template)?;
+        let driver_config =
+            DockerSandboxDriverConfig::from_template(template).map_err(Status::invalid_argument)?;
+        validate_docker_driver_mounts(&driver_config.mounts, config.enable_bind_mounts)?;
+        let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
+        Self::validate_gpu_request(gpu_requirements, config.supports_gpu, &driver_config)?;
+        Ok(ValidatedDockerSandbox {
+            template,
+            driver_config,
+            gpu_requirements,
+        })
+    }
+
+    fn validate_sandbox_template_base(template: &DriverSandboxTemplate) -> Result<(), Status> {
         if template.image.trim().is_empty() {
             return Err(Status::failed_precondition(
                 "docker sandboxes require a template image",
             ));
         }
-        Self::validate_gpu_request(spec.gpu, config.supports_gpu)?;
         if !template.agent_socket_path.trim().is_empty() {
             return Err(Status::failed_precondition(
                 "docker compute driver does not support template.agent_socket_path",
@@ -391,7 +511,6 @@ impl DockerComputeDriver {
             ));
         }
 
-        let _ = docker_resource_limits(template)?;
         Ok(())
     }
 
@@ -409,13 +528,102 @@ impl DockerComputeDriver {
         ))
     }
 
-    fn validate_gpu_request(gpu: bool, supports_gpu: bool) -> Result<(), Status> {
-        if gpu && !supports_gpu {
+    fn validate_gpu_request(
+        gpu_requirements: Option<&GpuResourceRequirements>,
+        supports_gpu: bool,
+        driver_config: &DockerSandboxDriverConfig,
+    ) -> Result<(), Status> {
+        let requested_count =
+            effective_driver_gpu_count(gpu_requirements).map_err(Status::invalid_argument)?;
+        if requested_count.is_some() && !supports_gpu {
             return Err(Status::failed_precondition(
                 "docker GPU sandboxes require Docker CDI support. Enable CDI on the Docker daemon, then restart the OpenShell gateway/server so GPU capability is detected.",
             ));
         }
+
+        if let Some(cdi_devices) = driver_config.cdi_devices.as_deref() {
+            validate_specific_gpu_device_request(
+                gpu_requirements,
+                cdi_devices,
+                "driver_config.cdi_devices",
+            )
+            .map_err(Status::invalid_argument)?;
+        }
+
         Ok(())
+    }
+
+    async fn validate_user_volume_mounts_available(
+        &self,
+        driver_config: &DockerSandboxDriverConfig,
+    ) -> Result<(), Status> {
+        for mount in &driver_config.mounts {
+            if let DockerDriverMountConfig::Volume { source, .. } = mount {
+                match self.docker.inspect_volume(source).await {
+                    Ok(volume) => {
+                        if !self.config.enable_bind_mounts && docker_volume_is_bind_backed(&volume)
+                        {
+                            return Err(Status::failed_precondition(format!(
+                                "docker volume '{source}' is backed by a host bind mount and requires enable_bind_mounts = true in [openshell.drivers.docker]"
+                            )));
+                        }
+                    }
+                    Err(err) if is_not_found_error(&err) => {
+                        return Err(Status::failed_precondition(format!(
+                            "docker volume '{source}' does not exist"
+                        )));
+                    }
+                    Err(err) => {
+                        return Err(internal_status("inspect docker volume", err));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn refresh_gpu_inventory(&self) -> Result<(), Status> {
+        let info = self
+            .docker
+            .info()
+            .await
+            .map_err(|err| internal_status("query Docker daemon info", err))?;
+        self.gpu_selector.refresh(
+            docker_cdi_gpu_inventory(&info),
+            self.config.allow_all_default_gpu,
+        );
+        Ok(())
+    }
+
+    async fn resolve_gpu_cdi_devices(
+        &self,
+        gpu_requirements: Option<&GpuResourceRequirements>,
+        driver_config: &DockerSandboxDriverConfig,
+        select_default_devices: fn(
+            &CdiGpuDefaultSelector,
+            u32,
+        ) -> Result<Vec<String>, CdiGpuSelectionError>,
+    ) -> Result<Option<Vec<String>>, Status> {
+        if let Some(cdi_devices) = driver_config.cdi_devices.as_deref() {
+            validate_specific_gpu_device_request(
+                gpu_requirements,
+                cdi_devices,
+                "driver_config.cdi_devices",
+            )
+            .map_err(Status::invalid_argument)?;
+            return Ok(Some(cdi_devices.to_vec()));
+        }
+
+        let Some(count) =
+            effective_driver_gpu_count(gpu_requirements).map_err(Status::invalid_argument)?
+        else {
+            return Ok(None);
+        };
+
+        self.refresh_gpu_inventory().await?;
+        select_default_devices(&self.gpu_selector, count)
+            .map(Some)
+            .map_err(docker_gpu_selection_status)
     }
 
     async fn get_sandbox_snapshot(
@@ -453,9 +661,23 @@ impl DockerComputeDriver {
     }
 
     async fn create_sandbox_inner(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
-        Self::validate_sandbox(sandbox, &self.config)?;
+        let validated = Self::validated_sandbox(sandbox, &self.config)?;
         Self::validate_sandbox_auth(sandbox)?;
-        let _ = build_container_create_body(sandbox, &self.config)?;
+        self.validate_user_volume_mounts_available(&validated.driver_config)
+            .await?;
+        let gpu_devices = self
+            .resolve_gpu_cdi_devices(
+                validated.gpu_requirements,
+                &validated.driver_config,
+                CdiGpuDefaultSelector::peek_device_ids,
+            )
+            .await?;
+        let _ = build_container_create_body_with_gpu_devices(
+            sandbox,
+            &self.config,
+            &validated.driver_config,
+            gpu_devices.as_deref(),
+        )?;
 
         if self
             .find_managed_container_summary(&sandbox.id, &sandbox.name)
@@ -512,11 +734,10 @@ impl DockerComputeDriver {
         &self,
         sandbox: &DriverSandbox,
     ) -> Result<(), DockerProvisioningFailure> {
-        let template = sandbox
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.template.as_ref())
-            .expect("validated sandbox has template");
+        let validated = Self::validated_sandbox(sandbox, &self.config).map_err(|status| {
+            DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
+        })?;
+        let template = validated.template;
         self.ensure_image_available(&sandbox.id, &template.image)
             .await
             .map_err(|status| {
@@ -529,7 +750,26 @@ impl DockerComputeDriver {
             })?;
 
         let container_name = container_name_for_sandbox(sandbox);
-        let create_body = build_container_create_body(sandbox, &self.config).map_err(|status| {
+        let gpu_devices = self
+            .resolve_gpu_cdi_devices(
+                validated.gpu_requirements,
+                &validated.driver_config,
+                CdiGpuDefaultSelector::next_device_ids,
+            )
+            .await
+            .map_err(|status| {
+                if token_file_created {
+                    cleanup_sandbox_token_file(sandbox, &self.config);
+                }
+                DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
+            })?;
+        let create_body = build_container_create_body_with_gpu_devices(
+            sandbox,
+            &self.config,
+            &validated.driver_config,
+            gpu_devices.as_deref(),
+        )
+        .map_err(|status| {
             if token_file_created {
                 cleanup_sandbox_token_file(sandbox, &self.config);
             }
@@ -1164,7 +1404,16 @@ impl ComputeDriver for DockerComputeDriver {
             .into_inner()
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-        Self::validate_sandbox(&sandbox, &self.config)?;
+        let validated = Self::validated_sandbox(&sandbox, &self.config)?;
+        self.validate_user_volume_mounts_available(&validated.driver_config)
+            .await?;
+        let _ = self
+            .resolve_gpu_cdi_devices(
+                validated.gpu_requirements,
+                &validated.driver_config,
+                CdiGpuDefaultSelector::peek_device_ids,
+            )
+            .await?;
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
@@ -1505,6 +1754,285 @@ fn attach_docker_progress_metadata(
     }
 }
 
+#[cfg(test)]
+fn docker_driver_config(
+    template: &DriverSandboxTemplate,
+    enable_bind_mounts: bool,
+) -> Result<DockerSandboxDriverConfig, Status> {
+    let config =
+        DockerSandboxDriverConfig::from_template(template).map_err(Status::invalid_argument)?;
+    validate_docker_driver_mounts(&config.mounts, enable_bind_mounts)?;
+    Ok(config)
+}
+
+/// Collect user-supplied bind mounts as string-format binds.
+///
+/// Bind mounts use the legacy `Binds` field (`-v` syntax) rather than the
+/// structured `Mount` API because the Docker Engine Mount object does not
+/// support `SELinux` relabelling (`:z` / `:Z`).  The string format does.
+fn docker_driver_bind_strings(config: &DockerSandboxDriverConfig) -> Result<Vec<String>, Status> {
+    config
+        .mounts
+        .iter()
+        .filter_map(|m| match m {
+            DockerDriverMountConfig::Bind {
+                source,
+                target,
+                read_only,
+                selinux_label,
+            } => Some(docker_bind_string(
+                source,
+                target,
+                *read_only,
+                *selinux_label,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn docker_bind_string(
+    source: &str,
+    target: &str,
+    read_only: bool,
+    selinux_label: Option<SelinuxLabel>,
+) -> Result<String, Status> {
+    driver_mounts::validate_absolute_mount_source(source, "bind source")
+        .map_err(Status::failed_precondition)?;
+    // Legacy `-v` binds silently create missing source directories as empty,
+    // root-owned paths.  The structured `--mount` API that was used before this
+    // change rejected missing sources at container-create time.  Preserve that
+    // fail-fast behaviour with an explicit existence check.
+    if !Path::new(source).exists() {
+        return Err(Status::failed_precondition(format!(
+            "bind source path does not exist: {source}"
+        )));
+    }
+    driver_mounts::validate_container_mount_target(target).map_err(Status::failed_precondition)?;
+    let normalized_target = driver_mounts::normalize_mount_target(target);
+
+    let mut opts = Vec::new();
+    if read_only {
+        opts.push("ro");
+    }
+    match selinux_label {
+        Some(SelinuxLabel::Shared) => opts.push("z"),
+        Some(SelinuxLabel::Private) => opts.push("Z"),
+        None => {}
+    }
+
+    if opts.is_empty() {
+        Ok(format!("{source}:{normalized_target}"))
+    } else {
+        Ok(format!("{source}:{normalized_target}:{}", opts.join(",")))
+    }
+}
+
+/// Collect user-supplied non-bind mounts as structured `Mount` objects.
+fn docker_driver_mounts(config: &DockerSandboxDriverConfig) -> Result<Vec<Mount>, Status> {
+    config
+        .mounts
+        .iter()
+        .filter_map(|m| docker_mount_from_config(m).transpose())
+        .collect()
+}
+
+fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Option<Mount>, Status> {
+    match config {
+        DockerDriverMountConfig::Bind { .. } => {
+            // Bind mounts are handled via docker_driver_bind_strings.
+            Ok(None)
+        }
+        DockerDriverMountConfig::Volume {
+            source,
+            target,
+            read_only,
+            subpath,
+        } => Ok(Some(Mount {
+            typ: Some(MountTypeEnum::VOLUME),
+            source: Some(source.clone()),
+            target: Some(target.clone()),
+            read_only: Some(*read_only),
+            volume_options: subpath.as_ref().map(|subpath| MountVolumeOptions {
+                subpath: Some(subpath.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })),
+        DockerDriverMountConfig::Tmpfs {
+            target,
+            options,
+            size_bytes,
+            mode,
+        } => Ok(Some(Mount {
+            typ: Some(MountTypeEnum::TMPFS),
+            target: Some(target.clone()),
+            tmpfs_options: Some(MountTmpfsOptions {
+                size_bytes: validate_optional_positive_integral_i64(
+                    *size_bytes,
+                    "tmpfs size_bytes",
+                )?,
+                mode: validate_optional_nonnegative_integral_i64(*mode, "tmpfs mode")?,
+                options: (!options.is_empty())
+                    .then(|| {
+                        options
+                            .iter()
+                            .map(|option| docker_tmpfs_option(option))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?,
+            }),
+            ..Default::default()
+        })),
+        DockerDriverMountConfig::Image { .. } => Err(Status::failed_precondition(
+            "invalid docker driver_config: docker image mounts are not supported",
+        )),
+    }
+}
+
+fn validate_docker_driver_mounts(
+    mounts: &[DockerDriverMountConfig],
+    enable_bind_mounts: bool,
+) -> Result<(), Status> {
+    let mut targets = HashSet::new();
+    for mount in mounts {
+        let target = match mount {
+            DockerDriverMountConfig::Bind { source, target, .. } => {
+                if !enable_bind_mounts {
+                    return Err(Status::failed_precondition(
+                        "docker bind mounts require enable_bind_mounts = true in [openshell.drivers.docker]",
+                    ));
+                }
+                driver_mounts::validate_absolute_mount_source(source, "bind source")
+                    .map_err(Status::failed_precondition)?;
+                target
+            }
+            DockerDriverMountConfig::Volume {
+                source,
+                target,
+                subpath,
+                ..
+            } => {
+                driver_mounts::validate_mount_source(source, "volume source")
+                    .map_err(Status::failed_precondition)?;
+                if let Some(subpath) = subpath {
+                    driver_mounts::validate_mount_subpath(subpath)
+                        .map_err(Status::failed_precondition)?;
+                }
+                target
+            }
+            DockerDriverMountConfig::Tmpfs {
+                target,
+                options,
+                size_bytes,
+                mode,
+            } => {
+                validate_optional_positive_integral_i64(*size_bytes, "tmpfs size_bytes")?;
+                validate_optional_nonnegative_integral_i64(*mode, "tmpfs mode")?;
+                for option in options {
+                    docker_tmpfs_option(option)?;
+                }
+                target
+            }
+            DockerDriverMountConfig::Image {
+                source,
+                target,
+                read_only,
+                subpath,
+            } => {
+                let _ = (source, target, read_only, subpath);
+                return Err(Status::failed_precondition(
+                    "invalid docker driver_config: docker image mounts are not supported",
+                ));
+            }
+        };
+        driver_mounts::validate_container_mount_target(target)
+            .map_err(Status::failed_precondition)?;
+        let normalized_target = driver_mounts::normalize_mount_target(target);
+        if !targets.insert(normalized_target.clone()) {
+            return Err(Status::failed_precondition(format!(
+                "duplicate docker driver_config mount target '{normalized_target}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_optional_positive_integral_i64(
+    value: Option<f64>,
+    field: &str,
+) -> Result<Option<i64>, Status> {
+    let Some(value) = validate_optional_integral_i64(value, field)? else {
+        return Ok(None);
+    };
+    if value <= 0 {
+        return Err(Status::failed_precondition(format!(
+            "{field} must be positive"
+        )));
+    }
+    Ok(Some(value))
+}
+
+fn validate_optional_nonnegative_integral_i64(
+    value: Option<f64>,
+    field: &str,
+) -> Result<Option<i64>, Status> {
+    let Some(value) = validate_optional_integral_i64(value, field)? else {
+        return Ok(None);
+    };
+    if value < 0 {
+        return Err(Status::failed_precondition(format!(
+            "{field} must be zero or greater"
+        )));
+    }
+    Ok(Some(value))
+}
+
+fn validate_optional_integral_i64(value: Option<f64>, field: &str) -> Result<Option<i64>, Status> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if !value.is_finite() || value.fract() != 0.0 {
+        return Err(Status::failed_precondition(format!(
+            "{field} must be an integer"
+        )));
+    }
+    value.to_string().parse::<i64>().map(Some).map_err(|_| {
+        Status::failed_precondition(format!("{field} must be representable as an i64"))
+    })
+}
+
+fn docker_tmpfs_option(option: &str) -> Result<Vec<String>, Status> {
+    let option = option.trim();
+    if option.is_empty() {
+        return Err(Status::failed_precondition(
+            "tmpfs options must not contain empty values",
+        ));
+    }
+    if let Some((key, value)) = option.split_once('=') {
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            return Err(Status::failed_precondition(
+                "tmpfs key=value options must include both key and value",
+            ));
+        }
+        Ok(vec![key.to_string(), value.to_string()])
+    } else {
+        Ok(vec![option.to_string()])
+    }
+}
+
+fn docker_volume_is_bind_backed(volume: &bollard::models::Volume) -> bool {
+    volume.driver == "local"
+        && volume.options.get("o").is_some_and(|options| {
+            options.split(',').any(|option| {
+                let option = option.trim();
+                option.eq_ignore_ascii_case("bind") || option.eq_ignore_ascii_case("rbind")
+            })
+        })
+}
+
 fn build_binds(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
@@ -1643,10 +2171,20 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
     ]);
 
     if let Some(spec) = sandbox.spec.as_ref() {
+        let mut user_env = HashMap::new();
         if let Some(template) = spec.template.as_ref() {
-            environment.extend(template.environment.clone());
+            user_env.extend(template.environment.clone());
         }
-        environment.extend(spec.environment.clone());
+        user_env.extend(spec.environment.clone());
+        environment.extend(user_env.clone());
+        if !user_env.is_empty()
+            && let Ok(json) = serde_json::to_string(&user_env)
+        {
+            environment.insert(
+                openshell_core::sandbox_env::USER_ENVIRONMENT.to_string(),
+                json,
+            );
+        }
     }
 
     environment.insert(
@@ -1713,19 +2251,70 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
         .collect()
 }
 
-fn docker_gpu_device_requests(gpu: bool, gpu_device: &str) -> Option<Vec<DeviceRequest>> {
-    cdi_gpu_device_ids(gpu, gpu_device).map(|device_ids| {
-        vec![DeviceRequest {
-            driver: Some("cdi".to_string()),
-            device_ids: Some(device_ids),
-            ..Default::default()
-        }]
-    })
+fn docker_cdi_gpu_inventory(info: &SystemInfo) -> CdiGpuInventory {
+    CdiGpuInventory::new(
+        info.discovered_devices
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|device| device.source.as_deref() == Some("cdi"))
+            .filter_map(|device| device.id.as_deref()),
+    )
 }
 
+fn docker_info_reports_wsl2(info: &SystemInfo) -> bool {
+    [
+        info.kernel_version.as_deref(),
+        info.operating_system.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(os_or_kernel_reports_wsl2)
+}
+
+fn os_or_kernel_reports_wsl2(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    value.contains("wsl2") || value.contains("microsoft-standard")
+}
+
+fn docker_gpu_selection_status(err: CdiGpuSelectionError) -> Status {
+    Status::failed_precondition(err.to_string())
+}
+
+#[cfg(test)]
 fn build_container_create_body(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
+) -> Result<ContainerCreateBody, Status> {
+    let template = sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref())
+        .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
+    let driver_config = docker_driver_config(template, config.enable_bind_mounts)?;
+    let gpu_requirements = sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| driver_gpu_requirements(spec.resource_requirements.as_ref()));
+    let cdi_devices = if let Some(cdi_devices) = driver_config.cdi_devices.as_ref() {
+        validate_specific_gpu_device_request(
+            gpu_requirements,
+            cdi_devices,
+            "driver_config.cdi_devices",
+        )
+        .map_err(Status::invalid_argument)?;
+        Some(cdi_devices.as_slice())
+    } else {
+        None
+    };
+    build_container_create_body_with_gpu_devices(sandbox, config, &driver_config, cdi_devices)
+}
+
+fn build_container_create_body_with_gpu_devices(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+    driver_config: &DockerSandboxDriverConfig,
+    gpu_device_ids: Option<&[String]>,
 ) -> Result<ContainerCreateBody, Status> {
     let spec = sandbox
         .spec
@@ -1736,6 +2325,15 @@ fn build_container_create_body(
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
     let resource_limits = docker_resource_limits(template)?;
+    let user_mounts = docker_driver_mounts(driver_config)?;
+    let user_bind_strings = docker_driver_bind_strings(driver_config)?;
+    let device_requests = gpu_device_ids.map(|device_ids| {
+        vec![DeviceRequest {
+            driver: Some("cdi".to_string()),
+            device_ids: Some(device_ids.to_vec()),
+            ..Default::default()
+        }]
+    });
     let mut labels = template.labels.clone();
     labels.insert(
         LABEL_MANAGED_BY.to_string(),
@@ -1765,8 +2363,13 @@ fn build_container_create_body(
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
             pids_limit: docker_pids_limit(config.sandbox_pids_limit)?,
-            device_requests: docker_gpu_device_requests(spec.gpu, &spec.gpu_device),
-            binds: Some(build_binds(sandbox, config)?),
+            device_requests,
+            binds: {
+                let mut binds = build_binds(sandbox, config)?;
+                binds.extend(user_bind_strings);
+                Some(binds)
+            },
+            mounts: Some(user_mounts),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                 maximum_retry_count: None,
@@ -2421,56 +3024,89 @@ fn normalize_docker_arch(arch: &str) -> String {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum SupervisorBinSource {
+    Binary(PathBuf),
+    Image(String),
+}
+
+fn resolve_supervisor_bin_source(
+    docker_config: &DockerComputeConfig,
+    current_exe: Option<&Path>,
+    target_candidates: &[PathBuf],
+) -> CoreResult<SupervisorBinSource> {
+    // Tier 1: explicit supervisor_bin in [openshell.drivers.docker].
+    if let Some(path) = docker_config.supervisor_bin.clone() {
+        let path = canonicalize_existing_file(&path, "docker supervisor binary")?;
+        validate_linux_elf_binary(&path)?;
+        return Ok(SupervisorBinSource::Binary(path));
+    }
+
+    // Tier 2: explicit supervisor_image in [openshell.drivers.docker].
+    // A configured image should be the source of truth even when a local
+    // developer build is present under target/.
+    if let Some(image) = docker_config.supervisor_image.clone() {
+        return Ok(SupervisorBinSource::Image(image));
+    }
+
+    // Tier 3: sibling `openshell-sandbox` next to the running gateway
+    // (release artifact layout). Linux-only because the sibling must be a
+    // Linux ELF to bind-mount into a Linux container.
+    if cfg!(target_os = "linux")
+        && let Some(current_exe) = current_exe
+        && let Some(parent) = current_exe.parent()
+    {
+        let sibling = parent.join("openshell-sandbox");
+        if sibling.is_file() {
+            let path = canonicalize_existing_file(&sibling, "docker supervisor binary")?;
+            if validate_linux_elf_binary(&path).is_ok() {
+                return Ok(SupervisorBinSource::Binary(path));
+            }
+        }
+    }
+
+    // Tier 4: local cargo target build (developer workflow). Preferred
+    // over the default registry image when available because it matches
+    // whatever the developer just built.
+    for candidate in target_candidates {
+        if candidate.is_file() {
+            let path = canonicalize_existing_file(candidate, "docker supervisor binary")?;
+            if validate_linux_elf_binary(&path).is_ok() {
+                return Ok(SupervisorBinSource::Binary(path));
+            }
+        }
+    }
+
+    // Tier 5: pull the release-matched default supervisor image and extract
+    // the binary to a host-side cache keyed by image content digest.
+    Ok(SupervisorBinSource::Image(default_docker_supervisor_image()))
+}
+
 pub(crate) async fn resolve_supervisor_bin(
     docker: &Docker,
     docker_config: &DockerComputeConfig,
     daemon_arch: &str,
 ) -> CoreResult<PathBuf> {
-    // Tier 1: explicit supervisor_bin in [openshell.drivers.docker].
-    if let Some(path) = docker_config.supervisor_bin.clone() {
-        let path = canonicalize_existing_file(&path, "docker supervisor binary")?;
-        validate_linux_elf_binary(&path)?;
-        return Ok(path);
-    }
-
-    // Tier 2: sibling `openshell-sandbox` next to the running gateway
-    // (release artifact layout). Linux-only because the sibling must be a
-    // Linux ELF to bind-mount into a Linux container.
-    if cfg!(target_os = "linux") {
-        let current_exe = std::env::current_exe()
-            .map_err(|err| Error::config(format!("failed to resolve current executable: {err}")))?;
-        if let Some(parent) = current_exe.parent() {
-            let sibling = parent.join("openshell-sandbox");
-            if sibling.is_file() {
-                let path = canonicalize_existing_file(&sibling, "docker supervisor binary")?;
-                if validate_linux_elf_binary(&path).is_ok() {
-                    return Ok(path);
-                }
-            }
-        }
-    }
-
-    // Tier 3: local cargo target build (developer workflow). Preferred
-    // over a registry pull when available because it matches whatever the
-    // developer just built.
+    let current_exe =
+        if cfg!(target_os = "linux")
+            && docker_config.supervisor_bin.is_none()
+            && docker_config.supervisor_image.is_none()
+        {
+            Some(std::env::current_exe().map_err(|err| {
+                Error::config(format!("failed to resolve current executable: {err}"))
+            })?)
+        } else {
+            None
+        };
     let target_candidates = linux_supervisor_candidates(daemon_arch);
-    for candidate in &target_candidates {
-        if candidate.is_file() {
-            let path = canonicalize_existing_file(candidate, "docker supervisor binary")?;
-            if validate_linux_elf_binary(&path).is_ok() {
-                return Ok(path);
-            }
+
+    match resolve_supervisor_bin_source(docker_config, current_exe.as_deref(), &target_candidates)?
+    {
+        SupervisorBinSource::Binary(path) => Ok(path),
+        SupervisorBinSource::Image(image) => {
+            extract_supervisor_bin_from_image(docker, &image).await
         }
     }
-
-    // Tier 4: pull the supervisor image from a registry and extract the
-    // binary to a host-side cache keyed by image content digest. This is
-    // the default path for released gateway binaries.
-    let image = docker_config
-        .supervisor_image
-        .clone()
-        .unwrap_or_else(default_docker_supervisor_image);
-    extract_supervisor_bin_from_image(docker, &image).await
 }
 
 fn linux_supervisor_candidates(daemon_arch: &str) -> Vec<PathBuf> {

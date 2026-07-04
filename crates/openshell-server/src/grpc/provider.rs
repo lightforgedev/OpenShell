@@ -8,7 +8,10 @@
 use crate::persistence::{
     ObjectId, ObjectLabels, ObjectName, ObjectType, Store, WriteCondition, generate_name,
 };
-use openshell_core::proto::{Provider, Sandbox};
+use openshell_core::proto::{
+    Provider, ProviderCredentialTokenGrantAudienceOverride, ProviderProfile,
+    ProviderProfileCredential, Sandbox,
+};
 use openshell_core::telemetry::{
     LifecycleOperation, ProviderProfile as TelemetryProviderProfile, TelemetryOutcome,
 };
@@ -36,10 +39,11 @@ fn redact_provider_credentials(mut provider: Provider) -> Provider {
     provider
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct ProviderEnvironment {
     pub environment: std::collections::HashMap<String, String>,
     pub credential_expires_at_ms: std::collections::HashMap<String, i64>,
+    pub dynamic_credentials: std::collections::HashMap<String, ProviderProfileCredential>,
 }
 
 impl ProviderEnvironment {
@@ -94,7 +98,7 @@ pub(super) async fn create_provider_record(
         return Err(Status::invalid_argument("provider.type is required"));
     }
     if provider.credentials.is_empty()
-        && !provider_type_allows_empty_credentials_for_refresh(store, &provider.r#type).await?
+        && !provider_type_allows_empty_credentials(store, &provider.r#type).await?
     {
         return Err(Status::invalid_argument(
             "provider.credentials must not be empty",
@@ -439,6 +443,7 @@ pub(super) async fn resolve_provider_environment(
     let mut expires = std::collections::HashMap::new();
     let now_ms = crate::persistence::current_time_ms();
     validate_provider_environment_keys_unique_at(store, provider_names, None, now_ms).await?;
+    let registry = openshell_providers::ProviderRegistry::new();
 
     for name in provider_names {
         let provider = store
@@ -484,58 +489,329 @@ pub(super) async fn resolve_provider_environment(
             }
         }
 
-        // For Vertex AI providers, inject agent-specific config env vars so that
-        // Claude Code, Goose, and OpenCode inside the sandbox can reach Vertex AI
-        // without additional configuration. Credentials from the loop above take
-        // precedence via entry().or_insert(), and sandbox --env overrides are
-        // applied at the process level after this environment is installed, so
-        // they naturally shadow these values.
-        if openshell_core::inference::normalize_inference_provider_type(&provider.r#type)
-            == Some("google-vertex-ai")
-        {
-            let project_id = provider
-                .config
-                .get(openshell_core::inference::VERTEX_AI_PROJECT_ID_KEY)
-                .map(String::as_str)
-                .unwrap_or_default()
-                .trim();
-            let region = provider
-                .config
-                .get(openshell_core::inference::VERTEX_AI_REGION_KEY)
-                .map(String::as_str)
-                .unwrap_or_default()
-                .trim();
-
-            // Static flags -- always present for Vertex AI providers.
-            env.entry("GOOSE_PROVIDER".to_string())
-                .or_insert_with(|| "gcp_vertex_ai".to_string());
-
-            // Project ID derived vars.
-            if !project_id.is_empty() {
-                env.entry("ANTHROPIC_VERTEX_PROJECT_ID".to_string())
-                    .or_insert_with(|| project_id.to_string());
-                env.entry("GCP_PROJECT_ID".to_string())
-                    .or_insert_with(|| project_id.to_string());
-                env.entry("GOOGLE_CLOUD_PROJECT".to_string())
-                    .or_insert_with(|| project_id.to_string());
-            }
-
-            // Region derived vars.
-            if !region.is_empty() {
-                env.entry("CLOUD_ML_REGION".to_string())
-                    .or_insert_with(|| region.to_string());
-                env.entry("GCP_LOCATION".to_string())
-                    .or_insert_with(|| region.to_string());
-                env.entry("VERTEX_LOCATION".to_string())
-                    .or_insert_with(|| region.to_string());
-            }
-        }
+        registry.inject_env(&provider, &mut env);
     }
 
     Ok(ProviderEnvironment {
         environment: env,
         credential_expires_at_ms: expires,
+        dynamic_credentials: resolve_dynamic_credentials(store, provider_names).await?,
     })
+}
+
+/// Resolve dynamic credentials (token grants) from provider profiles.
+///
+/// Returns a map of endpoint-bound keys to credential metadata for credentials
+/// that have `token_grant` configuration. Keys are internal supervisor metadata:
+/// host, port, endpoint path, and provider credential identity.
+pub(super) async fn resolve_dynamic_credentials(
+    store: &Store,
+    provider_names: &[String],
+) -> Result<std::collections::HashMap<String, ProviderProfileCredential>, Status> {
+    if provider_names.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let mut dynamic_creds = std::collections::HashMap::new();
+
+    for provider_name in provider_names {
+        let provider = store
+            .get_message_by_name::<Provider>(provider_name)
+            .await
+            .map_err(|e| {
+                Status::internal(format!("failed to fetch provider '{provider_name}': {e}"))
+            })?
+            .ok_or_else(|| {
+                Status::failed_precondition(format!("provider '{provider_name}' not found"))
+            })?;
+
+        let profile_id =
+            normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
+        let Some(profile) = get_provider_type_profile(store, profile_id).await? else {
+            continue;
+        };
+
+        insert_dynamic_credentials_for_profile(
+            &mut dynamic_creds,
+            &profile.to_proto(),
+            provider_name,
+        );
+    }
+
+    Ok(dynamic_creds)
+}
+
+fn insert_dynamic_credentials_for_profile(
+    dynamic_creds: &mut std::collections::HashMap<String, ProviderProfileCredential>,
+    profile: &ProviderProfile,
+    provider_name: &str,
+) {
+    for credential in &profile.credentials {
+        if credential.token_grant.is_none() {
+            continue;
+        }
+        for endpoint in &profile.endpoints {
+            for port in endpoint_ports(endpoint.port, &endpoint.ports) {
+                insert_dynamic_credentials_for_endpoint(
+                    dynamic_creds,
+                    &endpoint.host,
+                    port,
+                    &endpoint.path,
+                    provider_name,
+                    &credential.name,
+                    credential,
+                );
+            }
+        }
+    }
+}
+
+fn endpoint_ports(port: u32, ports: &[u32]) -> Vec<u32> {
+    if ports.is_empty() {
+        if port == 0 { Vec::new() } else { vec![port] }
+    } else {
+        ports.iter().copied().filter(|port| *port != 0).collect()
+    }
+}
+
+fn dynamic_credential_key(
+    host: &str,
+    port: u32,
+    path: &str,
+    provider_name: &str,
+    credential_name: &str,
+) -> String {
+    format!(
+        "{}\t{port}\t{}\t{}:{}",
+        host.to_ascii_lowercase(),
+        path,
+        provider_name,
+        credential_name
+    )
+}
+
+fn insert_dynamic_credentials_for_endpoint(
+    dynamic_creds: &mut std::collections::HashMap<String, ProviderProfileCredential>,
+    endpoint_host: &str,
+    endpoint_port: u32,
+    endpoint_path: &str,
+    provider_name: &str,
+    credential_name: &str,
+    credential: &ProviderProfileCredential,
+) {
+    let default_key = dynamic_credential_key(
+        endpoint_host,
+        endpoint_port,
+        endpoint_path,
+        provider_name,
+        credential_name,
+    );
+    dynamic_creds.insert(default_key, resolved_dynamic_credential(credential, None));
+
+    let Some(token_grant) = credential.token_grant.as_ref() else {
+        return;
+    };
+
+    for override_config in &token_grant.audience_overrides {
+        if !token_grant_override_matches_endpoint(override_config, endpoint_host, endpoint_port) {
+            continue;
+        }
+
+        let override_host = if override_config.host.is_empty() {
+            endpoint_host
+        } else {
+            override_config.host.as_str()
+        };
+        let override_port = if override_config.port == 0 {
+            endpoint_port
+        } else {
+            override_config.port
+        };
+        let override_path = if override_config.path.is_empty() {
+            endpoint_path
+        } else {
+            override_config.path.as_str()
+        };
+        let override_key = dynamic_credential_key(
+            override_host,
+            override_port,
+            override_path,
+            provider_name,
+            credential_name,
+        );
+        dynamic_creds.insert(
+            override_key,
+            resolved_dynamic_credential(credential, Some(override_config)),
+        );
+    }
+}
+
+fn resolved_dynamic_credential(
+    credential: &ProviderProfileCredential,
+    override_config: Option<&ProviderCredentialTokenGrantAudienceOverride>,
+) -> ProviderProfileCredential {
+    let mut credential = credential.clone();
+    if let Some(token_grant) = credential.token_grant.as_mut() {
+        if let Some(override_config) = override_config {
+            if !override_config.audience.is_empty() {
+                token_grant.audience.clone_from(&override_config.audience);
+            }
+            if !override_config.scopes.is_empty() {
+                token_grant.scopes.clone_from(&override_config.scopes);
+            }
+        }
+        token_grant.audience_overrides.clear();
+    }
+    credential
+}
+
+fn token_grant_override_matches_endpoint(
+    override_config: &ProviderCredentialTokenGrantAudienceOverride,
+    endpoint_host: &str,
+    endpoint_port: u32,
+) -> bool {
+    let host_matches = override_config.host.is_empty()
+        || host_pattern_matches(&override_config.host, endpoint_host)
+        || host_pattern_matches(endpoint_host, &override_config.host);
+    let port_matches = override_config.port == 0 || override_config.port == endpoint_port;
+    host_matches && port_matches
+}
+
+fn host_pattern_matches(pattern: &str, host: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase();
+    let host = host.to_ascii_lowercase();
+    if pattern == host {
+        return true;
+    }
+    if !pattern.contains('*') {
+        return false;
+    }
+
+    let pattern_labels: Vec<&str> = pattern.split('.').collect();
+    let host_labels: Vec<&str> = host.split('.').collect();
+    host_pattern_labels_match(&pattern_labels, &host_labels)
+}
+
+fn host_pattern_labels_match(pattern: &[&str], host: &[&str]) -> bool {
+    match pattern.split_first() {
+        None => host.is_empty(),
+        Some((label, rest)) if *label == "**" => {
+            host_pattern_labels_match(rest, host)
+                || (!host.is_empty() && host_pattern_labels_match(pattern, &host[1..]))
+        }
+        Some((label, rest)) if *label == "*" => {
+            !host.is_empty() && host_pattern_labels_match(rest, &host[1..])
+        }
+        Some((literal, rest)) => {
+            host.first().is_some_and(|label| label == literal)
+                && host_pattern_labels_match(rest, &host[1..])
+        }
+    }
+}
+
+fn dynamic_token_grant_match_score(host: &str, path: &str) -> u32 {
+    host_pattern_specificity(host) + endpoint_path_specificity(path)
+}
+
+fn host_pattern_specificity(pattern: &str) -> u32 {
+    let wildcard_penalty = count_as_u32(pattern.matches('*').count());
+    let label_count = count_as_u32(pattern.split('.').filter(|label| !label.is_empty()).count());
+    let literal_chars = count_as_u32(pattern.chars().filter(|ch| *ch != '*').count());
+    100_000u32
+        .saturating_sub(wildcard_penalty.saturating_mul(10_000))
+        .saturating_add(label_count.saturating_mul(100))
+        .saturating_add(literal_chars)
+}
+
+fn endpoint_path_specificity(path: &str) -> u32 {
+    if path.is_empty() || path == "**" {
+        return 0;
+    }
+    1_000_000u32.saturating_add(count_as_u32(path.chars().filter(|ch| *ch != '*').count()))
+}
+
+fn count_as_u32(count: usize) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+fn host_patterns_can_overlap(first: &str, second: &str) -> bool {
+    let first = first.to_ascii_lowercase();
+    let second = second.to_ascii_lowercase();
+    if !first.contains('*') {
+        return host_pattern_matches(&second, &first);
+    }
+    if !second.contains('*') {
+        return host_pattern_matches(&first, &second);
+    }
+    let first_labels: Vec<&str> = first.split('.').collect();
+    let second_labels: Vec<&str> = second.split('.').collect();
+    host_pattern_labels_can_overlap(&first_labels, &second_labels)
+}
+
+fn host_pattern_labels_can_overlap(first: &[&str], second: &[&str]) -> bool {
+    match (first.split_first(), second.split_first()) {
+        (None, None) => true,
+        (None, Some((label, rest))) if *label == "**" => {
+            host_pattern_labels_can_overlap(first, rest)
+        }
+        (Some((label, rest)), None) if *label == "**" => {
+            host_pattern_labels_can_overlap(rest, second)
+        }
+        (None, _) | (_, None) => false,
+        (Some((label, rest)), _) if *label == "**" => {
+            host_pattern_labels_can_overlap(rest, second)
+                || host_pattern_labels_can_overlap(first, &second[1..])
+        }
+        (_, Some((label, rest))) if *label == "**" => {
+            host_pattern_labels_can_overlap(first, rest)
+                || host_pattern_labels_can_overlap(&first[1..], second)
+        }
+        (Some((first_label, first_rest)), Some((second_label, second_rest))) => {
+            (*first_label == "*" || *second_label == "*" || first_label == second_label)
+                && host_pattern_labels_can_overlap(first_rest, second_rest)
+        }
+    }
+}
+
+fn path_patterns_can_overlap(first: &str, second: &str) -> bool {
+    if path_matches_all(first) || path_matches_all(second) {
+        return true;
+    }
+    if !first.contains('*') {
+        return endpoint_path_matches(second, first);
+    }
+    if !second.contains('*') {
+        return endpoint_path_matches(first, second);
+    }
+    match (path_prefix_pattern(first), path_prefix_pattern(second)) {
+        (Some(first_prefix), Some(second_prefix)) => {
+            first_prefix == second_prefix
+                || first_prefix.starts_with(&format!("{second_prefix}/"))
+                || second_prefix.starts_with(&format!("{first_prefix}/"))
+        }
+        _ => true,
+    }
+}
+
+fn path_matches_all(path: &str) -> bool {
+    path.is_empty() || path == "**" || path == "/**"
+}
+
+fn path_prefix_pattern(path: &str) -> Option<&str> {
+    path.strip_suffix("/**")
+}
+
+fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
+    if path_matches_all(pattern) {
+        return true;
+    }
+    if pattern == path {
+        return true;
+    }
+    if let Some(prefix) = path_prefix_pattern(pattern) {
+        return path == prefix || path.starts_with(&format!("{prefix}/"));
+    }
+    glob::Pattern::new(pattern).is_ok_and(|glob| glob.matches(path))
 }
 
 pub async fn validate_provider_environment_keys_unique(
@@ -599,6 +875,7 @@ async fn validate_provider_environment_keys_unique_at(
     now_ms: i64,
 ) -> Result<(), Status> {
     let mut seen = std::collections::HashMap::<String, String>::new();
+    let mut dynamic_bindings = Vec::new();
     for name in provider_names {
         let provider = match candidate_provider {
             Some(candidate) if candidate.object_name() == name.as_str() => candidate.clone(),
@@ -620,6 +897,162 @@ async fn validate_provider_environment_keys_unique_at(
                 }
             } else {
                 seen.insert(key, provider_name.clone());
+            }
+        }
+        dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider(store, &provider).await?);
+    }
+    validate_dynamic_token_grant_bindings_unambiguous(&dynamic_bindings)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DynamicTokenGrantBinding {
+    provider_name: String,
+    credential_name: String,
+    host: String,
+    port: u32,
+    path: String,
+    score: u32,
+}
+
+async fn dynamic_token_grant_bindings_for_provider(
+    store: &Store,
+    provider: &Provider,
+) -> Result<Vec<DynamicTokenGrantBinding>, Status> {
+    let provider_name = provider.object_name().to_string();
+    let profile_id = normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
+    let Some(profile) = get_provider_type_profile(store, profile_id).await? else {
+        return Ok(Vec::new());
+    };
+    Ok(dynamic_token_grant_bindings_for_profile(
+        &provider_name,
+        &profile.to_proto(),
+    ))
+}
+
+fn dynamic_token_grant_bindings_for_profile(
+    provider_name: &str,
+    profile: &ProviderProfile,
+) -> Vec<DynamicTokenGrantBinding> {
+    let mut bindings = Vec::new();
+    for credential in &profile.credentials {
+        if credential.token_grant.is_none() {
+            continue;
+        }
+        for endpoint in &profile.endpoints {
+            for port in endpoint_ports(endpoint.port, &endpoint.ports) {
+                push_dynamic_token_grant_bindings_for_endpoint(
+                    &mut bindings,
+                    provider_name,
+                    credential,
+                    &endpoint.host,
+                    port,
+                    &endpoint.path,
+                );
+            }
+        }
+    }
+    bindings
+}
+
+fn push_dynamic_token_grant_bindings_for_endpoint(
+    bindings: &mut Vec<DynamicTokenGrantBinding>,
+    provider_name: &str,
+    credential: &ProviderProfileCredential,
+    endpoint_host: &str,
+    endpoint_port: u32,
+    endpoint_path: &str,
+) {
+    push_dynamic_token_grant_binding(
+        bindings,
+        provider_name,
+        &credential.name,
+        endpoint_host,
+        endpoint_port,
+        endpoint_path,
+    );
+
+    let Some(token_grant) = credential.token_grant.as_ref() else {
+        return;
+    };
+
+    for override_config in &token_grant.audience_overrides {
+        if !token_grant_override_matches_endpoint(override_config, endpoint_host, endpoint_port) {
+            continue;
+        }
+        let override_host = if override_config.host.is_empty() {
+            endpoint_host
+        } else {
+            override_config.host.as_str()
+        };
+        let override_port = if override_config.port == 0 {
+            endpoint_port
+        } else {
+            override_config.port
+        };
+        let override_path = if override_config.path.is_empty() {
+            endpoint_path
+        } else {
+            override_config.path.as_str()
+        };
+        push_dynamic_token_grant_binding(
+            bindings,
+            provider_name,
+            &credential.name,
+            override_host,
+            override_port,
+            override_path,
+        );
+    }
+}
+
+fn push_dynamic_token_grant_binding(
+    bindings: &mut Vec<DynamicTokenGrantBinding>,
+    provider_name: &str,
+    credential_name: &str,
+    host: &str,
+    port: u32,
+    path: &str,
+) {
+    let candidate = DynamicTokenGrantBinding {
+        provider_name: provider_name.to_string(),
+        credential_name: credential_name.to_string(),
+        host: host.to_ascii_lowercase(),
+        port,
+        path: path.to_string(),
+        score: dynamic_token_grant_match_score(host, path),
+    };
+    if !bindings.iter().any(|binding| binding == &candidate) {
+        bindings.push(candidate);
+    }
+}
+
+fn validate_dynamic_token_grant_bindings_unambiguous(
+    bindings: &[DynamicTokenGrantBinding],
+) -> Result<(), Status> {
+    for (index, first) in bindings.iter().enumerate() {
+        for second in bindings.iter().skip(index + 1) {
+            if first.provider_name == second.provider_name
+                && first.credential_name == second.credential_name
+            {
+                continue;
+            }
+            if first.port == second.port
+                && first.score == second.score
+                && host_patterns_can_overlap(&first.host, &second.host)
+                && path_patterns_can_overlap(&first.path, &second.path)
+            {
+                return Err(Status::failed_precondition(format!(
+                    "dynamic token grants for '{}:{}' and '{}:{}' are ambiguous for {}:{} path selectors '{}' and '{}'; make one host/path selector more specific or attach only one matching provider",
+                    first.provider_name,
+                    first.credential_name,
+                    second.provider_name,
+                    second.credential_name,
+                    first.host,
+                    first.port,
+                    first.path,
+                    second.path
+                )));
             }
         }
     }
@@ -702,10 +1135,10 @@ use openshell_core::proto::{
     GetProviderRequest, ImportProviderProfilesRequest, ImportProviderProfilesResponse,
     LintProviderProfilesRequest, LintProviderProfilesResponse, ListProviderProfilesRequest,
     ListProviderProfilesResponse, ListProvidersRequest, ListProvidersResponse,
-    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
-    ProviderProfileImportItem, ProviderProfileResponse, ProviderResponse,
-    RotateProviderCredentialRequest, RotateProviderCredentialResponse, StoredProviderProfile,
-    UpdateProviderRequest,
+    ProviderCredentialRefreshStrategy, ProviderProfileDiagnostic, ProviderProfileImportItem,
+    ProviderProfileResponse, ProviderResponse, RotateProviderCredentialRequest,
+    RotateProviderCredentialResponse, StoredProviderProfile, UpdateProviderProfilesRequest,
+    UpdateProviderProfilesResponse, UpdateProviderRequest,
 };
 use openshell_providers::{
     CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile, default_profiles,
@@ -822,8 +1255,14 @@ pub(super) async fn handle_import_provider_profiles(
     let request = request.into_inner();
     let (profiles, mut diagnostics) = profiles_from_import_items(&request.profiles);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     diagnostics.extend(profile_conflict_diagnostics(state.store.as_ref(), &profiles).await?);
     diagnostics.extend(validate_profile_set(&profiles));
+    if !has_errors(&diagnostics) {
+        diagnostics.extend(
+            profile_attached_sandbox_diagnostics(state.store.as_ref(), &profiles, "import").await?,
+        );
+    }
 
     if has_errors(&diagnostics) {
         return Ok(Response::new(ImportProviderProfilesResponse {
@@ -835,8 +1274,8 @@ pub(super) async fn handle_import_provider_profiles(
 
     let mut imported = Vec::with_capacity(profiles.len());
     for (_, profile) in profiles {
-        let stored = stored_provider_profile(profile.to_proto());
-        state
+        let mut stored = stored_provider_profile(profile.to_proto());
+        let result = state
             .store
             .put_if(
                 StoredProviderProfile::object_type(),
@@ -848,13 +1287,125 @@ pub(super) async fn handle_import_provider_profiles(
             )
             .await
             .map_err(|e| Status::internal(format!("persist provider profile failed: {e}")))?;
-        imported.push(stored.profile.unwrap_or_default());
+        if let Some(metadata) = stored.metadata.as_mut() {
+            metadata.resource_version = result.resource_version;
+        }
+        let resource_version = stored_profile_resource_version(&stored);
+        imported.push(profile_response_payload(
+            stored.profile.unwrap_or_default(),
+            resource_version,
+        ));
     }
 
     Ok(Response::new(ImportProviderProfilesResponse {
         diagnostics: Vec::new(),
         profiles: imported,
         imported: true,
+    }))
+}
+
+pub(super) async fn handle_update_provider_profiles(
+    state: &Arc<ServerState>,
+    request: Request<UpdateProviderProfilesRequest>,
+) -> Result<Response<UpdateProviderProfilesResponse>, Status> {
+    let request = request.into_inner();
+    let items = request.profile.into_iter().collect::<Vec<_>>();
+    let (profiles, mut diagnostics) = profiles_from_import_items(&items);
+    add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
+    let target_id = normalize_profile_id_request(&request.id)?;
+    diagnostics.extend(
+        profile_update_target_diagnostics(state.store.as_ref(), &profiles, &target_id).await?,
+    );
+    diagnostics.extend(validate_profile_set(&profiles));
+    let expected_resource_version = if request.expected_resource_version != 0 {
+        Some(request.expected_resource_version)
+    } else {
+        profiles
+            .first()
+            .map(|(_, profile)| profile.resource_version)
+            .filter(|version| *version != 0)
+    };
+    if expected_resource_version.is_none() && !profiles.is_empty() {
+        let (source, profile) = &profiles[0];
+        diagnostics.push(ProfileValidationDiagnostic {
+            source: source.clone(),
+            profile_id: profile.id.clone(),
+            field: "resource_version".to_string(),
+            message: "custom provider profile update requires a non-zero resource_version; export the current profile before editing it".to_string(),
+            severity: "error".to_string(),
+        });
+    }
+    let _sandbox_sync_guard = if has_errors(&diagnostics) {
+        None
+    } else {
+        Some(state.compute.sandbox_sync_guard().await)
+    };
+    if !has_errors(&diagnostics) {
+        diagnostics.extend(
+            profile_attached_sandbox_diagnostics(state.store.as_ref(), &profiles, "update").await?,
+        );
+    }
+
+    if has_errors(&diagnostics) {
+        return Ok(Response::new(UpdateProviderProfilesResponse {
+            diagnostics: diagnostics.into_iter().map(proto_diagnostic).collect(),
+            profile: None,
+            updated: false,
+        }));
+    }
+
+    let expected_resource_version = expected_resource_version.unwrap_or_default();
+    let (_, profile) = profiles
+        .into_iter()
+        .next()
+        .ok_or_else(|| Status::internal("validated provider profile update is missing"))?;
+    let mut stored = state
+        .store
+        .get_message_by_name::<StoredProviderProfile>(&target_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?
+        .ok_or_else(|| Status::not_found("provider profile not found"))?;
+    let current_version = stored
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.resource_version);
+    if current_version != expected_resource_version {
+        return Err(Status::aborted(format!(
+            "provider profile was modified concurrently (current resource_version: {current_version})"
+        )));
+    }
+
+    stored.profile = Some(profile_storage_payload(profile.to_proto()));
+    let labels_json = stored
+        .object_labels()
+        .filter(|labels| !labels.is_empty())
+        .map(|labels| {
+            serde_json::to_string(&labels)
+                .map_err(|e| Status::internal(format!("serialize labels failed: {e}")))
+        })
+        .transpose()?;
+    let result = state
+        .store
+        .put_if(
+            StoredProviderProfile::object_type(),
+            stored.object_id(),
+            stored.object_name(),
+            &stored.encode_to_vec(),
+            labels_json.as_deref(),
+            WriteCondition::MatchResourceVersion(expected_resource_version),
+        )
+        .await
+        .map_err(|e| super::persistence_error_to_status(e, "update provider profile"))?;
+    if let Some(metadata) = stored.metadata.as_mut() {
+        metadata.resource_version = result.resource_version;
+    }
+    let resource_version = stored_profile_resource_version(&stored);
+    let profile = profile_response_payload(stored.profile.unwrap_or_default(), resource_version);
+
+    Ok(Response::new(UpdateProviderProfilesResponse {
+        diagnostics: Vec::new(),
+        profile: Some(profile),
+        updated: true,
     }))
 }
 
@@ -887,6 +1438,7 @@ pub(super) async fn handle_delete_provider_profile(
         ));
     }
 
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let existing = state
         .store
         .get_message_by_name::<StoredProviderProfile>(&id)
@@ -927,8 +1479,15 @@ pub(super) async fn get_provider_type_profile(
         .get_message_by_name::<StoredProviderProfile>(&id)
         .await
         .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?
-        .and_then(|stored| stored.profile)
-        .map(|profile| ProviderTypeProfile::from_proto(&profile));
+        .and_then(|stored| {
+            let resource_version = stored_profile_resource_version(&stored);
+            stored.profile.map(|profile| {
+                ProviderTypeProfile::from_proto(&profile_response_payload(
+                    profile,
+                    resource_version,
+                ))
+            })
+        });
     Ok(profile)
 }
 
@@ -978,14 +1537,14 @@ fn validate_refresh_material(
     Ok(())
 }
 
-async fn provider_type_allows_empty_credentials_for_refresh(
+async fn provider_type_allows_empty_credentials(
     store: &Store,
     provider_type: &str,
 ) -> Result<bool, Status> {
     let Some(profile) = get_provider_type_profile(store, provider_type).await? else {
         return Ok(false);
     };
-    Ok(profile.allows_gateway_refresh_bootstrap())
+    Ok(profile.allows_empty_provider_credentials())
 }
 
 async fn merged_provider_profiles(store: &Store) -> Result<Vec<ProviderTypeProfile>, Status> {
@@ -994,8 +1553,15 @@ async fn merged_provider_profiles(store: &Store) -> Result<Vec<ProviderTypeProfi
         custom_provider_profiles(store)
             .await?
             .into_iter()
-            .filter_map(|stored| stored.profile)
-            .map(|profile| ProviderTypeProfile::from_proto(&profile)),
+            .filter_map(|stored| {
+                let resource_version = stored_profile_resource_version(&stored);
+                stored.profile.map(|profile| {
+                    ProviderTypeProfile::from_proto(&profile_response_payload(
+                        profile,
+                        resource_version,
+                    ))
+                })
+            }),
     );
     Ok(profiles)
 }
@@ -1094,9 +1660,151 @@ async fn profile_conflict_diagnostics(
     Ok(diagnostics)
 }
 
+async fn profile_update_target_diagnostics(
+    store: &Store,
+    profiles: &[(String, ProviderTypeProfile)],
+    target_id: &str,
+) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
+    let mut diagnostics = Vec::new();
+    if profiles.len() == 1 {
+        let (source, profile) = &profiles[0];
+        if let Some(payload_id) = normalize_profile_id(&profile.id)
+            && payload_id != target_id
+        {
+            diagnostics.push(ProfileValidationDiagnostic {
+                source: source.clone(),
+                profile_id: profile.id.clone(),
+                field: "id".to_string(),
+                message: format!(
+                    "provider profile update target '{target_id}' does not match payload id '{payload_id}'"
+                ),
+                severity: "error".to_string(),
+            });
+        }
+    }
+    if get_default_profile(target_id).is_some() {
+        diagnostics.push(ProfileValidationDiagnostic {
+            source: target_id.to_string(),
+            profile_id: target_id.to_string(),
+            field: "id".to_string(),
+            message: format!("provider profile '{target_id}' is built-in and cannot be updated"),
+            severity: "error".to_string(),
+        });
+        return Ok(diagnostics);
+    }
+    if store
+        .get_message_by_name::<StoredProviderProfile>(target_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?
+        .is_none()
+    {
+        diagnostics.push(ProfileValidationDiagnostic {
+            source: target_id.to_string(),
+            profile_id: target_id.to_string(),
+            field: "id".to_string(),
+            message: format!("custom provider profile '{target_id}' does not exist"),
+            severity: "error".to_string(),
+        });
+    }
+    for (source, profile) in profiles {
+        let Some(id) = normalize_profile_id(&profile.id) else {
+            continue;
+        };
+        if get_default_profile(&id).is_some() {
+            diagnostics.push(ProfileValidationDiagnostic {
+                source: source.clone(),
+                profile_id: id.clone(),
+                field: "id".to_string(),
+                message: format!("provider profile '{id}' is built-in and cannot be updated"),
+                severity: "error".to_string(),
+            });
+        }
+    }
+    Ok(diagnostics)
+}
+
+async fn profile_attached_sandbox_diagnostics(
+    store: &Store,
+    profiles: &[(String, ProviderTypeProfile)],
+    operation: &str,
+) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
+    let mut candidate_profiles =
+        std::collections::HashMap::<String, (String, ProviderProfile)>::new();
+    for (source, profile) in profiles {
+        let Some(id) = normalize_profile_id(&profile.id) else {
+            continue;
+        };
+        candidate_profiles.insert(id, (source.clone(), profile.to_proto()));
+    }
+    if candidate_profiles.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let sandboxes = scan_sandboxes(store, |sandbox| {
+        sandbox
+            .spec
+            .as_ref()
+            .is_some_and(|spec| !spec.providers.is_empty())
+            .then_some(sandbox)
+    })
+    .await?;
+    let mut diagnostics = Vec::new();
+    for sandbox in sandboxes {
+        let sandbox_name = sandbox.object_name().to_string();
+        let spec = sandbox.spec.as_ref().expect("filtered by scan_sandboxes");
+        let mut bindings = Vec::new();
+        let mut imported_profiles_used = Vec::<(String, String)>::new();
+
+        for provider_name in &spec.providers {
+            let Some(provider) = store
+                .get_message_by_name::<Provider>(provider_name)
+                .await
+                .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+            else {
+                continue;
+            };
+            let profile_id =
+                normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
+            if let Some((source, profile)) = candidate_profiles.get(profile_id) {
+                bindings.extend(dynamic_token_grant_bindings_for_profile(
+                    provider.object_name(),
+                    profile,
+                ));
+                let used = (source.clone(), profile_id.to_string());
+                if !imported_profiles_used.contains(&used) {
+                    imported_profiles_used.push(used);
+                }
+            } else {
+                bindings.extend(dynamic_token_grant_bindings_for_provider(store, &provider).await?);
+            }
+        }
+
+        if imported_profiles_used.is_empty() {
+            continue;
+        }
+        if let Err(err) = validate_dynamic_token_grant_bindings_unambiguous(&bindings) {
+            for (source, profile_id) in &imported_profiles_used {
+                diagnostics.push(ProfileValidationDiagnostic {
+                    source: source.clone(),
+                    profile_id: profile_id.clone(),
+                    field: "credentials.token_grant.audience_overrides".to_string(),
+                    message: format!(
+                        "{operation} would create ambiguous dynamic token grants on sandbox '{sandbox_name}': {}",
+                        err.message()
+                    ),
+                    severity: "error".to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(diagnostics)
+}
+
 fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfile {
     use crate::persistence::current_time_ms;
     let now_ms = current_time_ms();
+    let profile = profile_storage_payload(profile);
     StoredProviderProfile {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: uuid::Uuid::new_v4().to_string(),
@@ -1107,6 +1815,26 @@ fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfile {
         }),
         profile: Some(profile),
     }
+}
+
+fn profile_storage_payload(mut profile: ProviderProfile) -> ProviderProfile {
+    profile.resource_version = 0;
+    profile
+}
+
+fn profile_response_payload(
+    mut profile: ProviderProfile,
+    resource_version: u64,
+) -> ProviderProfile {
+    profile.resource_version = resource_version;
+    profile
+}
+
+fn stored_profile_resource_version(stored: &StoredProviderProfile) -> u64 {
+    stored
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.resource_version)
 }
 
 fn proto_diagnostic(diagnostic: ProfileValidationDiagnostic) -> ProviderProfileDiagnostic {
@@ -1590,6 +2318,7 @@ fn telemetry_provider_profile(provider_type: &str) -> TelemetryProviderProfile {
         Some("claude" | "claude-code") => TelemetryProviderProfile::Claude,
         Some("codex") => TelemetryProviderProfile::Codex,
         Some("copilot") => TelemetryProviderProfile::Copilot,
+        Some("deepinfra") => TelemetryProviderProfile::Deepinfra,
         Some("github") => TelemetryProviderProfile::Github,
         Some("gitlab") => TelemetryProviderProfile::Gitlab,
         Some("nvidia") => TelemetryProviderProfile::Nvidia,
@@ -1614,8 +2343,10 @@ mod tests {
         DeleteProviderProfileRequest, GetProviderProfileRequest, ImportProviderProfilesRequest,
         L7Allow, L7Rule, LintProviderProfilesRequest, ListProviderProfilesRequest, NetworkBinary,
         NetworkEndpoint, ProviderCredentialRefresh, ProviderCredentialRefreshMaterial,
+        ProviderCredentialTokenGrant, ProviderCredentialTokenGrantAudienceOverride,
         ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
-        ProviderProfileImportItem, Sandbox, SandboxSpec,
+        ProviderProfileImportItem, Sandbox, SandboxSpec, StoredProviderProfile,
+        UpdateProviderProfilesRequest,
     };
     use openshell_core::{ObjectId, ObjectName};
     use std::collections::HashMap;
@@ -1678,6 +2409,569 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dynamic_credentials_expand_endpoint_audience_overrides() {
+        let service_audiences = [
+            ("alpha.default.svc.cluster.local", "alpha"),
+            ("beta.default.svc.cluster.local", "beta"),
+            ("gamma.default.svc.cluster.local", "gamma"),
+            ("delta.default.svc.cluster.local", "delta"),
+        ];
+        let credential = ProviderProfileCredential {
+            name: "access_token".to_string(),
+            description: String::new(),
+            env_vars: Vec::new(),
+            required: false,
+            auth_style: "bearer".to_string(),
+            header_name: "Authorization".to_string(),
+            query_param: String::new(),
+            refresh: None,
+            path_template: String::new(),
+            token_grant: Some(ProviderCredentialTokenGrant {
+                token_endpoint: "http://keycloak.default.svc.cluster.local/realms/openshell/protocol/openid-connect/token".to_string(),
+                audience: "api://default".to_string(),
+                jwt_svid_audience: "http://keycloak.default.svc.cluster.local/realms/openshell"
+                    .to_string(),
+                client_assertion_type:
+                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_string(),
+                scopes: vec!["openid".to_string()],
+                cache_ttl_seconds: 300,
+                audience_overrides: service_audiences
+                    .iter()
+                    .map(
+                        |(host, audience)| ProviderCredentialTokenGrantAudienceOverride {
+                            host: (*host).to_string(),
+                            port: 80,
+                            path: String::new(),
+                            audience: (*audience).to_string(),
+                            scopes: vec![(*audience).to_string()],
+                        },
+                    )
+                    .collect(),
+            }),
+        };
+        let profile = ProviderProfile {
+            id: "keycloak-sso".to_string(),
+            resource_version: 0,
+            display_name: "Keycloak SSO".to_string(),
+            description: String::new(),
+            category: ProviderProfileCategory::Other as i32,
+            credentials: vec![credential],
+            endpoints: service_audiences
+                .iter()
+                .map(|(host, _)| NetworkEndpoint {
+                    host: (*host).to_string(),
+                    port: 80,
+                    ..Default::default()
+                })
+                .collect(),
+            binaries: Vec::new(),
+            inference_capable: false,
+            discovery: None,
+        };
+
+        let mut dynamic_creds = HashMap::new();
+        insert_dynamic_credentials_for_profile(&mut dynamic_creds, &profile, "keycloak");
+
+        assert_eq!(dynamic_creds.len(), 4);
+        for (host, audience) in service_audiences {
+            let key = dynamic_credential_key(host, 80, "", "keycloak", "access_token");
+            let grant = dynamic_creds[&key].token_grant.as_ref().unwrap();
+            assert_eq!(grant.audience, audience);
+            assert_eq!(grant.scopes, vec![audience.to_string()]);
+            assert!(grant.audience_overrides.is_empty());
+        }
+    }
+
+    async fn import_token_grant_profile(
+        state: &Arc<ServerState>,
+        id: &str,
+        host: &str,
+        port: u32,
+        path: &str,
+    ) {
+        let mut profile = custom_profile(id);
+        profile.credentials = vec![token_grant_credential("access_token")];
+        profile.endpoints = vec![NetworkEndpoint {
+            host: host.to_string(),
+            port,
+            path: path.to_string(),
+            protocol: "rest".to_string(),
+            ..Default::default()
+        }];
+        handle_import_provider_profiles(
+            state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: format!("{id}.yaml"),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn create_empty_token_grant_provider(
+        store: &Store,
+        name: &str,
+        provider_type: &str,
+    ) -> Provider {
+        create_provider_record(
+            store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: name.to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: provider_type.to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn dynamic_token_grants_reject_equal_specificity_overlap() {
+        let state = test_server_state().await;
+        let store = state.store.as_ref();
+        import_token_grant_profile(&state, "grant-a", "api.example.com", 443, "/v1/**").await;
+        import_token_grant_profile(&state, "grant-b", "api.example.com", 443, "/v1/**").await;
+        create_empty_token_grant_provider(store, "provider-a", "grant-a").await;
+        create_empty_token_grant_provider(store, "provider-b", "grant-b").await;
+
+        let err = validate_provider_environment_keys_unique(
+            store,
+            &["provider-a".to_string(), "provider-b".to_string()],
+        )
+        .await
+        .expect_err("equal-specificity dynamic grants should be ambiguous");
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("dynamic token grants"));
+        assert!(err.message().contains("ambiguous"));
+    }
+
+    #[tokio::test]
+    async fn dynamic_token_grants_allow_more_specific_path_overlap() {
+        let state = test_server_state().await;
+        let store = state.store.as_ref();
+        import_token_grant_profile(&state, "grant-default", "api.example.com", 443, "/v1/**").await;
+        import_token_grant_profile(
+            &state,
+            "grant-admin",
+            "api.example.com",
+            443,
+            "/v1/admin/**",
+        )
+        .await;
+        create_empty_token_grant_provider(store, "provider-default", "grant-default").await;
+        create_empty_token_grant_provider(store, "provider-admin", "grant-admin").await;
+
+        validate_provider_environment_keys_unique(
+            store,
+            &["provider-default".to_string(), "provider-admin".to_string()],
+        )
+        .await
+        .expect("more-specific path should make dynamic grants deterministic");
+    }
+
+    #[tokio::test]
+    async fn import_provider_profile_rejects_attached_dynamic_binding_ambiguity() {
+        let state = test_server_state().await;
+        let store = state.store.as_ref();
+        import_token_grant_profile(&state, "grant-existing", "api.example.com", 443, "/v1/**")
+            .await;
+        create_empty_token_grant_provider(store, "provider-existing", "grant-existing").await;
+        create_provider_record(
+            store,
+            provider_with_values("provider-candidate", "grant-new"),
+        )
+        .await
+        .unwrap();
+        store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "sandbox-import-ambiguity-id".to_string(),
+                    name: "sandbox-import-ambiguity".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec![
+                        "provider-existing".to_string(),
+                        "provider-candidate".to_string(),
+                    ],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let mut profile = custom_profile("grant-new");
+        profile.credentials = vec![token_grant_credential("access_token")];
+        profile.endpoints = vec![NetworkEndpoint {
+            host: "api.example.com".to_string(),
+            port: 443,
+            path: "/v1/**".to_string(),
+            protocol: "rest".to_string(),
+            ..Default::default()
+        }];
+        let response = handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "grant-new.yaml".to_string(),
+                }],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.imported);
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("import would create ambiguous dynamic token grants")
+        }));
+    }
+
+    #[tokio::test]
+    async fn import_provider_profile_waits_for_sandbox_sync_guard() {
+        let state = test_server_state().await;
+        let guard = state.compute.sandbox_sync_guard().await;
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            handle_import_provider_profiles(
+                &task_state,
+                Request::new(ImportProviderProfilesRequest {
+                    profiles: vec![ProviderProfileImportItem {
+                        profile: Some(custom_profile("guarded-import")),
+                        source: "guarded-import.yaml".to_string(),
+                    }],
+                }),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !task.is_finished(),
+            "profile import should wait for sandbox sync guard"
+        );
+        drop(guard);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("import should finish after guard release")
+            .expect("join import task")
+            .expect("import should succeed")
+            .into_inner();
+        assert!(response.imported);
+    }
+
+    #[tokio::test]
+    async fn update_provider_profile_replaces_custom_profile_and_preserves_metadata() {
+        let state = test_server_state().await;
+        let mut original = custom_profile("custom-api");
+        original.display_name = "Original API".to_string();
+        let mut stored = stored_provider_profile(original);
+        stored.metadata.as_mut().unwrap().labels =
+            HashMap::from([("team".to_string(), "platform".to_string())]);
+        state.store.put_message(&stored).await.unwrap();
+        let before: StoredProviderProfile = state
+            .store
+            .get_message_by_name("custom-api")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut updated_profile = custom_profile("custom-api");
+        updated_profile.resource_version = before.metadata.as_ref().unwrap().resource_version;
+        updated_profile.display_name = "Updated API".to_string();
+        updated_profile.endpoints = vec![NetworkEndpoint {
+            host: "api.updated.example".to_string(),
+            port: 443,
+            ..Default::default()
+        }];
+        let response = handle_update_provider_profiles(
+            &state,
+            Request::new(UpdateProviderProfilesRequest {
+                profile: Some(ProviderProfileImportItem {
+                    profile: Some(updated_profile.clone()),
+                    source: "custom-api.yaml".to_string(),
+                }),
+                expected_resource_version: 0,
+                id: "custom-api".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(response.updated);
+        assert_eq!(response.profile.as_ref().unwrap().id, updated_profile.id);
+        assert_eq!(
+            response.profile.as_ref().unwrap().display_name,
+            updated_profile.display_name
+        );
+        let after: StoredProviderProfile = state
+            .store
+            .get_message_by_name("custom-api")
+            .await
+            .unwrap()
+            .unwrap();
+        let before_meta = before.metadata.unwrap();
+        let after_meta = after.metadata.unwrap();
+        assert_eq!(after_meta.id, before_meta.id);
+        assert_eq!(after_meta.name, before_meta.name);
+        assert_eq!(after_meta.created_at_ms, before_meta.created_at_ms);
+        assert_eq!(after_meta.labels, before_meta.labels);
+        assert!(after_meta.resource_version > before_meta.resource_version);
+        assert_eq!(
+            after.profile.unwrap().endpoints[0].host,
+            "api.updated.example"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_provider_profile_rejects_built_in_and_missing_profiles() {
+        let state = test_server_state().await;
+
+        let built_in = handle_update_provider_profiles(
+            &state,
+            Request::new(UpdateProviderProfilesRequest {
+                profile: Some(ProviderProfileImportItem {
+                    profile: Some(custom_profile("github")),
+                    source: "github.yaml".to_string(),
+                }),
+                expected_resource_version: 0,
+                id: "github".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(!built_in.updated);
+        assert!(built_in.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("built-in and cannot be updated")
+        }));
+
+        let missing = handle_update_provider_profiles(
+            &state,
+            Request::new(UpdateProviderProfilesRequest {
+                profile: Some(ProviderProfileImportItem {
+                    profile: Some(custom_profile("missing-custom")),
+                    source: "missing-custom.yaml".to_string(),
+                }),
+                expected_resource_version: 0,
+                id: "missing-custom".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(!missing.updated);
+        assert!(missing.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("custom provider profile 'missing-custom' does not exist")
+        }));
+    }
+
+    #[tokio::test]
+    async fn update_provider_profile_requires_current_resource_version() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&stored_provider_profile(custom_profile("custom-api")))
+            .await
+            .unwrap();
+
+        let missing_version = handle_update_provider_profiles(
+            &state,
+            Request::new(UpdateProviderProfilesRequest {
+                profile: Some(ProviderProfileImportItem {
+                    profile: Some(custom_profile("custom-api")),
+                    source: "custom-api.yaml".to_string(),
+                }),
+                expected_resource_version: 0,
+                id: "custom-api".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(!missing_version.updated);
+        assert!(missing_version.diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "resource_version"
+                && diagnostic.message.contains("non-zero resource_version")
+        }));
+
+        let mut stale_profile = custom_profile("custom-api");
+        stale_profile.resource_version = 99;
+        let stale_error = handle_update_provider_profiles(
+            &state,
+            Request::new(UpdateProviderProfilesRequest {
+                profile: Some(ProviderProfileImportItem {
+                    profile: Some(stale_profile),
+                    source: "custom-api.yaml".to_string(),
+                }),
+                expected_resource_version: 0,
+                id: "custom-api".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale_error.code(), Code::Aborted);
+        assert!(stale_error.message().contains("resource_version"));
+    }
+
+    #[tokio::test]
+    async fn update_provider_profile_rejects_payload_id_change() {
+        let state = test_server_state().await;
+        let mut profile_a = custom_profile("profile-a");
+        profile_a.display_name = "Profile A".to_string();
+        let mut profile_b = custom_profile("profile-b");
+        profile_b.display_name = "Profile B".to_string();
+        state
+            .store
+            .put_message(&stored_provider_profile(profile_a))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&stored_provider_profile(profile_b))
+            .await
+            .unwrap();
+        let profile_a_version = state
+            .store
+            .get_message_by_name::<StoredProviderProfile>("profile-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata
+            .as_ref()
+            .unwrap()
+            .resource_version;
+
+        let mut edited_payload = custom_profile("profile-b");
+        edited_payload.resource_version = profile_a_version;
+        edited_payload.display_name = "Wrong overwrite".to_string();
+        let response = handle_update_provider_profiles(
+            &state,
+            Request::new(UpdateProviderProfilesRequest {
+                profile: Some(ProviderProfileImportItem {
+                    profile: Some(edited_payload),
+                    source: "profile-a.yaml".to_string(),
+                }),
+                expected_resource_version: 0,
+                id: "profile-a".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.updated);
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "id"
+                && diagnostic
+                    .message
+                    .contains("does not match payload id 'profile-b'")
+        }));
+        let stored_b: StoredProviderProfile = state
+            .store
+            .get_message_by_name("profile-b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_b.profile.unwrap().display_name, "Profile B");
+    }
+
+    #[tokio::test]
+    async fn update_provider_profile_rejects_attached_dynamic_binding_ambiguity() {
+        let state = test_server_state().await;
+        let store = state.store.as_ref();
+        import_token_grant_profile(&state, "grant-existing", "api.example.com", 443, "/v1/**")
+            .await;
+        import_token_grant_profile(&state, "grant-updated", "api.example.com", 443, "/v2/**").await;
+        create_empty_token_grant_provider(store, "provider-existing", "grant-existing").await;
+        create_empty_token_grant_provider(store, "provider-updated", "grant-updated").await;
+        store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "sandbox-update-ambiguity-id".to_string(),
+                    name: "sandbox-update-ambiguity".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec![
+                        "provider-existing".to_string(),
+                        "provider-updated".to_string(),
+                    ],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let mut profile = custom_profile("grant-updated");
+        profile.resource_version = store
+            .get_message_by_name::<StoredProviderProfile>("grant-updated")
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata
+            .as_ref()
+            .unwrap()
+            .resource_version;
+        profile.credentials = vec![token_grant_credential("access_token")];
+        profile.endpoints = vec![NetworkEndpoint {
+            host: "api.example.com".to_string(),
+            port: 443,
+            path: "/v1/**".to_string(),
+            protocol: "rest".to_string(),
+            ..Default::default()
+        }];
+        let response = handle_update_provider_profiles(
+            &state,
+            Request::new(UpdateProviderProfilesRequest {
+                profile: Some(ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "grant-updated.yaml".to_string(),
+                }),
+                expected_resource_version: 0,
+                id: "grant-updated".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.updated);
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("update would create ambiguous dynamic token grants")
+        }));
+    }
+
     fn provider_with_values(name: &str, provider_type: &str) -> Provider {
         Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -1707,6 +3001,7 @@ mod tests {
     fn custom_profile(id: &str) -> ProviderProfile {
         ProviderProfile {
             id: id.to_string(),
+            resource_version: 0,
             display_name: format!("{id} Profile"),
             description: String::new(),
             category: ProviderProfileCategory::Other as i32,
@@ -1759,6 +3054,7 @@ mod tests {
                     },
                 ],
             }),
+            token_grant: None,
         }
     }
 
@@ -1796,6 +3092,31 @@ mod tests {
             query_param: String::new(),
             refresh: None,
             path_template: String::new(),
+            token_grant: None,
+        }
+    }
+
+    fn token_grant_credential(name: &str) -> ProviderProfileCredential {
+        ProviderProfileCredential {
+            name: name.to_string(),
+            description: String::new(),
+            env_vars: Vec::new(),
+            required: true,
+            auth_style: "bearer".to_string(),
+            header_name: "authorization".to_string(),
+            query_param: String::new(),
+            refresh: None,
+            path_template: String::new(),
+            token_grant: Some(ProviderCredentialTokenGrant {
+                token_endpoint: "https://auth.example.com/token".to_string(),
+                audience: "api://default".to_string(),
+                jwt_svid_audience: "https://auth.example.com".to_string(),
+                client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+                    .to_string(),
+                scopes: vec!["read".to_string()],
+                cache_ttl_seconds: 300,
+                audience_overrides: Vec::new(),
+            }),
         }
     }
 
@@ -1821,11 +3142,14 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "aws-bedrock",
                 "claude-code",
                 "codex",
                 "copilot",
                 "cursor",
+                "deepinfra",
                 "github",
+                "google-cloud",
                 "google-vertex-ai",
                 "nvidia",
                 "pypi"
@@ -2116,6 +3440,7 @@ mod tests {
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(ProviderProfile {
                         id: "advanced-api".to_string(),
+                        resource_version: 0,
                         display_name: "Advanced API".to_string(),
                         description: String::new(),
                         category: ProviderProfileCategory::Other as i32,
@@ -2896,6 +4221,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_provider_profile_waits_for_sandbox_sync_guard() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&stored_provider_profile(custom_profile("guarded-delete")))
+            .await
+            .unwrap();
+
+        let guard = state.compute.sandbox_sync_guard().await;
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            handle_delete_provider_profile(
+                &task_state,
+                Request::new(DeleteProviderProfileRequest {
+                    id: "guarded-delete".to_string(),
+                }),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !task.is_finished(),
+            "profile delete should wait for sandbox sync guard"
+        );
+        drop(guard);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("delete should finish after guard release")
+            .expect("join delete task")
+            .expect("delete should succeed")
+            .into_inner();
+        assert!(response.deleted);
+    }
+
+    #[tokio::test]
     async fn provider_crud_round_trip_and_semantics() {
         let store = test_store().await;
 
@@ -3193,6 +4555,7 @@ mod tests {
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(ProviderProfile {
                         id: "delegated-refresh-api".to_string(),
+                        resource_version: 0,
                         display_name: "Delegated Refresh API".to_string(),
                         description: String::new(),
                         category: ProviderProfileCategory::Messaging as i32,
@@ -3227,6 +4590,7 @@ mod tests {
                                     },
                                 ],
                             }),
+                            token_grant: None,
                         }],
                         endpoints: vec![],
                         binaries: vec![],
@@ -3651,6 +5015,24 @@ mod tests {
         assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
         assert_eq!(result.get("CLAUDE_API_KEY"), Some(&"sk-abc".to_string()));
         assert!(!result.contains_key("endpoint"));
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_allows_static_provider_without_profile() {
+        let store = test_store().await;
+        create_provider_record(
+            &store,
+            provider_with_values("static-provider", "unprofiled-static-api"),
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment(&store, &["static-provider".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(result.get("API_TOKEN"), Some(&"token-123".to_string()));
+        assert!(result.dynamic_credentials.is_empty());
     }
 
     #[tokio::test]
@@ -4645,5 +6027,129 @@ mod tests {
             .filter(|i| final_provider.credentials.contains_key(&format!("KEY_{i}")))
             .count();
         assert_eq!(new_keys_count, 1);
+    }
+
+    fn google_cloud_provider(config: HashMap<String, String>) -> Provider {
+        Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: "my-google-cloud".to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            r#type: "google-cloud".to_string(),
+            credentials: HashMap::new(),
+            config,
+            credential_expires_at_ms: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn inject_gcp_env_sets_metadata_host() {
+        use openshell_core::google_cloud;
+        let provider = google_cloud_provider(HashMap::new());
+        let mut env = HashMap::new();
+        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        assert_eq!(
+            env.get("GCE_METADATA_HOST").map(String::as_str),
+            Some(google_cloud::METADATA_HOST),
+        );
+        assert!(
+            !env.contains_key("CLAUDE_CODE_USE_VERTEX"),
+            "CLAUDE_CODE_USE_VERTEX is synthetic, should not be injected here"
+        );
+    }
+
+    #[test]
+    fn inject_gcp_env_propagates_project_id() {
+        use openshell_core::google_cloud;
+        let provider = google_cloud_provider(HashMap::from([(
+            "project_id".to_string(),
+            "my-project".to_string(),
+        )]));
+        let mut env = HashMap::new();
+        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        for var in google_cloud::PROJECT_ID_ENV_VARS {
+            assert_eq!(
+                env.get(*var).map(String::as_str),
+                Some("my-project"),
+                "{var} should be set to project_id config value"
+            );
+        }
+    }
+
+    #[test]
+    fn inject_gcp_env_propagates_region() {
+        use openshell_core::google_cloud;
+        let provider = google_cloud_provider(HashMap::from([(
+            "region".to_string(),
+            "us-central1".to_string(),
+        )]));
+        let mut env = HashMap::new();
+        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        for var in google_cloud::REGION_ENV_VARS {
+            assert_eq!(
+                env.get(*var).map(String::as_str),
+                Some("us-central1"),
+                "{var} should be set to region config value"
+            );
+        }
+    }
+
+    #[test]
+    fn inject_gcp_env_propagates_service_account_email() {
+        use openshell_core::google_cloud;
+        let provider = google_cloud_provider(HashMap::from([(
+            "service_account_email".to_string(),
+            "sa@proj.iam.gserviceaccount.com".to_string(),
+        )]));
+        let mut env = HashMap::new();
+        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        for var in google_cloud::SERVICE_ACCOUNT_EMAIL_ENV_VARS {
+            assert_eq!(
+                env.get(*var).map(String::as_str),
+                Some("sa@proj.iam.gserviceaccount.com"),
+                "{var} should be set to service_account_email config value"
+            );
+        }
+    }
+
+    #[test]
+    fn inject_gcp_env_does_not_overwrite_existing_values() {
+        let provider = google_cloud_provider(HashMap::from([(
+            "project_id".to_string(),
+            "from-config".to_string(),
+        )]));
+        let mut env = HashMap::from([("GCP_PROJECT_ID".to_string(), "user-override".to_string())]);
+        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        assert_eq!(
+            env.get("GCP_PROJECT_ID").map(String::as_str),
+            Some("user-override"),
+            "user-provided value should not be overwritten"
+        );
+    }
+
+    #[test]
+    fn inject_non_gcp_provider_does_nothing() {
+        let provider = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: "github".to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            r#type: "github".to_string(),
+            credentials: HashMap::new(),
+            config: HashMap::from([("project_id".to_string(), "should-be-ignored".to_string())]),
+            credential_expires_at_ms: HashMap::new(),
+        };
+        let mut env = HashMap::new();
+        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        assert!(
+            env.is_empty(),
+            "non-GCP provider should not inject any env vars"
+        );
     }
 }

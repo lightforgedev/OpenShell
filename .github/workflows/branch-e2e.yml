@@ -26,7 +26,7 @@ jobs:
       run_kubernetes_ha_e2e: ${{ steps.labels.outputs.run_kubernetes_ha_e2e }}
       run_any_e2e: ${{ steps.labels.outputs.run_any_e2e }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - id: gate
         uses: ./.github/actions/pr-gate
       - id: labels
@@ -80,6 +80,17 @@ jobs:
       component: supervisor
       image-tag: ${{ github.sha }}
 
+  build-cli:
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: cli
+      platform: linux/amd64
+
   e2e:
     needs: [pr_metadata, build-gateway, build-supervisor]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
@@ -104,12 +115,22 @@ jobs:
   kubernetes-e2e:
     needs: [pr_metadata, build-gateway, build-supervisor]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - agent_sandbox_api: v1beta1
+            agent_sandbox_version: v0.5.0
+          - agent_sandbox_api: v1alpha1
+            agent_sandbox_version: v0.4.6
     permissions:
       contents: read
       packages: read
     uses: ./.github/workflows/e2e-kubernetes-test.yml
     with:
       image-tag: ${{ github.sha }}
+      job-name: Kubernetes E2E (Rust smoke, Agent Sandbox ${{ matrix.agent_sandbox_api }})
+      agent-sandbox-version: ${{ matrix.agent_sandbox_version }}
 
   kubernetes-ha-e2e:
     needs: [pr_metadata, build-gateway, build-supervisor]
@@ -122,6 +143,7 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes HA E2E (Rust smoke)
       extra-helm-values: deploy/helm/openshell/ci/values-high-availability.yaml
+      external-postgres-secret: openshell-ha-pg
 
   core-e2e-result:
     name: Core E2E result

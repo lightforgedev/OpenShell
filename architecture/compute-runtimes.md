@@ -33,17 +33,32 @@ when a sandbox create request asks for GPU resources.
 | Docker | Local development with Docker available. | Container plus nested sandbox namespace. | Uses host networking so loopback gateway endpoints work from the supervisor. |
 | Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API, OCI image volumes, and CDI GPU devices when available. |
 | Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
-| VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Gateway spawns `openshell-driver-vm` as a subprocess over a private, state-local Unix socket. The VM driver boots a cached bootstrap `rootfs.ext4`, prepares requested OCI images inside a bootstrap VM with `umoci`, attaches the prepared image disk read-only, and gives each sandbox a writable `overlay.ext4` for merged-root changes and runtime material. The driver persists each accepted launch request beside the overlay and restarts those VMs on driver startup without recreating the overlay. |
+| VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Managed endpoint-backed driver. The gateway spawns `openshell-driver-vm`, waits for its Unix socket, and then consumes it through the same remote `compute_driver.proto` path used by unmanaged endpoint drivers. The VM driver boots a cached bootstrap `rootfs.ext4`, prepares requested OCI images inside a bootstrap VM with `umoci`, attaches the prepared image disk read-only, and gives each sandbox a writable `overlay.ext4` for merged-root changes and runtime material. The driver persists each accepted launch request beside the overlay and restarts those VMs on driver startup without recreating the overlay. |
+| Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a non-reserved custom `compute_drivers = ["<name>"]` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. Reserved built-in names such as `vm`, `docker`, `podman`, and `kubernetes` cannot be used as unmanaged socket endpoints. The gateway connects to a UDS the operator already provisioned, runs `GetCapabilities`, logs the advertised `driver_name`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
 
 Per-sandbox CPU and memory values currently enter the driver layer through
 template resource limits. Docker and Podman apply them as runtime limits.
 Kubernetes mirrors each limit into the matching request. VM accepts the fields
 but currently ignores them.
 
+Docker and Podman also accept per-sandbox driver-config mounts for existing
+runtime-managed named volumes and tmpfs mounts. Podman additionally accepts
+image mounts through its image-volume API. User-supplied bind and volume mounts
+default to read-only. Direct host bind mounts, and Docker or Podman local-driver
+bind-backed named volumes, are available only when explicitly enabled in the
+active local driver table of `gateway.toml`. Host bind mounts are an unsafe
+operator override because they place gateway-host filesystem state inside the
+sandbox and can negate OpenShell workspace isolation and filesystem-policy
+controls. Driver-owned supervisor, token, and TLS bind mounts stay reserved.
+
 Kubernetes deployments may set an AppArmor profile on sandbox agent containers
 through the driver configuration. The Helm chart defaults sandbox agents to
 `Unconfined` so runtime/default AppArmor profiles do not block supervisor
 network namespace setup on AppArmor-enabled nodes.
+
+Resource requirements enter the driver layer through `SandboxSpec.resource_requirements`. This includes a set of GPU requirements, where a user
+can request a specific number of GPUs or the driver-specific default behaviour.
+For all in-tree drivers, this is equivalent to selecting a single GPU.
 
 VM runtime state paths are derived only from driver-validated sandbox IDs
 matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a
@@ -68,6 +83,7 @@ The supervisor must be available inside each sandbox workload:
 | Podman | Read-only OCI image volume containing the supervisor binary. |
 | Kubernetes | Sandbox pod image or pod template configuration. |
 | VM | Embedded in the guest rootfs bundle. |
+| Extension | Defined by the out-of-tree driver. |
 
 Driver-controlled environment variables must override sandbox image or template
 values for sandbox ID, sandbox name, gateway endpoint, relay socket path, TLS
@@ -82,11 +98,19 @@ users.
 Custom sandbox images must include the agent runtime and any system
 dependencies, but they should not need to include the gateway. GPU-capable
 images must include the user-space libraries required by the workload. The
-runtime still owns GPU device injection.
+runtime still owns GPU device injection. GPU requests are explicit, and can be
+refined with a driver-native device identifier or requested count; the gateway
+validates the request shape and each runtime enforces the GPU allocation modes it
+supports.
 
 ## Deployment Shape
 
-Kubernetes deployments use the Helm chart under `deploy/helm/openshell`.
+Kubernetes deployments use the Helm chart under `deploy/helm/openshell`. The
+chart deploys the gateway and sandbox runtime integration. The default gateway
+workload is a StatefulSet for SQLite-backed single-replica installs. External
+database-backed installs can render a Deployment with `workload.kind=deployment`;
+HA deployments must point `server.externalDbSecret` at an operator-managed
+PostgreSQL database.
 Standalone local deployments start the gateway with a selected runtime such as
 Docker, Podman, or VM. The CLI can register multiple gateways and switch between
 them without changing the sandbox architecture.

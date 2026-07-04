@@ -27,6 +27,16 @@ on:
         required: false
         type: string
         default: ""
+      external-postgres-secret:
+        description: "Create an ephemeral external PostgreSQL fixture and write its URI to this Secret"
+        required: false
+        type: string
+        default: ""
+      agent-sandbox-version:
+        description: "Agent Sandbox release to install before OpenShell"
+        required: false
+        type: string
+        default: "v0.5.0"
       mise-version:
         description: "mise version to install on the bare Kubernetes e2e runner"
         required: false
@@ -54,7 +64,7 @@ jobs:
       MISE_VERSION: ${{ inputs.mise-version }}
       KIND_CLUSTER_NAME: kube-e2e-${{ github.run_id }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
 
@@ -109,8 +119,10 @@ jobs:
 
       - name: Run Kubernetes E2E (Rust smoke)
         env:
+          AGENT_SANDBOX_VERSION: ${{ inputs.agent-sandbox-version }}
           OPENSHELL_E2E_KUBE_CONTEXT: kind-${{ env.KIND_CLUSTER_NAME }}
           OPENSHELL_E2E_KUBE_EXTRA_VALUES: ${{ inputs.extra-helm-values }}
+          OPENSHELL_E2E_KUBE_EXTERNAL_POSTGRES_SECRET: ${{ inputs.external-postgres-secret }}
           IMAGE_TAG: ${{ inputs.image-tag }}
           OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
         run: mise run --no-deps --skip-deps e2e:kubernetes

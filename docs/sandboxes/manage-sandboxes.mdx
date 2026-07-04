@@ -70,9 +70,40 @@ To request GPU resources, add `--gpu`:
 openshell sandbox create --gpu -- claude
 ```
 
+Request a specific number of GPUs by passing a count to `--gpu`:
+
+```shell
+openshell sandbox create --gpu 2 -- claude
+```
+
+When you omit the count, OpenShell treats the request as `--gpu 1`.
+Kubernetes honors counted `--gpu` requests by setting the `nvidia.com/gpu`
+limit. Docker and Podman select the requested number of default NVIDIA CDI
+devices in round-robin order. VM gateways accept only one GPU, either through
+`--gpu` or `--gpu 1`; a single `gpu_device_ids` entry works with either form.
+
 For Docker-backed sandboxes, GPU injection uses Docker CDI. If you enable Docker
 CDI after the gateway starts, restart the gateway so OpenShell can detect the
 updated Docker daemon capability.
+
+Docker and Podman refresh the CDI inventory before validating or creating a
+default GPU request, so CDI devices added or removed after the driver starts can
+be reflected in later sandbox creates. On WSL2 all-only runtimes, the default
+can fall back to `nvidia.com/gpu=all`; that fallback counts as one selectable
+device.
+
+Exact GPU device selection is driver-specific and still requires `--gpu`. For
+Docker or Podman, pass CDI IDs through `cdi_devices`. The top-level key must
+match the active driver; replace `docker` with `podman` when using Podman. CDI
+IDs are treated as opaque strings. The list must not contain duplicate IDs, and
+its length must match the effective GPU count:
+
+```shell
+openshell sandbox create \
+  --gpu \
+  --driver-config-json '{"docker":{"cdi_devices":["nvidia.com/gpu=0"]}}' \
+  -- claude
+```
 
 ### Custom Containers
 
@@ -153,6 +184,27 @@ OpenShell allocates a TTY automatically when both stdin and stdout are terminals
 | `--timeout`    | Command timeout in seconds. `0` disables the timeout.    |
 | `--tty`        | Force TTY allocation.                                    |
 | `--no-tty`     | Disable TTY allocation even when attached to a terminal. |
+| `--env`        | Set an environment variable for the command (`KEY=VALUE`, repeatable). |
+
+## Set Environment Variables
+
+Inject environment variables into the sandbox at creation time:
+
+```shell
+openshell sandbox create --env API_KEY=sk-test --env DEBUG=1 -- my-agent
+```
+
+Variables set with `--env` are available to all processes in the sandbox, including interactive shells and exec commands.
+
+You can also set per-command environment variables with `sandbox exec`:
+
+```shell
+openshell sandbox exec -n my-sandbox --env MY_VAR=hello -- printenv MY_VAR
+```
+
+Per-command variables override the sandbox-level environment for that command only.
+
+Environment variable names starting with `OPENSHELL_` are reserved. Keys must match `[A-Za-z_][A-Za-z0-9_]*`.
 
 ## Label a Sandbox
 
@@ -278,6 +330,8 @@ openshell forward start 8000 my-sandbox
 openshell forward start 8000 my-sandbox -d    # run in background
 ```
 
+OpenShell prints the local URL only after the forward listener is reachable. Background forwards must be tracked locally so `openshell forward list` and `openshell forward stop` can manage them.
+
 List and stop active forwards:
 
 ```shell
@@ -336,6 +390,13 @@ openshell sandbox create --upload ./src:/workspace/src --upload ./config:/worksp
 ```
 
 </Note>
+
+By default, uploads inside a Git repository respect `.gitignore` rules so that
+build artifacts, dependency caches, and other ignored files are not transferred.
+If `.gitignore` filtering excludes every file in the upload path, the CLI falls
+back to an unfiltered upload and prints a warning. Pass `--no-git-ignore` to
+opt into unfiltered uploads explicitly, upload a path outside the Git work
+tree, or force-add the intended files if they should remain Git-aware.
 
 ## Delete Sandboxes
 

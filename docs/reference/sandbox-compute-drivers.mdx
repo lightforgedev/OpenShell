@@ -21,7 +21,9 @@ Configure the compute driver on the gateway. Current releases accept one driver 
 compute_drivers = ["docker"]
 ```
 
-Supported values are `docker`, `podman`, `kubernetes`, and `vm`.
+Reserved built-in values are `docker`, `podman`, `kubernetes`, and `vm`.
+Non-reserved names select an extension driver and require a
+`socket_path` in `[openshell.drivers.<name>]`.
 
 When `compute_drivers` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker by CLI availability or a local Unix socket. The VM driver is never auto-detected; configure it explicitly with `compute_drivers = ["vm"]` or set `OPENSHELL_DRIVERS=vm` in the launch environment.
 
@@ -29,9 +31,32 @@ Common gateway options:
 
 | Gateway TOML option | Description |
 |---|---|
-| `compute_drivers = ["<driver>"]` | Select the compute driver. Supported values are `docker`, `podman`, `kubernetes`, and `vm`. |
+| `compute_drivers = ["<driver>"]` | Select the compute driver. Built-in values are `docker`, `podman`, `kubernetes`, and `vm`; custom names require `[openshell.drivers.<name>].socket_path`. |
 
 Set driver-specific values such as sandbox images, callback endpoints, network names, TLS material, and VM sizing in the gateway TOML file. See the [Gateway Configuration File](./gateway-config) reference for the full `[openshell.drivers.<name>]` schema.
+
+Extension drivers use the same `compute_driver.proto` gRPC surface as the
+managed VM driver. For an out-of-tree driver, choose a driver name and point
+the gateway at the Unix socket the operator has already provisioned:
+
+```toml
+[openshell.gateway]
+compute_drivers = ["kyma"]
+
+[openshell.drivers.kyma]
+socket_path = "/run/openshell/kyma.sock"
+```
+
+For a launch-time socket override, pass the same non-reserved driver name with
+the socket path:
+
+```shell
+openshell-gateway --drivers kyma --compute-driver-socket /run/openshell/kyma.sock
+```
+
+The gateway does not spawn, supervise, or delete extension drivers. The
+operator must protect the socket so only the gateway uid can access it.
+Reserved built-in names cannot be selected through unmanaged socket endpoints.
 
 Sandbox create supports `--cpu` and `--memory` for per-sandbox compute sizing.
 Docker and Podman apply them as runtime limits. Kubernetes applies them as both
@@ -53,7 +78,29 @@ openshell sandbox create \
 ```
 
 Driver config is for fields without a stable public flag. Prefer `--cpu`,
-`--memory`, and `--gpu` for portable resource intent.
+`--memory`, and `--gpu` for supported resource intent. When `--gpu` is present
+without a count, OpenShell treats it as a request for one GPU. Pass
+`--gpu COUNT` when requesting more than one GPU.
+
+Kubernetes maps the GPU count to the `nvidia.com/gpu` pod resource limit.
+Docker and Podman satisfy count-only GPU requests by selecting the requested
+number of NVIDIA CDI devices from the local CDI inventory in round-robin order.
+The drivers refresh the CDI inventory before validating or creating the
+sandbox, so CDI devices added or removed after gateway start can affect later
+creates. On WSL2 all-only runtimes, Docker or Podman can use
+`nvidia.com/gpu=all` as a compatibility fallback, where it counts as one
+selectable device.
+
+Exact GPU device selection remains driver-owned and requires `--gpu`. Docker
+and Podman accept `cdi_devices` as opaque CDI device names; replace the
+top-level `docker` key with `podman` when using the Podman driver, for example
+`{"docker":{"cdi_devices":["nvidia.com/gpu=0"]}}`. Explicit CDI device lists
+must not contain duplicates, and their length must match the effective GPU
+count. A single exact CDI device is compatible with the default `--gpu`
+request. The VM driver accepts `gpu_device_ids`, for example
+`{"vm":{"gpu_device_ids":["0000:2d:00.0"]}}`; the current VM implementation
+accepts at most one entry and allows either `--gpu` or `--gpu 1` when
+`gpu_device_ids` is set.
 
 For Kubernetes, `pod.runtime_class_name` maps to PodSpec `runtimeClassName`.
 It overrides the gateway's configured default runtime class for that sandbox,
@@ -72,6 +119,58 @@ Select Docker with `compute_drivers = ["docker"]` in `[openshell.gateway]`. Conf
 
 For GPU-backed Docker sandboxes, configure Docker CDI before starting the gateway so OpenShell can detect the daemon capability.
 
+### Docker Driver Config Mounts
+
+Docker driver config accepts user-supplied `volume` and `tmpfs` mounts. It also
+accepts `bind` mounts when `[openshell.drivers.docker]` sets
+`enable_bind_mounts = true` in `gateway.toml`. See Docker's [storage documentation](https://docs.docker.com/engine/storage/) for more information.
+Docker local-driver named volumes created with bind options also expose
+gateway-host paths, so OpenShell treats them like bind mounts and requires
+`enable_bind_mounts = true`.
+
+Use a `volume` mount for existing Docker named volumes:
+
+```shell
+docker volume create openshell-work
+
+openshell sandbox create \
+  --driver-config-json '{"docker":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work","read_only":false}]}}' \
+  -- claude
+```
+
+<Warning>
+Bind mounts share gateway-host filesystem resources with the sandbox. They may
+be considered insecure because they can negate OpenShell controls such as
+workspace isolation and filesystem policy. Use them only when you understand and
+accept that loss of isolation.
+</Warning>
+
+Use a `bind` mount only after enabling it in the Docker driver table:
+
+```toml
+[openshell.drivers.docker]
+enable_bind_mounts = true
+```
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"docker":{"mounts":[{"type":"bind","source":"/srv/openshell/work","target":"/sandbox/work","read_only":false}]}}' \
+  -- claude
+```
+
+Docker mount schema:
+
+| Type | Fields |
+|---|---|
+| `bind` | `source`, `target`, optional `read_only` (`true` by default), optional `selinux_label` (`shared` for `:z` or `private` for `:Z`). `source` must be an absolute host path. Requires `enable_bind_mounts = true`. |
+| `volume` | `source`, `target`, optional `read_only` (`true` by default), optional `subpath`. The named volume must already exist. Docker local-driver bind-backed volumes require `enable_bind_mounts = true`. |
+| `tmpfs` | `target`, optional `options`, optional `size_bytes`, optional `mode`. |
+
+OpenShell rejects mount targets that replace the workspace root, container root,
+supervisor files, `/etc/openshell`, `/etc/openshell-tls`, authentication
+material, or network namespace paths. These checks do not make host bind mounts
+safe.
+
 ## Podman Driver
 
 [Podman](https://podman.io/)-backed sandboxes run as rootless containers on the gateway host. Use Podman for Linux workstation workflows that avoid a rootful Docker daemon.
@@ -83,6 +182,61 @@ For maintainer-level implementation details, refer to the [Podman driver README]
 Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, `host_gateway_ip`, `sandbox_ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.podman]`.
 
 On macOS with `podman machine`, the driver uses gvproxy's host-loopback IP, `192.168.127.254`, for sandbox host aliases by default. Set `host_gateway_ip` only when your Podman machine uses a non-standard host-loopback address. On Linux, an empty `host_gateway_ip` keeps Podman's `host-gateway` resolver behavior.
+
+### Podman Driver Config Mounts
+
+Podman driver config accepts user-supplied `volume`, `tmpfs`, and `image`
+mounts. It also accepts `bind` mounts when `[openshell.drivers.podman]` sets
+`enable_bind_mounts = true` in `gateway.toml`. Podman local-driver named
+volumes created with bind options also expose gateway-host paths, so
+OpenShell treats them like bind mounts and requires `enable_bind_mounts = true`.
+Host bind mounts expose gateway host paths to sandbox requests, so they are
+disabled by default.
+
+Use a `volume` mount for existing Podman named volumes:
+
+```shell
+podman volume create openshell-work
+
+openshell sandbox create \
+  --driver-config-json '{"podman":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work","read_only":false}]}}' \
+  -- claude
+```
+
+<Warning>
+Bind mounts share gateway-host filesystem resources with the sandbox. They may
+be considered insecure because they can negate OpenShell controls such as
+workspace isolation and filesystem policy. Use them only when you understand and
+accept that loss of isolation.
+</Warning>
+
+Use a `bind` mount only after enabling it in the Podman driver table:
+
+```toml
+[openshell.drivers.podman]
+enable_bind_mounts = true
+```
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"podman":{"mounts":[{"type":"bind","source":"/srv/openshell/work","target":"/sandbox/work","read_only":false}]}}' \
+  -- claude
+```
+
+Podman mount schema:
+
+| Type | Fields |
+|---|---|
+| `bind` | `source`, `target`, optional `read_only` (`true` by default), optional `selinux_label` (`shared` for `:z` or `private` for `:Z`). `source` must be an absolute host path. Requires `enable_bind_mounts = true`. |
+| `volume` | `source`, `target`, optional `read_only` (`true` by default). The named volume must already exist. Podman local-driver bind-backed volumes require `enable_bind_mounts = true`. |
+| `tmpfs` | `target`, optional `options`, optional `size_bytes`, optional `mode`. |
+| `image` | `source`, `target`, optional `read_only` (`true` by default). |
+
+Podman `volume` and `image` mounts do not support `subpath` in OpenShell driver
+config. OpenShell rejects mount targets that replace the workspace root,
+container root, supervisor files, `/etc/openshell`, `/etc/openshell-tls`,
+authentication material, or network namespace paths. These checks do not make
+host bind mounts safe.
 
 ## MicroVM Driver
 
@@ -111,7 +265,7 @@ compute_drivers = ["vm"]
 
 For a launch-time override, set `OPENSHELL_DRIVERS=vm` in the gateway environment and restart the service.
 
-Configure VM driver values such as `grpc_endpoint`, `driver_dir`, `state_dir`, `default_image`, `bootstrap_image`, `vcpus`, `mem_mib`, `overlay_disk_mib`, `krun_log_level`, and `guest_tls_*` in `[openshell.drivers.vm]`. The VM `state_dir` stores overlay disks, console logs, runtime state, image-rootfs cache, and the private `run/compute-driver.sock` socket.
+Configure VM driver values such as `grpc_endpoint`, `driver_dir`, `state_dir`, `default_image`, `bootstrap_image`, `vcpus`, `mem_mib`, `overlay_disk_mib`, `krun_log_level`, and `guest_tls_*` in `[openshell.drivers.vm]`. The VM `state_dir` stores overlay disks, console logs, runtime state, image-rootfs cache, and the private `run/compute-driver.sock` socket. The VM socket path is managed by the gateway and is not configurable through remote endpoint settings.
 
 The gateway starts `openshell-driver-vm` over a private Unix socket and passes its process ID so the driver can reject unexpected local clients. The driver's standalone TCP listener is disabled unless `--allow-unauthenticated-tcp` is set for local development.
 
@@ -154,8 +308,37 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
 
-The Kubernetes driver creates namespaced `agents.x-k8s.io/v1alpha1` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
+The Kubernetes driver creates namespaced `agents.x-k8s.io` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. It detects the served Sandbox API at runtime, caches the selected API version for the gateway process, and uses `v1beta1` when available before falling back to `v1alpha1`, so supported Agent Sandbox installations work without version-specific operator configuration. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
+
+If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the controller and CRD rollout completes so the gateway can detect the served API versions again.
 
 <Note>
 `Sandbox.spec.volumeClaimTemplates` is immutable after creation. To change storage configuration, delete the sandbox and create a new one with the updated spec.
 </Note>
+
+## Sandbox User Identity
+
+OpenShell accepts both the hardcoded username `"sandbox"` and numeric UIDs in `[1000, 2_000_000_000]` for the supervisor's process identity (the policy's `run_as_user` field). The driver resolves the UID at sandbox creation time and passes it to the supervisor via environment variables.
+
+### Kubernetes / OpenShift
+
+The Kubernetes driver auto-detects the sandbox UID from OpenShift SCC namespace annotations:
+
+- `openshift.io/sa.scc.uid-range` (format: `<start>/<size>`, e.g. `1000000000/10000`) provides the UID.
+- `openshift.io/sa.scc.supplemental-groups` provides the GID when present; otherwise the resolved UID is used as the GID.
+- On non-OpenShift clusters, or when annotations are absent, the driver falls back to `1000`.
+
+You can override autodetection with explicit `sandbox_uid` / `sandbox_gid` config in `[openshell.drivers.kubernetes]`. When set, the driver skips namespace annotation lookup entirely.
+
+The resolved UID/GID appear in:
+
+- Supervisor container environment variables (`OPENSHELL_SANDBOX_UID`, `OPENSHELL_SANDBOX_GID`) for direct kernel-level privilege dropping without `/etc/passwd` lookups.
+- PVC init container `securityContext.runAsUser/runAsGroup/fsGroup` for workspace ownership operations.
+
+### VM Driver
+
+The VM driver injects the sandbox UID into the rootfs guest's `/etc/passwd`, `/etc/group`, and `/etc/gshadow` during rootfs preparation. Default UID is `10001`; configure `sandbox_uid` in `[openshell.drivers.vm]` to use a different value.
+
+### Custom Images
+
+Custom sandbox images no longer need a baked-in `"sandbox"` user. If your image requires a passwd entry for tools like `sudo` or `ssh`, add one manually (e.g. `RUN useradd -m -u 1500 deploy`). The supervisor resolves the numeric UID directly via `setuid()` without needing `/etc/passwd`.
