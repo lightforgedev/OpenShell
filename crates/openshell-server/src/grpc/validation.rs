@@ -56,6 +56,7 @@ pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(
         }
         reject_control_chars(value, &format!("environment value for '{key}'"))?;
     }
+    validate_exec_env_entries(&req.environment, "environment")?;
     if !req.workdir.is_empty() {
         if req.workdir.len() > MAX_EXEC_WORKDIR_LEN {
             return Err(Status::invalid_argument(format!(
@@ -125,11 +126,16 @@ pub(super) fn validate_sandbox_spec(
         MAX_MAP_VALUE_LEN,
         "spec.environment",
     )?;
+    validate_env_entries(&spec.environment, "spec.environment")?;
 
     // --- spec.template ---
     if let Some(ref tmpl) = spec.template {
         validate_sandbox_template(tmpl)?;
+        validate_env_entries(&tmpl.environment, "spec.template.environment")?;
     }
+
+    // --- spec.resource_requirements.gpu ---
+    validate_gpu_request_fields(spec)?;
 
     // --- spec.policy serialized size ---
     if let Some(ref policy) = spec.policy {
@@ -139,6 +145,14 @@ pub(super) fn validate_sandbox_spec(
                 "policy serialized size exceeds maximum ({size} > {MAX_POLICY_SIZE})"
             )));
         }
+    }
+
+    Ok(())
+}
+
+fn validate_gpu_request_fields(spec: &openshell_core::proto::SandboxSpec) -> Result<(), Status> {
+    if openshell_core::gpu::sandbox_gpu_count(spec.resource_requirements.as_ref()) == Some(0) {
+        return Err(Status::invalid_argument("gpu count must be greater than 0"));
     }
 
     Ok(())
@@ -192,14 +206,6 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
             )));
         }
     }
-    if let Some(ref s) = tmpl.volume_claim_templates {
-        let size = s.encoded_len();
-        if size > MAX_TEMPLATE_STRUCT_SIZE {
-            return Err(Status::invalid_argument(format!(
-                "template.volume_claim_templates serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
-            )));
-        }
-    }
     if let Some(ref s) = tmpl.driver_config {
         let size = s.encoded_len();
         if size > MAX_TEMPLATE_STRUCT_SIZE {
@@ -239,6 +245,57 @@ pub(super) fn validate_string_map(
                 value.len()
             )));
         }
+    }
+    Ok(())
+}
+
+/// OPENSHELL_* keys that are allowed in exec environment. The Python SDK's
+/// `exec_python()` sends a serialized callable via this key.
+const EXEC_ALLOWED_OPENSHELL_KEYS: &[&str] = &["OPENSHELL_PYFUNC_B64"];
+
+/// Maximum total serialized size of user environment (bytes). The drivers
+/// serialize the full map as JSON into a single `OPENSHELL_USER_ENVIRONMENT`
+/// env var; capping the input prevents driver/runtime-specific startup
+/// failures from oversized env blocks.
+const MAX_ENV_SERIALIZED_SIZE: usize = 256 * 1024; // 256 KiB
+
+fn validate_env_entries(
+    map: &std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<(), Status> {
+    let total_size: usize = map.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if total_size > MAX_ENV_SERIALIZED_SIZE {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} total size exceeds {MAX_ENV_SERIALIZED_SIZE} byte limit ({total_size} bytes)"
+        )));
+    }
+    validate_env_entries_inner(map, field_name, &[])
+}
+
+fn validate_exec_env_entries(
+    map: &std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<(), Status> {
+    validate_env_entries_inner(map, field_name, EXEC_ALLOWED_OPENSHELL_KEYS)
+}
+
+fn validate_env_entries_inner(
+    map: &std::collections::HashMap<String, String>,
+    field_name: &str,
+    allowed_openshell_keys: &[&str],
+) -> Result<(), Status> {
+    for (key, value) in map {
+        if !super::provider::is_valid_env_key(key) {
+            return Err(Status::invalid_argument(format!(
+                "{field_name} keys must match ^[A-Za-z_][A-Za-z0-9_]*$; got '{key}'"
+            )));
+        }
+        if key.starts_with("OPENSHELL_") && !allowed_openshell_keys.contains(&key.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "{field_name} keys starting with OPENSHELL_ are reserved; got '{key}'"
+            )));
+        }
+        reject_control_chars(value, &format!("{field_name} value for '{key}'"))?;
     }
     Ok(())
 }
@@ -573,6 +630,22 @@ pub(super) fn validate_policy_safety(policy: &ProtoSandboxPolicy) -> Result<(), 
     Ok(())
 }
 
+/// Validate that user-authored policy does not use provider-derived rule keys.
+pub(super) fn validate_no_reserved_provider_policy_keys(
+    policy: &ProtoSandboxPolicy,
+) -> Result<(), Status> {
+    if let Some(key) = policy
+        .network_policies
+        .keys()
+        .find(|key| openshell_policy::is_provider_rule_name(key))
+    {
+        return Err(Status::invalid_argument(format!(
+            "network_policies key '{key}' uses reserved '_provider_' prefix for provider composition; use 'openshell policy get <sandbox> --base' for a round-trippable base policy, or use 'openshell policy get <sandbox> --full' to inspect the effective policy including provider entries"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate that static policy fields (filesystem, landlock, process) haven't changed
 /// from the baseline (version 1) policy.
 pub(super) fn validate_static_fields_unchanged(
@@ -706,10 +779,36 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_accepts_gpu_flag() {
         let spec = SandboxSpec {
-            gpu: true,
+            resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
+            }),
             ..Default::default()
         };
         assert!(validate_sandbox_spec("gpu-sandbox", &spec).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_accepts_gpu_count() {
+        let spec = SandboxSpec {
+            resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                gpu: Some(openshell_core::proto::GpuResourceRequirements { count: Some(2) }),
+            }),
+            ..Default::default()
+        };
+        assert!(validate_sandbox_spec("gpu-sandbox", &spec).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_zero_gpu_count() {
+        let spec = SandboxSpec {
+            resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                gpu: Some(openshell_core::proto::GpuResourceRequirements { count: Some(0) }),
+            }),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("gpu-sandbox", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("gpu count must be greater than 0"));
     }
 
     #[test]
@@ -892,6 +991,133 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_sandbox_spec("my-sandbox", &spec).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_reserved_env_key() {
+        let spec = SandboxSpec {
+            environment: std::iter::once(("OPENSHELL_SECRET".to_string(), "val".to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("s", &spec).unwrap_err();
+        assert!(
+            err.message().contains("OPENSHELL_") && err.message().contains("reserved"),
+            "expected reserved key error, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_reserved_template_env_key() {
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                environment: std::iter::once((
+                    "OPENSHELL_ENDPOINT".to_string(),
+                    "evil".to_string(),
+                ))
+                .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("s", &spec).unwrap_err();
+        assert!(
+            err.message().contains("OPENSHELL_") && err.message().contains("reserved"),
+            "expected reserved key error, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn validate_exec_request_rejects_reserved_env_key() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "id".to_string(),
+            command: vec!["echo".to_string()],
+            environment: std::iter::once(("OPENSHELL_SANDBOX_ID".to_string(), "evil".to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        let err = validate_exec_request_fields(&req).unwrap_err();
+        assert!(
+            err.message().contains("OPENSHELL_") && err.message().contains("reserved"),
+            "expected reserved key error, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn validate_exec_request_allows_pyfunc_helper_key() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "id".to_string(),
+            command: vec!["python".to_string()],
+            environment: std::iter::once(("OPENSHELL_PYFUNC_B64".to_string(), "data".to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        assert!(validate_exec_request_fields(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_template_env_value_with_control_chars() {
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                environment: std::iter::once(("KEY".to_string(), "val\nue".to_string())).collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("s", &spec).unwrap_err();
+        assert!(
+            err.message().contains("newline"),
+            "expected control char error, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_invalid_env_key_name() {
+        let spec = SandboxSpec {
+            environment: std::iter::once(("1BAD".to_string(), "val".to_string())).collect(),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("s", &spec).unwrap_err();
+        assert!(
+            err.message().contains("1BAD"),
+            "expected invalid key error, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_env_value_with_control_chars() {
+        let spec = SandboxSpec {
+            environment: std::iter::once(("KEY".to_string(), "val\nue".to_string())).collect(),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("s", &spec).unwrap_err();
+        assert!(
+            err.message().contains("newline"),
+            "expected control char error, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_invalid_template_env_key_name() {
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                environment: std::iter::once(("BAD-NAME".to_string(), "val".to_string())).collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("s", &spec).unwrap_err();
+        assert!(
+            err.message().contains("BAD-NAME"),
+            "expected invalid key error, got: {}",
+            err.message()
+        );
     }
 
     // ---- Provider field validation ----
@@ -1385,6 +1611,43 @@ mod tests {
         let err = validate_policy_safety(&policy).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("TLD wildcard"));
+    }
+
+    #[test]
+    fn validate_no_reserved_provider_policy_keys_rejects_reserved_key() {
+        use openshell_core::proto::NetworkPolicyRule;
+
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "_provider_work_github".into(),
+            NetworkPolicyRule {
+                name: "_provider_work_github".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = validate_no_reserved_provider_policy_keys(&policy).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("_provider_work_github"));
+        assert!(err.message().contains("reserved '_provider_' prefix"));
+        assert!(err.message().contains("policy get <sandbox> --base"));
+        assert!(err.message().contains("round-trippable base policy"));
+    }
+
+    #[test]
+    fn validate_no_reserved_provider_policy_keys_accepts_user_key() {
+        use openshell_core::proto::NetworkPolicyRule;
+
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "provider_work_github".into(),
+            NetworkPolicyRule {
+                name: "provider_work_github".into(),
+                ..Default::default()
+            },
+        );
+
+        assert!(validate_no_reserved_provider_policy_keys(&policy).is_ok());
     }
 
     // ---- Static field validation ----

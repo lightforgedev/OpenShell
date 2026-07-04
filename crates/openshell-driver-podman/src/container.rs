@@ -4,11 +4,17 @@
 //! Container spec construction for the Podman driver.
 
 use crate::config::PodmanComputeConfig;
-use openshell_core::gpu::cdi_gpu_device_ids;
-use openshell_core::proto::compute::v1::DriverSandbox;
+use openshell_core::ComputeDriverError;
+use openshell_core::driver_mounts::SelinuxLabel;
+#[cfg(test)]
+use openshell_core::gpu::{driver_gpu_requirements, validate_specific_gpu_device_request};
+use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxTemplate};
+use openshell_core::proto_struct::deserialize_optional_non_empty_string_list;
+use openshell_core::{driver_mounts, proto_struct};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
 
 /// Returns `true` when `SELinux` is enabled (enforcing or permissive).
 ///
@@ -21,7 +27,7 @@ use std::collections::BTreeMap;
 /// exist and this returns `false`, leaving mount options unchanged.
 #[cfg(target_os = "linux")]
 fn is_selinux_enabled() -> bool {
-    std::path::Path::new("/sys/fs/selinux").is_dir()
+    Path::new("/sys/fs/selinux").is_dir()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -46,11 +52,93 @@ const CONTAINER_PREFIX: &str = "openshell-sandbox-";
 /// Volume name prefix.
 const VOLUME_PREFIX: &str = "openshell-sandbox-";
 
-/// Container-side mount paths for client TLS materials.
-const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
-const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
-const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
-const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
+/// Container-side mount paths for client TLS materials and the sandbox token.
+const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
+const TLS_CERT_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CERT_MOUNT_PATH;
+const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PATH;
+const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
+
+/// Directory inside sandbox containers where the supervisor binary is mounted.
+const SUPERVISOR_MOUNT_DIR: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_DIR;
+/// Full path to the supervisor binary inside sandbox containers.
+const SUPERVISOR_BINARY_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PodmanSandboxDriverConfig {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_empty_string_list"
+    )]
+    pub cdi_devices: Option<Vec<String>>,
+    mounts: Vec<PodmanDriverMountConfig>,
+}
+
+impl PodmanSandboxDriverConfig {
+    pub fn from_sandbox(sandbox: &DriverSandbox) -> Result<Self, ComputeDriverError> {
+        let Some(template) = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+        else {
+            return Ok(Self::default());
+        };
+
+        Self::from_template(template)
+    }
+
+    pub fn from_template(template: &DriverSandboxTemplate) -> Result<Self, ComputeDriverError> {
+        let Some(config) = template.driver_config.as_ref() else {
+            return Ok(Self::default());
+        };
+
+        serde_json::from_value(proto_struct::struct_to_json_value(config)).map_err(|err| {
+            ComputeDriverError::InvalidArgument(format!("invalid podman driver_config: {err}"))
+        })
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum PodmanDriverMountConfig {
+    Bind {
+        source: String,
+        target: String,
+        #[serde(default = "default_true")]
+        read_only: bool,
+        #[serde(default)]
+        selinux_label: Option<SelinuxLabel>,
+    },
+    Volume {
+        source: String,
+        target: String,
+        #[serde(default = "default_true")]
+        read_only: bool,
+        #[serde(default)]
+        subpath: Option<String>,
+    },
+    Tmpfs {
+        target: String,
+        #[serde(default)]
+        options: Vec<String>,
+        #[serde(default)]
+        size_bytes: Option<f64>,
+        #[serde(default)]
+        mode: Option<f64>,
+    },
+    Image {
+        source: String,
+        target: String,
+        #[serde(default = "default_true")]
+        read_only: bool,
+        #[serde(default)]
+        subpath: Option<String>,
+    },
+}
+
+fn default_true() -> bool {
+    true
+}
 
 /// Build a Podman container name from the sandbox name.
 #[must_use]
@@ -166,6 +254,13 @@ struct NamedVolume {
     options: Vec<String>,
 }
 
+#[derive(Default)]
+struct PodmanUserMounts {
+    volumes: Vec<NamedVolume>,
+    image_volumes: Vec<ImageVolume>,
+    mounts: Vec<Mount>,
+}
+
 #[derive(Serialize)]
 struct HealthConfig {
     test: Vec<String>,
@@ -244,6 +339,13 @@ fn build_env(
     let mut env: BTreeMap<String, String> = BTreeMap::new();
 
     // 1. User-supplied environment (lowest priority).
+    // Template vars first, then spec overwrites (spec is user-specified).
+    let mut user_env: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(t) = template {
+        for (k, v) in &t.environment {
+            user_env.insert(k.clone(), v.clone());
+        }
+    }
     if let Some(s) = spec {
         if !s.log_level.is_empty() {
             env.insert(
@@ -252,13 +354,14 @@ fn build_env(
             );
         }
         for (k, v) in &s.environment {
-            env.insert(k.clone(), v.clone());
+            user_env.insert(k.clone(), v.clone());
         }
     }
-    if let Some(t) = template {
-        for (k, v) in &t.environment {
-            env.insert(k.clone(), v.clone());
-        }
+    env.extend(user_env.clone());
+    if !user_env.is_empty()
+        && let Ok(json) = serde_json::to_string(&user_env)
+    {
+        env.insert(openshell_core::sandbox_env::USER_ENVIRONMENT.into(), json);
     }
 
     // 2. Required driver vars (highest priority -- always overwrite).
@@ -377,30 +480,336 @@ fn podman_pids_limit(value: i64) -> Option<i64> {
     if value > 0 { Some(value) } else { None }
 }
 
-/// Build CDI GPU device list if GPU is requested.
-fn build_devices(sandbox: &DriverSandbox) -> Option<Vec<LinuxDevice>> {
-    let spec = sandbox.spec.as_ref()?;
-    cdi_gpu_device_ids(spec.gpu, &spec.gpu_device).map(|device_ids| {
-        device_ids
-            .into_iter()
-            .map(|path| LinuxDevice { path })
-            .collect()
-    })
+pub fn podman_driver_volume_mount_sources(
+    sandbox: &DriverSandbox,
+    enable_bind_mounts: bool,
+) -> Result<Vec<String>, String> {
+    let template = sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref());
+    let Some(template) = template else {
+        return Ok(Vec::new());
+    };
+    let config = podman_driver_config(template, enable_bind_mounts)?;
+    Ok(config
+        .mounts
+        .into_iter()
+        .filter_map(|mount| match mount {
+            PodmanDriverMountConfig::Volume { source, .. } => Some(source),
+            _ => None,
+        })
+        .collect())
+}
+
+pub fn podman_driver_image_mount_sources(
+    sandbox: &DriverSandbox,
+    enable_bind_mounts: bool,
+) -> Result<Vec<String>, String> {
+    let template = sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref());
+    let Some(template) = template else {
+        return Ok(Vec::new());
+    };
+    let config = podman_driver_config(template, enable_bind_mounts)?;
+    Ok(config
+        .mounts
+        .into_iter()
+        .filter_map(|mount| match mount {
+            PodmanDriverMountConfig::Image { source, .. } => Some(source),
+            _ => None,
+        })
+        .collect())
+}
+
+fn podman_user_mounts(
+    sandbox: &DriverSandbox,
+    enable_bind_mounts: bool,
+) -> Result<PodmanUserMounts, String> {
+    let template = sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref());
+    let Some(template) = template else {
+        return Ok(PodmanUserMounts::default());
+    };
+    let config = podman_driver_config(template, enable_bind_mounts)?;
+    let mut result = PodmanUserMounts::default();
+    for mount in config.mounts {
+        match mount {
+            PodmanDriverMountConfig::Bind {
+                source,
+                target,
+                read_only,
+                selinux_label,
+            } => {
+                let mut options = vec![
+                    if read_only { "ro" } else { "rw" }.to_string(),
+                    "rbind".to_string(),
+                ];
+                match selinux_label {
+                    Some(SelinuxLabel::Shared) => options.push("z".to_string()),
+                    Some(SelinuxLabel::Private) => options.push("Z".to_string()),
+                    None => {}
+                }
+                driver_mounts::validate_absolute_mount_source(&source, "bind source")?;
+                driver_mounts::validate_container_mount_target(&target)?;
+                result.mounts.push(Mount {
+                    kind: "bind".into(),
+                    source,
+                    destination: driver_mounts::normalize_mount_target(&target),
+                    options,
+                });
+            }
+            PodmanDriverMountConfig::Volume {
+                source,
+                target,
+                read_only,
+                subpath,
+            } => {
+                reject_subpath(subpath.as_deref(), "podman volume mounts")?;
+                driver_mounts::validate_mount_source(&source, "volume source")?;
+                driver_mounts::validate_container_mount_target(&target)?;
+                result.volumes.push(NamedVolume {
+                    name: source,
+                    dest: target,
+                    options: vec![if read_only { "ro" } else { "rw" }.to_string()],
+                });
+            }
+            PodmanDriverMountConfig::Tmpfs {
+                target,
+                options,
+                size_bytes,
+                mode,
+            } => {
+                let mut options = validate_tmpfs_options(&options)?;
+                if options.is_empty() {
+                    options.push("rw".to_string());
+                }
+                if let Some(size_bytes) =
+                    validate_optional_positive_integral_i64(size_bytes, "tmpfs size_bytes")?
+                {
+                    options.push(format!("size={size_bytes}"));
+                }
+                if let Some(mode) = validate_optional_nonnegative_integral_i64(mode, "tmpfs mode")?
+                {
+                    options.push(format!("mode={mode:o}"));
+                }
+                driver_mounts::validate_container_mount_target(&target)?;
+                result.mounts.push(Mount {
+                    kind: "tmpfs".into(),
+                    source: "tmpfs".into(),
+                    destination: target,
+                    options,
+                });
+            }
+            PodmanDriverMountConfig::Image {
+                source,
+                target,
+                read_only,
+                subpath,
+            } => {
+                reject_subpath(subpath.as_deref(), "podman image mounts")?;
+                driver_mounts::validate_mount_source(&source, "image source")?;
+                driver_mounts::validate_container_mount_target(&target)?;
+                result.image_volumes.push(ImageVolume {
+                    source,
+                    destination: target,
+                    rw: !read_only,
+                });
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn podman_driver_config(
+    template: &DriverSandboxTemplate,
+    enable_bind_mounts: bool,
+) -> Result<PodmanSandboxDriverConfig, String> {
+    let Some(config) = template.driver_config.as_ref() else {
+        return Ok(PodmanSandboxDriverConfig::default());
+    };
+    let json = Value::Object(proto_struct::struct_to_json_object(config));
+    let config: PodmanSandboxDriverConfig = serde_json::from_value(json)
+        .map_err(|err| format!("invalid podman driver_config: {err}"))?;
+    validate_podman_driver_mounts(&config.mounts, enable_bind_mounts)?;
+    Ok(config)
+}
+
+fn validate_podman_driver_mounts(
+    mounts: &[PodmanDriverMountConfig],
+    enable_bind_mounts: bool,
+) -> Result<(), String> {
+    let mut targets = HashSet::new();
+    for mount in mounts {
+        let target = match mount {
+            PodmanDriverMountConfig::Bind { source, target, .. } => {
+                if !enable_bind_mounts {
+                    return Err(
+                        "podman bind mounts require enable_bind_mounts = true in [openshell.drivers.podman]"
+                            .to_string(),
+                    );
+                }
+                driver_mounts::validate_absolute_mount_source(source, "bind source")?;
+                target
+            }
+            PodmanDriverMountConfig::Volume {
+                source,
+                target,
+                subpath,
+                ..
+            } => {
+                driver_mounts::validate_mount_source(source, "volume source")?;
+                reject_subpath(subpath.as_deref(), "podman volume mounts")?;
+                target
+            }
+            PodmanDriverMountConfig::Tmpfs {
+                target,
+                options,
+                size_bytes,
+                mode,
+            } => {
+                validate_tmpfs_options(options)?;
+                validate_optional_positive_integral_i64(*size_bytes, "tmpfs size_bytes")?;
+                validate_optional_nonnegative_integral_i64(*mode, "tmpfs mode")?;
+                target
+            }
+            PodmanDriverMountConfig::Image {
+                source,
+                target,
+                subpath,
+                ..
+            } => {
+                driver_mounts::validate_mount_source(source, "image source")?;
+                reject_subpath(subpath.as_deref(), "podman image mounts")?;
+                target
+            }
+        };
+        driver_mounts::validate_container_mount_target(target)?;
+        let normalized_target = driver_mounts::normalize_mount_target(target);
+        if !targets.insert(normalized_target.clone()) {
+            return Err(format!(
+                "duplicate podman driver_config mount target '{normalized_target}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_subpath(subpath: Option<&str>, mount_type: &str) -> Result<(), String> {
+    let Some(subpath) = subpath else {
+        return Ok(());
+    };
+    driver_mounts::validate_mount_subpath(subpath)?;
+    Err(format!("{mount_type} do not support subpath"))
+}
+
+fn validate_optional_positive_integral_i64(
+    value: Option<f64>,
+    field: &str,
+) -> Result<Option<i64>, String> {
+    let Some(value) = validate_optional_integral_i64(value, field)? else {
+        return Ok(None);
+    };
+    if value <= 0 {
+        return Err(format!("{field} must be positive"));
+    }
+    Ok(Some(value))
+}
+
+fn validate_optional_nonnegative_integral_i64(
+    value: Option<f64>,
+    field: &str,
+) -> Result<Option<i64>, String> {
+    let Some(value) = validate_optional_integral_i64(value, field)? else {
+        return Ok(None);
+    };
+    if value < 0 {
+        return Err(format!("{field} must be zero or greater"));
+    }
+    Ok(Some(value))
+}
+
+fn validate_optional_integral_i64(value: Option<f64>, field: &str) -> Result<Option<i64>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if !value.is_finite() || value.fract() != 0.0 {
+        return Err(format!("{field} must be an integer"));
+    }
+    value
+        .to_string()
+        .parse::<i64>()
+        .map(Some)
+        .map_err(|_| format!("{field} must be representable as an i64"))
+}
+
+fn validate_tmpfs_options(options: &[String]) -> Result<Vec<String>, String> {
+    options
+        .iter()
+        .map(|option| {
+            let option = option.trim();
+            if option.is_empty() {
+                return Err("tmpfs options must not contain empty values".to_string());
+            }
+            Ok(option.to_string())
+        })
+        .collect()
 }
 
 /// Build the Podman container creation JSON spec.
 #[cfg(test)]
 #[must_use]
 pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfig) -> Value {
-    build_container_spec_with_token(sandbox, config, None)
+    try_build_container_spec_with_token(sandbox, config, None)
+        .expect("container spec should be valid")
 }
 
+#[cfg(test)]
 #[must_use]
 pub fn build_container_spec_with_token(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
-    token_host_path: Option<&std::path::Path>,
+    token_host_path: Option<&Path>,
 ) -> Value {
+    try_build_container_spec_with_token(sandbox, config, token_host_path)
+        .expect("container spec should be valid")
+}
+
+#[cfg(test)]
+pub fn try_build_container_spec_with_token(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+    token_host_path: Option<&Path>,
+) -> Result<Value, ComputeDriverError> {
+    let driver_config = PodmanSandboxDriverConfig::from_sandbox(sandbox)?;
+    let gpu_requirements = sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| driver_gpu_requirements(spec.resource_requirements.as_ref()));
+    let cdi_devices = if let Some(cdi_devices) = driver_config.cdi_devices.as_ref() {
+        validate_specific_gpu_device_request(
+            gpu_requirements,
+            cdi_devices,
+            "driver_config.cdi_devices",
+        )
+        .map_err(ComputeDriverError::InvalidArgument)?;
+        Some(cdi_devices.as_slice())
+    } else {
+        None
+    };
+    build_container_spec_with_token_and_gpu_devices(sandbox, config, token_host_path, cdi_devices)
+}
+
+pub fn build_container_spec_with_token_and_gpu_devices(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+    token_host_path: Option<&Path>,
+    gpu_device_ids: Option<&[String]>,
+) -> Result<Value, ComputeDriverError> {
     let image = resolve_image(sandbox, config);
     let name = container_name(&sandbox.name);
     let vol = volume_name(&sandbox.id);
@@ -408,7 +817,15 @@ pub fn build_container_spec_with_token(
     let env = build_env(sandbox, config, image);
     let labels = build_labels(sandbox);
     let resource_limits = build_resource_limits(sandbox, config);
-    let devices = build_devices(sandbox);
+    let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
+        .map_err(ComputeDriverError::InvalidArgument)?;
+    let devices = gpu_device_ids.map(|device_ids| {
+        device_ids
+            .iter()
+            .cloned()
+            .map(|path| LinuxDevice { path })
+            .collect()
+    });
 
     // Network configuration -- always bridge mode.
     // Matches libpod's network spec format `{name: {opts}}`; the unit-struct
@@ -417,35 +834,41 @@ pub fn build_container_spec_with_token(
     let mut networks = BTreeMap::new();
     networks.insert(config.network_name.clone(), NetworkAttachment {});
 
+    let mut volumes = vec![NamedVolume {
+        name: vol,
+        dest: "/sandbox".into(),
+        options: vec!["rw".into()],
+    }];
+    volumes.extend(user_mounts.volumes);
+
+    let mut image_volumes = vec![ImageVolume {
+        source: config.supervisor_image.clone(),
+        destination: SUPERVISOR_MOUNT_DIR.into(),
+        rw: false,
+    }];
+    image_volumes.extend(user_mounts.image_volumes);
+
     let container_spec = ContainerSpec {
         name,
         image: image.to_string(),
         labels,
         env,
-        volumes: vec![NamedVolume {
-            name: vol,
-            dest: "/sandbox".into(),
-            options: vec!["rw".into()],
-        }],
+        volumes,
         // Side-load the supervisor binary from a standalone OCI image.
         // Podman resolves image_volumes at the libpod layer, mounting the
         // image's filesystem at the destination path without starting a
         // container from it. The supervisor image is FROM scratch with just
         // the binary at /openshell-sandbox, so it appears at
         // /opt/openshell/bin/openshell-sandbox.
-        image_volumes: vec![ImageVolume {
-            source: config.supervisor_image.clone(),
-            destination: "/opt/openshell/bin".into(),
-            rw: false,
-        }],
+        image_volumes,
         hostname: format!("sandbox-{}", sandbox.name),
         // Override the image's ENTRYPOINT so the supervisor binary runs
         // directly. Sandbox images (e.g. the community base image) set
         // ENTRYPOINT ["/bin/bash"], and Podman's `command` field only
         // overrides CMD — which gets appended as args to the entrypoint.
-        // Without this, the container would run `/bin/bash /opt/openshell/bin/openshell-sandbox`
-        // and bash would fail trying to interpret the binary as a script.
-        entrypoint: vec!["/opt/openshell/bin/openshell-sandbox".into()],
+        // Without this, the container would run the entrypoint binary with
+        // the supervisor path as an argument instead of executing it directly.
+        entrypoint: vec![SUPERVISOR_BINARY_PATH.into()],
         command: vec![],
         // Force the supervisor to run as root (UID 0). Sandbox images may
         // set a non-root USER directive (e.g. `USER sandbox`), but the
@@ -472,8 +895,6 @@ pub fn build_container_spec_with_token(
             "NET_RAW".into(),
             // Not needed: the supervisor does not manipulate file capabilities.
             "SETFCAP".into(),
-            // Not needed: the supervisor does not manage its own capability bounding set.
-            "SETPCAP".into(),
             // Not needed: the supervisor does not call chroot().
             "SYS_CHROOT".into(),
         ],
@@ -494,13 +915,18 @@ pub fn build_container_spec_with_token(
             // Without it the proxy cannot determine which binary made each outbound
             // connection and all traffic is denied.
             "DAC_READ_SEARCH".into(),
+            // Child setup clears the capability bounding set before exec, which
+            // requires CAP_SETPCAP in the supervisor until drop_privileges().
+            "SETPCAP".into(),
         ],
-        // SETUID, SETGID, CHOWN, and FOWNER are intentionally kept from Podman's
-        // default set and not dropped:
+        // SETUID, SETGID, SETPCAP, CHOWN, and FOWNER are intentionally kept from
+        // Podman's default set and not dropped:
         //   SETUID/SETGID – drop_privileges(): setuid()/setgid()/initgroups() to the
         //                   sandbox user. In rootless Podman cap_drop:ALL removes them
         //                   from the bounding set even though uid=0 owns the user
         //                   namespace — so we keep them by not dropping them explicitly.
+        //   SETPCAP       – drop_privileges(): clears the child capability
+        //                   bounding set before the sandbox user execs.
         //   CHOWN         – prepare_filesystem(): chown(path, uid, gid) on newly
         //                   created read_write directories so the sandbox user can
         //                   write to them.
@@ -530,7 +956,7 @@ pub fn build_container_spec_with_token(
                     openshell_core::config::DEFAULT_SSH_PORT
                 ),
             ],
-            interval: 3_000_000_000,
+            interval: config.health_check_interval_secs * 1_000_000_000,
             timeout: 2_000_000_000,
             retries: 10,
             start_period: 5_000_000_000,
@@ -608,6 +1034,7 @@ pub fn build_container_spec_with_token(
                     options: ro,
                 });
             }
+            m.extend(user_mounts.mounts);
             m
         },
         // Publish the SSH port with host_port=0 to get an ephemeral host port.
@@ -620,7 +1047,7 @@ pub fn build_container_spec_with_token(
         }],
     };
 
-    serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail")
+    Ok(serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail"))
 }
 
 fn hostadd_entries(config: &PodmanComputeConfig) -> Vec<String> {
@@ -695,9 +1122,53 @@ fn parse_memory_to_bytes(quantity: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::proto::compute::v1::{GpuResourceRequirements, ResourceRequirements};
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    fn json_struct(value: Value) -> prost_types::Struct {
+        match json_value(value).kind {
+            Some(prost_types::value::Kind::StructValue(value)) => value,
+            _ => panic!("expected JSON object"),
+        }
+    }
+
+    fn json_value(value: Value) -> prost_types::Value {
+        match value {
+            Value::Null => prost_types::Value { kind: None },
+            Value::Bool(value) => prost_types::Value {
+                kind: Some(prost_types::value::Kind::BoolValue(value)),
+            },
+            Value::Number(value) => prost_types::Value {
+                kind: value.as_f64().map(prost_types::value::Kind::NumberValue),
+            },
+            Value::String(value) => prost_types::Value {
+                kind: Some(prost_types::value::Kind::StringValue(value)),
+            },
+            Value::Array(values) => prost_types::Value {
+                kind: Some(prost_types::value::Kind::ListValue(
+                    prost_types::ListValue {
+                        values: values.into_iter().map(json_value).collect(),
+                    },
+                )),
+            },
+            Value::Object(values) => prost_types::Value {
+                kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
+                    fields: values
+                        .into_iter()
+                        .map(|(key, value)| (key, json_value(value)))
+                        .collect(),
+                })),
+            },
+        }
+    }
+
+    fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
+        ResourceRequirements {
+            gpu: Some(GpuResourceRequirements { count }),
+        }
+    }
 
     #[test]
     fn parse_cpu_millicore() {
@@ -806,32 +1277,58 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_maps_empty_gpu_request_to_all_cdi_device() {
-        use openshell_core::config::CDI_GPU_DEVICE_ALL;
+    fn container_spec_maps_empty_gpu_request_to_selected_default_cdi_device() {
         use openshell_core::proto::compute::v1::DriverSandboxSpec;
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            gpu: true,
+            resource_requirements: Some(gpu_resources(None)),
             ..Default::default()
         });
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let gpu_devices = vec!["nvidia.com/gpu=1".to_string()];
+        let spec = build_container_spec_with_token_and_gpu_devices(
+            &sandbox,
+            &config,
+            None,
+            Some(&gpu_devices),
+        )
+        .unwrap();
 
         assert_eq!(
             spec["devices"][0]["path"].as_str(),
-            Some(CDI_GPU_DEVICE_ALL)
+            Some("nvidia.com/gpu=1")
         );
     }
 
     #[test]
-    fn container_spec_passes_explicit_cdi_device_id_through() {
+    fn container_spec_omits_devices_without_resolved_default_cdi_devices() {
         use openshell_core::proto::compute::v1::DriverSandboxSpec;
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            gpu: true,
-            gpu_device: "nvidia.com/gpu=0".to_string(),
+            resource_requirements: Some(gpu_resources(None)),
+            ..Default::default()
+        });
+        let config = test_config();
+
+        let spec =
+            build_container_spec_with_token_and_gpu_devices(&sandbox, &config, None, None).unwrap();
+
+        assert!(spec.get("devices").is_none());
+    }
+
+    #[test]
+    fn container_spec_passes_explicit_cdi_device_id_through() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            resource_requirements: Some(gpu_resources(None)),
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(cdi_devices_config(&["nvidia.com/gpu=0"])),
+                ..Default::default()
+            }),
             ..Default::default()
         });
         let config = test_config();
@@ -841,6 +1338,118 @@ mod tests {
             spec["devices"][0]["path"].as_str(),
             Some("nvidia.com/gpu=0")
         );
+    }
+
+    #[test]
+    fn container_spec_accepts_gpu_count_matching_cdi_devices() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            resource_requirements: Some(gpu_resources(Some(2))),
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(cdi_devices_config(&[
+                    "nvidia.com/gpu=0",
+                    "nvidia.com/gpu=1",
+                ])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        assert_eq!(spec["devices"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            spec["devices"][0]["path"].as_str(),
+            Some("nvidia.com/gpu=0")
+        );
+        assert_eq!(
+            spec["devices"][1]["path"].as_str(),
+            Some("nvidia.com/gpu=1")
+        );
+    }
+
+    #[test]
+    fn container_spec_rejects_gpu_count_mismatched_cdi_devices() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            resource_requirements: Some(gpu_resources(Some(2))),
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(cdi_devices_config(&["nvidia.com/gpu=0"])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+
+        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+        assert!(matches!(err, ComputeDriverError::InvalidArgument(_)));
+        assert!(
+            err.to_string()
+                .contains("gpu count (2) must match driver_config.cdi_devices length (1)")
+        );
+    }
+
+    #[test]
+    fn container_spec_rejects_cdi_devices_without_gpu_request() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(cdi_devices_config(&["nvidia.com/gpu=0"])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+
+        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+        assert!(matches!(err, ComputeDriverError::InvalidArgument(_)));
+        assert!(err.to_string().contains("requires a gpu request"));
+    }
+
+    #[test]
+    fn container_spec_rejects_empty_cdi_devices() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            resource_requirements: Some(gpu_resources(None)),
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(cdi_devices_config(&[])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+
+        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+        assert!(matches!(err, ComputeDriverError::InvalidArgument(_)));
+        assert!(err.to_string().contains("non-empty list"));
+    }
+
+    #[test]
+    fn container_spec_rejects_unknown_driver_config_fields() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            resource_requirements: Some(gpu_resources(None)),
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(cdi_device_typo_config(&["nvidia.com/gpu=0"])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+
+        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+        assert!(matches!(err, ComputeDriverError::InvalidArgument(_)));
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]
@@ -863,12 +1472,14 @@ mod tests {
             added.contains(&"DAC_READ_SEARCH"),
             "missing DAC_READ_SEARCH"
         );
+        assert!(added.contains(&"SETPCAP"), "missing SETPCAP");
 
         // SETUID and SETGID are NOT in cap_add — they remain available from the
         // default bounding set because we no longer use cap_drop:ALL. Verify they
-        // are also not explicitly dropped. Similarly CHOWN and FOWNER must not be
-        // dropped because prepare_filesystem() calls chown() on newly created
-        // read_write directories before the supervisor drops privileges.
+        // are also not explicitly dropped. Similarly SETPCAP, CHOWN and FOWNER
+        // must not be dropped because child setup clears the bounding set and
+        // prepare_filesystem() calls chown() on newly created read_write
+        // directories before the supervisor drops privileges.
         let dropped: Vec<&str> = spec["cap_drop"]
             .as_array()
             .expect("cap_drop should be an array")
@@ -884,6 +1495,10 @@ mod tests {
         assert!(
             !dropped.contains(&"FOWNER"),
             "FOWNER must not be dropped (needed for chown on non-owned files)"
+        );
+        assert!(
+            !dropped.contains(&"SETPCAP"),
+            "SETPCAP must not be dropped (needed for child bounding-set clear)"
         );
         assert!(
             !dropped.contains(&"ALL"),
@@ -938,6 +1553,19 @@ mod tests {
             command.contains("test -S /run/openshell/test-ssh.sock"),
             "healthcheck should consider the supervisor Unix socket ready"
         );
+    }
+
+    #[test]
+    fn container_spec_healthcheck_interval_from_config() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let mut config = test_config();
+        config.health_check_interval_secs = 30;
+        let spec = build_container_spec(&sandbox, &config);
+
+        let interval = spec["healthconfig"]["Interval"]
+            .as_u64()
+            .expect("healthcheck interval should be a u64");
+        assert_eq!(interval, 30_000_000_000);
     }
 
     #[test]
@@ -1120,6 +1748,37 @@ mod tests {
         }
     }
 
+    fn cdi_devices_config(device_ids: &[&str]) -> prost_types::Struct {
+        list_string_driver_config("cdi_devices", device_ids)
+    }
+
+    fn cdi_device_typo_config(device_ids: &[&str]) -> prost_types::Struct {
+        list_string_driver_config("cdi_device", device_ids)
+    }
+
+    fn list_string_driver_config(field: &str, values: &[&str]) -> prost_types::Struct {
+        prost_types::Struct {
+            fields: std::iter::once((
+                field.to_string(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::ListValue(
+                        prost_types::ListValue {
+                            values: values
+                                .iter()
+                                .map(|device_id| prost_types::Value {
+                                    kind: Some(prost_types::value::Kind::StringValue(
+                                        (*device_id).to_string(),
+                                    )),
+                                })
+                                .collect(),
+                        },
+                    )),
+                },
+            ))
+            .collect(),
+        }
+    }
+
     fn test_config() -> PodmanComputeConfig {
         PodmanComputeConfig {
             socket_path: std::path::PathBuf::from("/tmp/test.sock"),
@@ -1154,7 +1813,7 @@ mod tests {
         );
         assert_eq!(
             vol["destination"].as_str(),
-            Some("/opt/openshell/bin"),
+            Some(SUPERVISOR_MOUNT_DIR),
             "image volume destination should be /opt/openshell/bin"
         );
         assert_eq!(
@@ -1162,6 +1821,393 @@ mod tests {
             Some(false),
             "image volume should be read-only"
         );
+    }
+
+    #[test]
+    fn container_spec_includes_driver_config_mounts() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [
+                        {
+                            "type": "volume",
+                            "source": "work-nfs",
+                            "target": "/sandbox/work",
+                            "read_only": true
+                        },
+                        {
+                            "type": "tmpfs",
+                            "target": "/sandbox/cache",
+                            "options": ["nosuid", "nodev"],
+                            "size_bytes": 1_048_576,
+                            "mode": 511
+                        },
+                        {
+                            "type": "image",
+                            "source": "ghcr.io/acme/tools:latest",
+                            "target": "/opt/tools",
+                            "read_only": true
+                        }
+                    ]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        let volumes = spec["volumes"]
+            .as_array()
+            .expect("volumes should be an array");
+        assert!(volumes.iter().any(|volume| {
+            volume["name"].as_str() == Some("openshell-sandbox-test-id-workspace")
+                && volume["dest"].as_str() == Some("/sandbox")
+        }));
+        assert!(volumes.iter().any(|volume| {
+            volume["name"].as_str() == Some("work-nfs")
+                && volume["dest"].as_str() == Some("/sandbox/work")
+                && volume["options"].as_array().is_some_and(|options| {
+                    options.iter().any(|option| option.as_str() == Some("ro"))
+                })
+        }));
+
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+        assert!(mounts.iter().any(|mount| {
+            mount["type"].as_str() == Some("tmpfs")
+                && mount["destination"].as_str() == Some("/sandbox/cache")
+                && mount["options"].as_array().is_some_and(|options| {
+                    options
+                        .iter()
+                        .any(|option| option.as_str() == Some("size=1048576"))
+                        && options
+                            .iter()
+                            .any(|option| option.as_str() == Some("mode=777"))
+                })
+        }));
+
+        let image_volumes = spec["image_volumes"]
+            .as_array()
+            .expect("image_volumes should be an array");
+        assert!(image_volumes.iter().any(|volume| {
+            volume["source"].as_str() == Some("ghcr.io/nvidia/openshell/supervisor:latest")
+                && volume["destination"].as_str() == Some("/opt/openshell/bin")
+        }));
+        assert!(image_volumes.iter().any(|volume| {
+            volume["source"].as_str() == Some("ghcr.io/acme/tools:latest")
+                && volume["destination"].as_str() == Some("/opt/tools")
+                && volume["rw"].as_bool() == Some(false)
+        }));
+    }
+
+    #[test]
+    fn container_spec_defaults_volume_mounts_to_read_only() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "volume",
+                        "source": "work-nfs",
+                        "target": "/sandbox/work"
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+
+        let spec = build_container_spec(&sandbox, &config);
+        let volumes = spec["volumes"]
+            .as_array()
+            .expect("volumes should be an array");
+
+        assert!(volumes.iter().any(|volume| {
+            volume["name"].as_str() == Some("work-nfs")
+                && volume["dest"].as_str() == Some("/sandbox/work")
+                && volume["options"].as_array().is_some_and(|options| {
+                    options.iter().any(|option| option.as_str() == Some("ro"))
+                })
+        }));
+    }
+
+    #[test]
+    fn container_spec_allows_explicit_writable_volume_mounts() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "volume",
+                        "source": "work-nfs",
+                        "target": "/sandbox/work",
+                        "read_only": false
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+
+        let spec = build_container_spec(&sandbox, &config);
+        let volumes = spec["volumes"]
+            .as_array()
+            .expect("volumes should be an array");
+
+        assert!(volumes.iter().any(|volume| {
+            volume["name"].as_str() == Some("work-nfs")
+                && volume["dest"].as_str() == Some("/sandbox/work")
+                && volume["options"].as_array().is_some_and(|options| {
+                    options.iter().any(|option| option.as_str() == Some("rw"))
+                })
+        }));
+    }
+
+    #[test]
+    fn driver_config_rejects_bind_mounts_unless_enabled() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "bind",
+                        "source": "/host/path",
+                        "target": "/sandbox/host"
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+
+        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+
+        assert!(err.to_string().contains("enable_bind_mounts = true"));
+    }
+
+    #[test]
+    fn container_spec_includes_bind_mounts_when_enabled() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "bind",
+                        "source": "/host/path",
+                        "target": "/sandbox/host",
+                        "read_only": true
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut config = test_config();
+        config.enable_bind_mounts = true;
+
+        let spec = build_container_spec(&sandbox, &config);
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+
+        assert!(mounts.iter().any(|mount| {
+            mount["type"].as_str() == Some("bind")
+                && mount["source"].as_str() == Some("/host/path")
+                && mount["destination"].as_str() == Some("/sandbox/host")
+                && mount["options"].as_array().is_some_and(|options| {
+                    options.iter().any(|option| option.as_str() == Some("ro"))
+                        && options
+                            .iter()
+                            .any(|option| option.as_str() == Some("rbind"))
+                })
+        }));
+    }
+
+    #[test]
+    fn container_spec_defaults_enabled_bind_mounts_to_read_only() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "bind",
+                        "source": "/host/path",
+                        "target": "/sandbox/host"
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut config = test_config();
+        config.enable_bind_mounts = true;
+
+        let spec = build_container_spec(&sandbox, &config);
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+
+        assert!(mounts.iter().any(|mount| {
+            mount["type"].as_str() == Some("bind")
+                && mount["source"].as_str() == Some("/host/path")
+                && mount["destination"].as_str() == Some("/sandbox/host")
+                && mount["options"].as_array().is_some_and(|options| {
+                    options.iter().any(|option| option.as_str() == Some("ro"))
+                        && options
+                            .iter()
+                            .any(|option| option.as_str() == Some("rbind"))
+                })
+        }));
+    }
+
+    #[test]
+    fn driver_config_rejects_relative_bind_sources_when_enabled() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "bind",
+                        "source": "relative/path",
+                        "target": "/sandbox/host"
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut config = test_config();
+        config.enable_bind_mounts = true;
+
+        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("bind source must be an absolute host path")
+        );
+    }
+
+    #[test]
+    fn container_spec_bind_mount_selinux_shared_label() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "bind",
+                        "source": "/data/shared",
+                        "target": "/sandbox/data",
+                        "read_only": true,
+                        "selinux_label": "shared"
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut config = test_config();
+        config.enable_bind_mounts = true;
+
+        let spec = build_container_spec(&sandbox, &config);
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+
+        assert!(mounts.iter().any(|mount| {
+            mount["type"].as_str() == Some("bind")
+                && mount["source"].as_str() == Some("/data/shared")
+                && mount["destination"].as_str() == Some("/sandbox/data")
+                && mount["options"].as_array().is_some_and(|options| {
+                    options.iter().any(|o| o.as_str() == Some("ro"))
+                        && options.iter().any(|o| o.as_str() == Some("z"))
+                })
+        }));
+    }
+
+    #[test]
+    fn container_spec_bind_mount_selinux_private_label() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "bind",
+                        "source": "/data/exclusive",
+                        "target": "/sandbox/data",
+                        "read_only": false,
+                        "selinux_label": "private"
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut config = test_config();
+        config.enable_bind_mounts = true;
+
+        let spec = build_container_spec(&sandbox, &config);
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+
+        assert!(mounts.iter().any(|mount| {
+            mount["type"].as_str() == Some("bind")
+                && mount["source"].as_str() == Some("/data/exclusive")
+                && mount["destination"].as_str() == Some("/sandbox/data")
+                && mount["options"].as_array().is_some_and(|options| {
+                    options.iter().any(|o| o.as_str() == Some("rw"))
+                        && options.iter().any(|o| o.as_str() == Some("Z"))
+                })
+        }));
+    }
+
+    #[test]
+    fn driver_config_rejects_reserved_mount_targets() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "volume",
+                        "source": "work-nfs",
+                        "target": "/etc/openshell/tls/custom"
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+
+        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+
+        assert!(err.to_string().contains("reserved OpenShell path"));
     }
 
     #[test]
@@ -1266,7 +2312,7 @@ mod tests {
             ..Default::default()
         });
         let config = test_config();
-        let token_path = std::path::Path::new("/host/token.jwt");
+        let token_path = Path::new("/host/token.jwt");
 
         let spec = build_container_spec_with_token(&sandbox, &config, Some(token_path));
 

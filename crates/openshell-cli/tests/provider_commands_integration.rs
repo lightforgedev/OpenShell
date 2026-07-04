@@ -343,7 +343,7 @@ impl OpenShell for TestOpenShell {
         if provider.credentials.is_empty() {
             let bootstrap_allowed =
                 if let Some(profile) = openshell_providers::get_default_profile(&provider.r#type) {
-                    profile.allows_gateway_refresh_bootstrap()
+                    profile.allows_empty_provider_credentials()
                 } else {
                     self.state
                         .profiles
@@ -353,7 +353,7 @@ impl OpenShell for TestOpenShell {
                         .cloned()
                         .is_some_and(|profile| {
                             openshell_providers::ProviderTypeProfile::from_proto(&profile)
-                                .allows_gateway_refresh_bootstrap()
+                                .allows_empty_provider_credentials()
                         })
                 };
             if !bootstrap_allowed {
@@ -455,6 +455,10 @@ impl OpenShell for TestOpenShell {
             .profiles
             .into_iter()
             .filter_map(|item| item.profile)
+            .map(|mut profile| {
+                profile.resource_version = 1;
+                profile
+            })
             .inspect(|profile| {
                 profiles.insert(profile.id.clone(), profile.clone());
             })
@@ -464,6 +468,72 @@ impl OpenShell for TestOpenShell {
                 diagnostics: Vec::new(),
                 profiles: imported,
                 imported: true,
+            },
+        ))
+    }
+
+    async fn update_provider_profiles(
+        &self,
+        request: tonic::Request<openshell_core::proto::UpdateProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::UpdateProviderProfilesResponse>, Status> {
+        let mut profiles = self.state.profiles.lock().await;
+        let request = request.into_inner();
+        let mut profile = request
+            .profile
+            .and_then(|item| item.profile)
+            .ok_or_else(|| Status::invalid_argument("provider profile is required"))?;
+        let target_id = request.id;
+        if target_id != profile.id {
+            return Ok(Response::new(
+                openshell_core::proto::UpdateProviderProfilesResponse {
+                    diagnostics: vec![openshell_core::proto::ProviderProfileDiagnostic {
+                        source: target_id.clone(),
+                        profile_id: profile.id.clone(),
+                        field: "id".to_string(),
+                        message: format!(
+                            "provider profile update target '{}' does not match payload id '{}'",
+                            target_id, profile.id
+                        ),
+                        severity: "error".to_string(),
+                    }],
+                    profile: None,
+                    updated: false,
+                },
+            ));
+        }
+        let Some(current) = profiles.get(&target_id) else {
+            return Ok(Response::new(
+                openshell_core::proto::UpdateProviderProfilesResponse {
+                    diagnostics: vec![openshell_core::proto::ProviderProfileDiagnostic {
+                        source: target_id.clone(),
+                        profile_id: target_id.clone(),
+                        field: "id".to_string(),
+                        message: format!("custom provider profile '{target_id}' does not exist"),
+                        severity: "error".to_string(),
+                    }],
+                    profile: None,
+                    updated: false,
+                },
+            ));
+        };
+        let expected_resource_version = if request.expected_resource_version != 0 {
+            request.expected_resource_version
+        } else {
+            profile.resource_version
+        };
+        if expected_resource_version == 0 || expected_resource_version != current.resource_version {
+            return Err(Status::aborted(format!(
+                "provider profile was modified concurrently (current resource_version: {})",
+                current.resource_version
+            )));
+        }
+        profile.resource_version = current.resource_version + 1;
+        profiles.insert(profile.id.clone(), profile.clone());
+        Ok(Response::new(
+            openshell_core::proto::UpdateProviderProfilesResponse {
+                diagnostics: Vec::new(),
+                profile: Some(profile),
+                updated: true,
             },
         ))
     }
@@ -997,7 +1067,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
     run::provider_get(&ts.endpoint, "my-claude", &ts.tls)
         .await
         .expect("provider get");
-    run::provider_list(&ts.endpoint, 100, 0, false, &ts.tls)
+    run::provider_list(&ts.endpoint, 100, 0, false, "table", &ts.tls)
         .await
         .expect("provider list");
 
@@ -1025,6 +1095,72 @@ async fn provider_list_profiles_cli_uses_profile_browsing_rpc() {
     run::provider_list_profiles(&ts.endpoint, "table", &ts.tls)
         .await
         .expect("provider list-profiles");
+}
+
+#[tokio::test]
+async fn provider_list_json_output() {
+    let ts = run_server().await;
+
+    // Create a provider with credentials and config
+    run::provider_create(
+        &ts.endpoint,
+        "test-provider",
+        "anthropic",
+        false,
+        &["ANTHROPIC_API_KEY=test-key".to_string()],
+        false,
+        &["region=us-west".to_string()],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    // Test JSON output (verifies it doesn't error)
+    run::provider_list(&ts.endpoint, 100, 0, false, "json", &ts.tls)
+        .await
+        .expect("provider list json should succeed");
+
+    run::provider_delete(&ts.endpoint, &["test-provider".to_string()], &ts.tls)
+        .await
+        .expect("provider delete");
+}
+
+#[tokio::test]
+async fn provider_list_yaml_output() {
+    let ts = run_server().await;
+
+    // Create a provider with credentials and config
+    run::provider_create(
+        &ts.endpoint,
+        "test-provider",
+        "anthropic",
+        false,
+        &["ANTHROPIC_API_KEY=test-key".to_string()],
+        false,
+        &["region=us-west".to_string()],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    // Test YAML output (verifies it doesn't error)
+    run::provider_list(&ts.endpoint, 100, 0, false, "yaml", &ts.tls)
+        .await
+        .expect("provider list yaml should succeed");
+
+    run::provider_delete(&ts.endpoint, &["test-provider".to_string()], &ts.tls)
+        .await
+        .expect("provider delete");
+}
+
+#[tokio::test]
+async fn provider_list_json_empty() {
+    let ts = run_server().await;
+
+    // Test JSON output with no providers (verifies it doesn't error on empty list)
+    run::provider_list(&ts.endpoint, 100, 0, false, "json", &ts.tls)
+        .await
+        .expect("provider list json empty should succeed");
 }
 
 #[tokio::test]
@@ -1119,13 +1255,14 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
         },
     );
 
-    run::provider_create(
+    run::provider_create_with_options(
         &ts.endpoint,
         "custom-refresh-provider",
         "custom-refresh",
         false,
         &[],
         false,
+        true,
         &[],
         &ts.tls,
     )
@@ -1136,6 +1273,50 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
     let provider = stored.get("custom-refresh-provider").expect("provider");
     assert_eq!(provider.r#type, "custom-refresh");
     assert!(provider.credentials.is_empty());
+}
+
+#[tokio::test]
+async fn provider_create_requires_runtime_credentials_for_empty_gateway_refresh_profiles() {
+    let ts = run_server().await;
+    ts.state.profiles.lock().await.insert(
+        "custom-refresh".to_string(),
+        ProviderProfile {
+            id: "custom-refresh".to_string(),
+            display_name: "Custom Refresh".to_string(),
+            credentials: vec![ProviderProfileCredential {
+                name: "ACCESS_TOKEN".to_string(),
+                required: true,
+                refresh: Some(ProviderCredentialRefresh {
+                    strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+
+    let err = run::provider_create(
+        &ts.endpoint,
+        "custom-refresh-provider",
+        "custom-refresh",
+        false,
+        &[],
+        false,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("empty runtime-resolved providers should require an explicit source");
+
+    assert!(err.to_string().contains("--runtime-credentials"));
+    assert!(
+        !ts.state
+            .providers
+            .lock()
+            .await
+            .contains_key("custom-refresh-provider")
+    );
 }
 
 #[tokio::test]
@@ -1255,6 +1436,31 @@ binaries: [/usr/bin/custom]
     run::provider_profile_import(&ts.endpoint, Some(&profile_path), None, &ts.tls)
         .await
         .expect("profile import");
+    let exported_yaml =
+        run::provider_profile_export_text(&ts.endpoint, "custom-api", "yaml", &ts.tls)
+            .await
+            .expect("profile export text");
+    assert!(exported_yaml.contains("resource_version: 1"));
+    let updated_yaml = exported_yaml
+        .replace(
+            "display_name: Custom API",
+            "display_name: Custom API Updated",
+        )
+        .replace("host: api.custom.example", "host: api.updated.example");
+    std::fs::write(&profile_path, updated_yaml).unwrap();
+    run::provider_profile_update(&ts.endpoint, "custom-api", &profile_path, &ts.tls)
+        .await
+        .expect("profile update");
+    assert_eq!(
+        ts.state
+            .profiles
+            .lock()
+            .await
+            .get("custom-api")
+            .and_then(|profile| profile.endpoints.first())
+            .map(|endpoint| endpoint.host.as_str()),
+        Some("api.updated.example")
+    );
     run::provider_profile_export(&ts.endpoint, "custom-api", "yaml", &ts.tls)
         .await
         .expect("profile export");
@@ -2123,8 +2329,7 @@ async fn provider_create_from_gcloud_adc_rejects_wrong_provider_type_before_cred
     .expect_err("wrong provider type should fail before generic credential validation");
 
     assert!(
-        err.to_string()
-            .contains("--from-gcloud-adc is only valid for google-vertex-ai providers"),
+        err.to_string().contains("--from-gcloud-adc"),
         "unexpected error: {err}"
     );
     assert!(ts.state.providers.lock().await.is_empty());

@@ -44,7 +44,7 @@ openshell settings delete --global --key providers_v2_enabled
 ```
 
 <Note>
-The feature flag controls provider-derived policy layers. It does not change the current credential injection model. OpenShell still injects placeholder environment variables into sandbox processes and resolves those placeholders in outbound HTTP traffic.
+The feature flag controls provider-derived policy layers. OpenShell still supports placeholder environment variables for provider credentials, and provider profiles can also declare dynamic token grants that the sandbox proxy resolves on demand for matching HTTP endpoints.
 </Note>
 
 ## Available Features
@@ -53,13 +53,14 @@ Providers v2 currently includes these user-facing features:
 
 - Built-in provider profiles stored in the `providers/` directory of the GitHub repository.
 - `openshell provider list-profiles` with table, YAML, and JSON output.
-- `openshell provider profile export`, `import`, `lint`, and `delete` for custom profiles.
+- `openshell provider profile export`, `import`, `update`, `lint`, and `delete` for custom profiles.
 - Provider instances created from built-in or imported profile IDs with `openshell provider create --type <id>`.
 - Profile-backed credential discovery for explicit `openshell provider create --from-existing` and `openshell provider update --from-existing` flows. The built-in `google-vertex-ai` profile also supplements discovery with Vertex config env vars such as `VERTEX_AI_PROJECT_ID` and `VERTEX_AI_REGION`.
 - Just-in-time effective policy composition from sandbox policy plus attached provider profiles.
 - Runtime sandbox provider lifecycle commands under `openshell sandbox provider list|attach|detach`.
 - Credential refresh configuration with `openshell provider refresh status|configure|rotate|delete`.
 - Credential expiry metadata with `openshell provider update --credential-expires-at`; values accept Unix epoch milliseconds or ISO/RFC3339 timestamps.
+- Dynamic token grants that use the sandbox's SPIFFE JWT-SVID as an OAuth2 client assertion and inject short-lived tokens into supported headers for matching profile endpoints.
 
 ## Roadmap
 
@@ -67,8 +68,8 @@ The following Providers v2 design items are not part of the current behavior:
 
 | Roadmap item | Current behavior |
 |---|---|
-| Profile-driven explicit credential injection | Profile `auth_style`, `header_name`, `query_param`, and `path_template` fields are stored and validated, but runtime injection still depends on environment placeholders generated from provider credentials. |
-| Endpoint and binary scoped credential injection | Provider profile endpoints and binaries affect policy composition. They do not yet restrict which outbound requests can receive credential injection. |
+| General profile-driven credential placement | Static `auth_style`, `header_name`, `query_param`, and `path_template` placement metadata is stored and validated, but static credential injection still depends on environment placeholders generated from provider credentials. Dynamic `token_grant` credentials support `bearer` and `header` placement for matching HTTP endpoints. |
+| Endpoint and binary scoped credential injection | Provider profile endpoints and binaries affect policy composition. Dynamic token grants are endpoint-scoped. Static placeholder injection is not yet restricted by profile endpoint or binary metadata. |
 | Credential verification on create | `openshell provider create` does not yet probe provider verification endpoints or expose `--no-verify`. |
 | Automatic credential scope extraction | OpenShell does not yet inspect upstream provider responses to discover credential scopes. |
 | Inference mounting from attached providers | `inference_capable` is profile metadata. Attaching an inference-capable provider does not yet create `inference.local` routes. |
@@ -96,6 +97,7 @@ Built-in Providers v2 profiles currently include:
 | `codex` | `agent` | `CODEX_AUTH_ACCESS_TOKEN`, `CODEX_AUTH_REFRESH_TOKEN`, `CODEX_AUTH_ACCOUNT_ID`, `CODEX_AUTH_ID_TOKEN` |
 | `copilot` | `agent` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` |
 | `cursor` | `agent` | None |
+| `deepinfra` | `inference` | `DEEPINFRA_API_KEY` |
 | `github` | `source_control` | `GITHUB_TOKEN`, `GH_TOKEN` |
 | `google-vertex-ai` | `inference` | `GOOGLE_SERVICE_ACCOUNT_KEY`, `GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN`, `VERTEX_AI_SERVICE_ACCOUNT_TOKEN`, `GOOGLE_VERTEX_AI_TOKEN`, `VERTEX_AI_TOKEN` |
 | `nvidia` | `inference` | `NVIDIA_API_KEY` |
@@ -125,7 +127,18 @@ Import all non-recursive `*.yaml`, `*.yml`, and `*.json` files from a directory:
 openshell provider profile import --from ./provider-profiles
 ```
 
-Custom profile IDs must use lowercase kebab-case with `a-z`, `0-9`, and `-`. Built-in profile IDs and legacy provider aliases are reserved. Built-in profiles are read-only, and OpenShell rejects deleting a custom profile while a sandbox-attached provider uses it.
+Import is create-only. It fails if a custom profile with the same ID already exists.
+
+Update an existing custom profile by exporting the current custom profile, editing the file, and submitting the edited file back:
+
+```shell
+openshell provider profile export github-profile -o yaml > github-profile.yaml
+openshell provider profile update github-profile -f github-profile.yaml
+```
+
+Exported custom profiles include `resource_version`. OpenShell requires that version during update so stale files cannot silently overwrite newer profile definitions. The target ID in the command must match the profile ID in the file. Update accepts one file at a time. If an update would make dynamic token grants ambiguous for an attached sandbox, OpenShell rejects it before changing the profile.
+
+Custom profile IDs must use lowercase kebab-case with `a-z`, `0-9`, and `-`. Built-in profile IDs and legacy provider aliases are reserved. Built-in profiles are read-only, and OpenShell rejects updating or deleting a built-in profile. OpenShell also rejects deleting a custom profile while a sandbox-attached provider uses it.
 
 ### Category Enum
 
@@ -147,6 +160,8 @@ Provider profile YAML and JSON use this shape. Treat this as a field map, not a 
 
 ```yaml wordWrap showLineNumbers={false}
 id: custom-api
+# Present on exported custom profiles; preserve it when updating.
+resource_version: 1
 display_name: Custom API
 description: Custom API access for sandbox agents
 category: data
@@ -159,8 +174,8 @@ credentials:
     required: true
 
     # Accepted values: basic, bearer, header, query, path.
-    # These fields describe the intended credential placement.
-    # Runtime injection still uses env placeholder resolution today.
+    # These fields describe static credential placement.
+    # Static runtime injection still uses env placeholder resolution.
     auth_style: bearer
     header_name: authorization
     query_param: api_key
@@ -184,6 +199,24 @@ credentials:
           description: OAuth client secret
           required: true
           secret: true
+
+    # Optional dynamic credential. The sandbox supervisor requests a
+    # SPIFFE JWT-SVID, exchanges it at token_endpoint, caches the returned
+    # access token, and injects it according to auth_style/header_name for
+    # matching endpoint traffic.
+    token_grant:
+      token_endpoint: https://login.example.com/realms/custom/protocol/openid-connect/token
+      audience: api://custom-api
+      jwt_svid_audience: https://login.example.com/realms/custom
+      client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-bearer
+      scopes: [api.read, api.write]
+      cache_ttl_seconds: 300
+      audience_overrides:
+        - host: api.example.com
+          port: 443
+          path: /v1/projects/**
+          audience: api://custom-projects
+          scopes: [projects.read]
 
 discovery:
   credentials: [api_token]
@@ -240,7 +273,7 @@ binaries:
 
 `category` groups profiles in `openshell provider list-profiles`. Use one of the values in the category enum.
 
-`credentials` declares the credential names, environment variables, auth metadata, and optional refresh metadata for the provider type. The `auth_style` field accepts `basic`, `bearer`, `header`, `query`, or `path`. When `auth_style` is `path`, set `path_template` to a URL path containing the `{credential}` placeholder exactly once (for example, `/v1/{credential}/resources`). The current runtime still exposes configured credential keys as placeholder environment variables and resolves placeholders in outbound HTTP requests.
+`credentials` declares the credential names, environment variables, auth metadata, optional refresh metadata, and optional dynamic token grant metadata for the provider type. The `auth_style` field accepts `basic`, `bearer`, `header`, `query`, or `path`. When `auth_style` is `path`, set `path_template` to a URL path containing the `{credential}` placeholder exactly once (for example, `/v1/{credential}/resources`). Static credentials are exposed as placeholder environment variables and resolved in outbound HTTP requests. Dynamic token grants are resolved by the sandbox proxy on demand for matching profile endpoints and support `bearer` or `header` placement. Credential environment variable names must not use the reserved `v<digits>_` prefix, such as `v10_GITHUB_TOKEN`, because OpenShell uses that namespace for revision-scoped placeholders.
 
 `discovery` controls what `--from-existing` scans when
 `providers_v2_enabled=true`. Each entry in `discovery.credentials` must name a
@@ -279,6 +312,33 @@ Gateway-managed refresh strategies use these material keys:
 | `google_service_account_jwt` | `client_email`, `private_key`, optional `subject` or `sub`. |
 
 OpenShell keeps token endpoints profile-owned. Refresh material cannot override `token_url` or `token_uri` during refresh configuration.
+
+### Dynamic Token Grants
+
+`token_grant` belongs to one credential declaration. When a sandbox with the provider attached sends HTTP traffic to a matching profile endpoint, the supervisor requests a SPIFFE JWT-SVID from the local Workload API, exchanges it at `token_endpoint`, caches the returned access token, and injects it before forwarding the request upstream. Use `auth_style: bearer` to inject `Authorization: Bearer <token>`, or `auth_style: header` with `header_name` to inject the raw access token into a custom header. Token grants do not support `query` or `path` placement.
+
+Create provider instances for token-grant-only profiles with `--runtime-credentials`. This records an empty provider instance and makes the runtime-resolved credential source explicit:
+
+```shell
+openshell provider create \
+  --name spiffe-token-demo \
+  --type spiffe-token-demo \
+  --runtime-credentials
+```
+
+Token grant fields:
+
+| Field | Required | Behavior |
+|---|---|---|
+| `token_endpoint` | Yes | OAuth2 token endpoint that accepts a SPIFFE JWT-SVID client assertion. Use `https://` unless the endpoint is loopback or a Kubernetes service DNS name such as `token-issuer.default.svc.cluster.local`. |
+| `audience` | No | Resource audience requested from the token service. |
+| `jwt_svid_audience` | No | Audience used when requesting the JWT-SVID. When omitted, OpenShell derives an issuer-style audience from Keycloak token endpoint paths or falls back to the full token endpoint URL. |
+| `client_assertion_type` | No | OAuth2 `client_assertion_type` form value. Defaults to RFC 7523 `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`. Set a provider-specific value, such as `urn:ietf:params:oauth:client-assertion-type:jwt-spiffe`, only when the token issuer explicitly requires it. |
+| `scopes` | No | OAuth2 scopes sent as a space-separated `scope` parameter. |
+| `cache_ttl_seconds` | No | Token cache TTL override. When omitted or `0`, OpenShell uses the token response `expires_in` with a 30-second safety margin and one-hour cap, or five minutes minus the margin if the response does not include an expiry. |
+| `audience_overrides` | No | Endpoint-specific `audience` and `scopes` overrides selected by host, port, and path. |
+
+Token grants require the sandbox supervisor to have access to a SPIFFE Workload API socket. They apply to HTTP traffic that the proxy can inspect. Endpoints with `tls: skip` bypass TLS termination and cannot receive dynamic token grant injection for HTTPS traffic. The token service must return a token value that is safe for HTTP header placement; malformed values are rejected before caching or header injection.
 
 ## Provider Instances
 
@@ -320,6 +380,8 @@ openshell provider create \
   --type custom-api \
   --credential CUSTOM_API_TOKEN
 ```
+
+Provider profiles whose required credentials are fully runtime-resolvable through `token_grant` or gateway-managed refresh can be created without `--credential`.
 
 Inspect the provider:
 
@@ -485,7 +547,9 @@ openshell sandbox create \
   -- claude
 ```
 
-When `providers_v2_enabled=true`, each attached provider with a matching profile contributes a provider policy layer to the sandbox effective policy. When the setting is disabled, the sandbox receives provider credentials but not provider-derived policy entries.
+When `providers_v2_enabled=true`, each attached provider with a matching profile contributes a provider policy layer to the sandbox effective policy. The base policy is the user-authored sandbox policy that you can edit and apply. The effective policy is the composed policy that the sandbox enforces: base policy plus provider policy layers. When the setting is disabled, the sandbox receives provider credentials but not provider-derived policy entries.
+
+Updating a custom provider profile affects every provider instance whose `type` matches that profile ID. Provider instances are not rewritten, and sandbox-authored policies are not modified. Running sandboxes observe the updated provider-derived policy on their next config sync. If a gateway-global policy is active, provider-derived policy layers remain suppressed.
 
 Providers v2 does not infer or auto-attach providers from the sandbox command.
 Attach providers explicitly with `--provider` during sandbox creation, or use
@@ -501,7 +565,7 @@ The list output includes provider name, provider type, credential key count, and
 
 ## Policy Composition
 
-OpenShell stores sandbox-authored policy and provider attachments separately. When a sandbox asks for its effective policy, the gateway composes the current sandbox policy with provider policy layers just in time.
+OpenShell stores the base policy and provider attachments separately. When a sandbox asks for its effective policy, the gateway composes the current base policy with provider policy layers just in time.
 
 For example, the built-in GitHub profile contains these endpoints and binaries:
 
@@ -579,14 +643,20 @@ network_policies:
 Inspect the effective policy:
 
 ```shell
-openshell policy get provider-demo
+openshell policy get provider-demo --full
+```
+
+Pull the round-trippable base policy without provider entries:
+
+```shell
+openshell policy get provider-demo --base
 ```
 
 Composition follows these rules:
 
 - Provider policy entries use reserved `_provider_*` keys derived from provider instance names.
-- Provider policy entries are derived data. OpenShell does not persist them back into the sandbox-authored policy.
-- If a user-authored rule already uses the same key, OpenShell keeps the user rule and adds a numeric suffix to the provider rule.
+- Provider policy entries are derived data. OpenShell does not persist them back into the base policy.
+- User-authored policies cannot define `_provider_*` network policy keys. The gateway rejects those keys on sandbox create and full policy replacement, and sandbox-originated policy sync strips them before persistence.
 - Provider and user rules are concatenated. Overlapping endpoints remain separate rules.
 - A gateway global policy override suppresses provider-derived policy layers.
 
@@ -616,7 +686,7 @@ Already-running processes keep the environment they started with. OpenShell does
 
 Detaching a provider removes its provider policy layer from future effective policy reads and removes its credential placeholders from future process environments. It does not remove environment variables from already-running processes.
 
-OpenShell rejects provider updates and refresh configuration when they would make two providers attached to the same sandbox expose the same active credential environment key. Use provider-specific credential names when one sandbox needs multiple providers with overlapping upstream concepts.
+OpenShell rejects provider updates and refresh configuration when they would make two providers attached to the same sandbox expose the same active credential environment key. It also rejects attached provider sets with ambiguous dynamic token grants at equal host/path specificity. Use provider-specific credential names and make one dynamic grant selector more specific when one sandbox needs multiple providers with overlapping upstream concepts.
 
 ## Next Steps
 

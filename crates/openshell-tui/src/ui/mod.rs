@@ -132,13 +132,21 @@ fn draw_title_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
         _ => Span::styled(&app.status_text, t.muted),
     };
 
+    let active_gateway_source = app
+        .gateways
+        .iter()
+        .find(|gateway| gateway.name == app.gateway_name)
+        .map_or("unknown", app::GatewayEntry::source_label);
+
     let mut parts: Vec<Span<'_>> = vec![
         Span::styled(" >_ OpenShell ", t.accent_bold),
         Span::styled(" ALPHA ", t.badge),
         Span::styled(" | ", t.muted),
         Span::styled("Current Gateway: ", t.text),
         Span::styled(&app.gateway_name, t.heading),
-        Span::styled(" (", t.muted),
+        Span::styled(" [", t.muted),
+        Span::styled(active_gateway_source, t.muted),
+        Span::styled("] (", t.muted),
         status_span,
         Span::styled(")", t.muted),
         Span::styled(" | ", t.muted),
@@ -564,6 +572,86 @@ fn draw_setting_edit_overlay(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(t.border_focused)
+        .padding(Padding::horizontal(1));
+
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// Draw a labeled text input field.
+///
+/// `cursor` is the cursor character shown when `focused` (e.g. `"█"` or `"_"`).
+/// `show_gap` appends an extra blank row below the input line.
+#[allow(clippy::too_many_arguments)]
+fn draw_text_field(
+    frame: &mut Frame<'_>,
+    label: &str,
+    value: &str,
+    placeholder: &str,
+    focused: bool,
+    area: Rect,
+    theme: &Theme,
+    cursor: &str,
+    show_gap: bool,
+) {
+    let t = theme;
+    let chunks = if show_gap {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // label
+                Constraint::Length(1), // input
+                Constraint::Length(1), // gap
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // label
+                Constraint::Length(1), // input
+            ])
+            .split(area)
+    };
+
+    let label_style = if focused { t.accent_bold } else { t.text };
+    let mut label_spans = vec![Span::styled(format!("{label}:"), label_style)];
+    if !placeholder.is_empty() {
+        label_spans.push(Span::styled(format!("  {placeholder}"), t.muted));
+    }
+    frame.render_widget(Paragraph::new(Line::from(label_spans)), chunks[0]);
+
+    let display = if value.is_empty() && !focused {
+        Line::from(Span::styled("  -", t.muted))
+    } else if focused {
+        Line::from(vec![
+            Span::styled(format!("  {value}"), t.accent),
+            Span::styled(cursor, t.accent),
+        ])
+    } else {
+        Line::from(Span::styled(format!("  {value}"), t.text))
+    };
+    frame.render_widget(Paragraph::new(display), chunks[1]);
+}
+
+/// Render a bordered confirmation popup centred on `area`.
+///
+/// `lines` is the popup body; height is derived from the line count.
+/// Use `t.border_focused` for confirmations and `t.status_err` for destructive
+/// actions.
+fn draw_confirm_popup(
+    frame: &mut Frame<'_>,
+    lines: Vec<Line<'_>>,
+    border_style: Style,
+    width: u16,
+    area: Rect,
+) {
+    let popup_height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    let popup = centered_popup(width, popup_height, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
         .padding(Padding::horizontal(1));
 
     frame.render_widget(Paragraph::new(lines).block(block), popup);

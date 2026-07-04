@@ -11,7 +11,7 @@ use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_kubernetes::{
     AppArmorProfile, ComputeDriverService, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
-    KubernetesComputeConfig, KubernetesComputeDriver, SupervisorSideloadMethod,
+    KubernetesComputeConfig, KubernetesComputeDriver, SupervisorSideloadMethod, SupervisorTopology,
 };
 
 #[derive(Parser, Debug)]
@@ -80,6 +80,13 @@ struct Args {
     )]
     supervisor_sideload_method: SupervisorSideloadMethod,
 
+    #[arg(
+        long,
+        env = "OPENSHELL_SUPERVISOR_TOPOLOGY",
+        default_value = "combined"
+    )]
+    supervisor_topology: SupervisorTopology,
+
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 
@@ -92,6 +99,15 @@ struct Args {
     /// gateway clamps values outside `[600, 86400]`. Default 3600.
     #[arg(long, env = "OPENSHELL_K8S_SA_TOKEN_TTL_SECS", default_value_t = 3600)]
     sa_token_ttl_secs: i64,
+
+    #[arg(long, env = "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET")]
+    provider_spiffe_workload_api_socket_path: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_K8S_SANDBOX_UID")]
+    sandbox_uid: Option<u32>,
+
+    #[arg(long, env = "OPENSHELL_K8S_SANDBOX_GID")]
+    sandbox_gid: Option<u32>,
 }
 
 #[tokio::main]
@@ -114,6 +130,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| openshell_core::config::DEFAULT_SUPERVISOR_IMAGE.to_string()),
         supervisor_image_pull_policy: args.supervisor_image_pull_policy.unwrap_or_default(),
         supervisor_sideload_method: args.supervisor_sideload_method,
+        supervisor_topology: args.supervisor_topology,
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
         ssh_socket_path: args.sandbox_ssh_socket_path,
         client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
@@ -129,6 +146,11 @@ async fn main() -> Result<()> {
         default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
             .unwrap_or_default(),
         sa_token_ttl_secs: args.sa_token_ttl_secs,
+        provider_spiffe_workload_api_socket_path: args
+            .provider_spiffe_workload_api_socket_path
+            .unwrap_or_default(),
+        sandbox_uid: args.sandbox_uid,
+        sandbox_gid: args.sandbox_gid,
     })
     .await
     .into_diagnostic()?;

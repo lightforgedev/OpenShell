@@ -83,6 +83,7 @@ mod tests {
     fn profile() -> ProviderTypeProfile {
         ProviderTypeProfile {
             id: "custom".to_string(),
+            resource_version: 0,
             display_name: "Custom".to_string(),
             description: String::new(),
             category: openshell_core::proto::ProviderProfileCategory::Other,
@@ -97,6 +98,7 @@ mod tests {
                     query_param: String::new(),
                     refresh: None,
                     path_template: String::new(),
+                    token_grant: None,
                 },
                 CredentialProfile {
                     name: "secondary".to_string(),
@@ -108,6 +110,7 @@ mod tests {
                     query_param: String::new(),
                     refresh: None,
                     path_template: String::new(),
+                    token_grant: None,
                 },
             ],
             endpoints: Vec::new(),

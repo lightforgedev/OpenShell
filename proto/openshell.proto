@@ -95,6 +95,10 @@ service OpenShell {
   rpc ImportProviderProfiles(ImportProviderProfilesRequest)
       returns (ImportProviderProfilesResponse);
 
+  // Update an existing custom provider type profile.
+  rpc UpdateProviderProfiles(UpdateProviderProfilesRequest)
+      returns (UpdateProviderProfilesResponse);
+
   // Validate provider type profiles without registering them.
   rpc LintProviderProfiles(LintProviderProfilesRequest)
       returns (LintProviderProfilesResponse);
@@ -317,18 +321,29 @@ message SandboxSpec {
   openshell.sandbox.v1.SandboxPolicy policy = 7;
   // Provider names to attach to this sandbox.
   repeated string providers = 8;
-  // Request NVIDIA GPU resources for this sandbox.
-  bool gpu = 9;
-  // Optional PCI BDF address (e.g. "0000:2d:00.0") or device index
-  // (e.g. "0", "1"). When empty with gpu=true, the driver assigns the
-  // first available GPU.
-  string gpu_device = 10;
+  // Portable resource requirements used by the gateway for driver selection
+  // and by drivers for provisioning.
+  ResourceRequirements resource_requirements = 9;
+  reserved 10;
+  reserved "gpu_device";
   // Field 11 was `proposal_approval_mode`. The approval mode is now a
   // runtime setting (gateway or sandbox scope) read via UpdateConfig /
   // GetSandboxConfig, so it can be flipped on a running sandbox and
   // managed fleet-wide.
   reserved 11;
   reserved "proposal_approval_mode";
+}
+
+message ResourceRequirements {
+  // GPU requirements for the sandbox. Presence indicates a GPU request.
+  GpuResourceRequirements gpu = 1;
+}
+
+// Public GPU resource requirements.
+message GpuResourceRequirements {
+  // Optional number of GPUs requested. When omitted, the request is for one
+  // GPU using the selected driver's default assignment behavior.
+  optional uint32 count = 1;
 }
 
 // Public sandbox template mapped onto compute-driver template inputs.
@@ -347,8 +362,8 @@ message SandboxTemplate {
   map<string, string> environment = 6;
   // Platform-specific compute resource requirements and limits.
   google.protobuf.Struct resources = 7;
-  // Optional platform-specific volume claim templates.
-  google.protobuf.Struct volume_claim_templates = 9;
+  reserved 9;
+  reserved "volume_claim_templates";
   // Enable Kubernetes user namespace isolation (hostUsers: false).
   // When true, container UID 0 maps to a non-root host UID and capabilities
   // become namespaced. Requires Kubernetes 1.33+ with user namespace support
@@ -892,6 +907,52 @@ message ProviderProfileDiagnostic {
   string severity = 5;
 }
 
+// Endpoint selector for token grant audience overrides.
+message ProviderCredentialTokenGrantAudienceOverride {
+  // Optional: endpoint host selector. If omitted, inherits the profile endpoint host.
+  string host = 1;
+
+  // Optional: endpoint port selector. If omitted, matches the expanded profile endpoint port.
+  uint32 port = 2;
+
+  // Optional: endpoint path selector. If omitted, inherits the profile endpoint path.
+  string path = 3;
+
+  // Resource audience to request for matching endpoints.
+  string audience = 4;
+
+  // Optional: OAuth2 scopes to request. If omitted, inherits the token grant scopes.
+  repeated string scopes = 5;
+}
+
+// Provider credential token grant configuration.
+// When present, the credential is obtained dynamically via OAuth2 grant when needed.
+message ProviderCredentialTokenGrant {
+  // OAuth2 token endpoint URL (e.g., https://keycloak.example.com/realms/my-realm/protocol/openid-connect/token)
+  string token_endpoint = 1;
+
+  // Optional: default resource audience to request from the token service
+  string audience = 2;
+
+  // Optional: audience to request when fetching the JWT-SVID from SPIRE.
+  // If omitted, the sandbox derives this from token_endpoint.
+  string jwt_svid_audience = 6;
+
+  // Optional: OAuth2 scopes to request
+  repeated string scopes = 3;
+
+  // Optional: override token cache TTL (seconds)
+  // If 0 or omitted, use expires_in from token response
+  int64 cache_ttl_seconds = 4;
+
+  // Optional: endpoint-specific resource audience overrides.
+  repeated ProviderCredentialTokenGrantAudienceOverride audience_overrides = 5;
+
+  // Optional: OAuth2 client_assertion_type value. If omitted, OpenShell uses
+  // urn:ietf:params:oauth:client-assertion-type:jwt-bearer.
+  string client_assertion_type = 7;
+}
+
 // Provider credential declaration.
 message ProviderProfileCredential {
   string name = 1;
@@ -903,6 +964,7 @@ message ProviderProfileCredential {
   string query_param = 7;
   ProviderCredentialRefresh refresh = 8;
   string path_template = 9;
+  ProviderCredentialTokenGrant token_grant = 10;
 }
 
 enum ProviderCredentialRefreshStrategy {
@@ -1030,6 +1092,10 @@ message ProviderProfile {
   repeated openshell.sandbox.v1.NetworkBinary binaries = 7;
   bool inference_capable = 8;
   ProviderProfileDiscovery discovery = 9;
+  // Storage resource version for custom profiles. Built-in profiles and new
+  // profile files use 0. Gateway responses set this for stored custom profiles.
+  // Update calls use this for optimistic concurrency.
+  uint64 resource_version = 10;
 }
 
 // Stored custom provider profile object.
@@ -1058,6 +1124,25 @@ message ImportProviderProfilesResponse {
   repeated ProviderProfileDiagnostic diagnostics = 1;
   repeated ProviderProfile profiles = 2;
   bool imported = 3;
+}
+
+// Update one custom provider profile request.
+message UpdateProviderProfilesRequest {
+  ProviderProfileImportItem profile = 1;
+  // Expected storage resource version for optimistic concurrency control.
+  // If 0, the server uses the resource_version embedded in profile.profile.
+  // Updates without a non-zero version are rejected to prevent stale files from
+  // silently overwriting newer profile definitions.
+  uint64 expected_resource_version = 2;
+  // Existing custom provider profile ID to update. The payload ID must match.
+  string id = 3;
+}
+
+// Update one custom provider profile response.
+message UpdateProviderProfilesResponse {
+  repeated ProviderProfileDiagnostic diagnostics = 1;
+  ProviderProfile profile = 2;
+  bool updated = 3;
 }
 
 // Lint provider profiles request.
@@ -1100,6 +1185,10 @@ message GetSandboxProviderEnvironmentResponse {
   uint64 provider_env_revision = 2;
   // Expiration timestamps for returned environment variables.
   map<string, int64> credential_expires_at_ms = 3;
+  // Dynamic credentials that require token grants or other runtime injection.
+  // Maps endpoint-bound provider metadata to credential metadata.
+  // Supervisor uses this to inject Authorization headers for token grant credentials.
+  map<string, ProviderProfileCredential> dynamic_credentials = 4;
 }
 
 // ---------------------------------------------------------------------------

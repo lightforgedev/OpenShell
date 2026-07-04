@@ -37,6 +37,10 @@ health, metrics, or tunnel routes. The plaintext service router also rejects
 browser requests whose Fetch Metadata, Origin, or Referer headers indicate a
 cross-origin or sibling-subdomain request.
 
+Operators can configure a gateway-wide gRPC request rate limit. The limit is
+applied only to gRPC API traffic after protocol multiplexing; health, metrics,
+and local sandbox-service HTTP routes are not rate limited by this control.
+
 Supported auth modes:
 
 | Mode | Use |
@@ -47,9 +51,13 @@ Supported auth modes:
 | Cloudflare JWT | Edge-authenticated deployments where Cloudflare Access supplies identity. |
 | OIDC | Bearer-token auth for users, with browser PKCE or client credentials login. |
 
-Sandbox supervisor RPCs authenticate with gateway-minted sandbox JWTs when that
-authenticator is configured; mTLS does not grant sandbox identity. User-facing
-mutations are authorized by role policy when OIDC or edge identity is enabled.
+Sandbox supervisor RPCs authenticate with explicit sandbox credentials; mTLS
+does not grant sandbox identity. Kubernetes deployments use the
+gateway-minted JWT bootstrap path: the supervisor starts with a projected
+ServiceAccount token, exchanges it for a gateway-minted sandbox JWT, and uses
+that JWT on subsequent gateway RPCs.
+User-facing mutations are authorized by role policy when OIDC or edge identity
+is enabled.
 
 Sandbox secrets are gateway-signed JWTs bound to a single sandbox ID. Docker,
 Podman, and VM drivers deliver the initial token through supervisor-only
@@ -58,10 +66,13 @@ token through `IssueSandboxToken`. The gateway validates that projected token
 with Kubernetes `TokenReview`, requires the configured sandbox service account,
 checks the returned pod binding against the live pod UID, and verifies the pod's
 controlling `Sandbox` ownerReference against the live Sandbox CR UID and
-sandbox-id label before minting the gateway JWT. Supervisors renew gateway JWTs
-in memory before expiry only while the sandbox record still exists. Older tokens
-are not server-revoked; shared deployments bound replay exposure with short
-`gateway_jwt.ttl_secs` lifetimes. The config default is
+sandbox-id label before minting the gateway JWT. The bootstrap path accepts
+both `agents.x-k8s.io/v1beta1` ownerReferences from newer Agent Sandbox
+controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing
+deployments. Supervisors renew gateway JWTs in memory before expiry only while
+the sandbox record still exists. Older tokens are not server-revoked; shared
+deployments bound replay exposure with short `gateway_jwt.ttl_secs` lifetimes.
+The config default is
 `gateway_jwt.ttl_secs = 0` for local single-player Docker, Podman, and VM
 gateways; those tokens carry `exp = 0` and do not expire. Kubernetes and other
 shared deployments should set a positive TTL.
@@ -208,7 +219,8 @@ modes:
   mutation. If they diverge it returns `Conflict` without attempting the
   write. Client-facing operations that carry an `expected_resource_version`
   field use this mode: `AttachSandboxProvider`, `DetachSandboxProvider`,
-  `UpdateProvider`, and `UpdateConfig` (policy backfill path).
+  `UpdateProvider`, `UpdateProviderProfiles`, and `UpdateConfig` (policy
+  backfill path).
 
 **Lists.** The `list_messages` and `list_messages_with_selector` helpers decode
 protobuf payloads from list results and hydrate `resource_version` from the
@@ -227,7 +239,7 @@ coverage:
 |---|---|---|---|
 | Sandbox | `MustCreate` | `update_message_cas` | `list_messages` |
 | Provider | `MustCreate` | `update_message_cas` | `list_messages` |
-| ProviderProfile | `MustCreate` | (immutable) | `list_messages` |
+| ProviderProfile | `MustCreate` | `MatchResourceVersion` | `list_messages` |
 | InferenceRoute | `MustCreate` | `update_message_cas` | `list_messages` |
 | SandboxPolicy | scoped versioning | scoped versioning | scoped query |
 | Settings | `Mutex`-guarded | `Mutex`-guarded | single-row |
@@ -239,7 +251,20 @@ gateways, the Mutex alone would be insufficient. Sandbox-scoped settings
 rely entirely on CAS without a Mutex.
 
 The `resource_version` is surfaced to clients through `ObjectMeta` in proto
-responses. Database migrations backfill existing rows with version 1.
+responses. Provider profiles are the exception: custom profile get/list/export
+responses copy the stored version onto the profile payload so exported YAML can
+carry the expected version for safe single-profile updates. Profile update
+requests also carry an explicit target profile ID; the payload ID must match the
+target so an edited export cannot overwrite a different profile. Database
+migrations backfill existing rows with version 1.
+
+Provider profile imports, updates, and deletes hold the sandbox synchronization
+guard while checking attached-sandbox dynamic token grant ambiguity or in-use
+state and writing the profile record. Sandbox creation with initial providers and
+sandbox provider attach/detach use the same guard, so one gateway process cannot
+interleave a profile mutation with a sandbox provider-set mutation that would
+leave an ambiguous final dynamic-token state or a deleted custom profile that is
+still referenced by a sandbox.
 
 Policy and runtime settings are delivered together through the effective sandbox
 config path. A gateway-global policy can override sandbox-scoped policy. The
@@ -257,7 +282,7 @@ Cluster inference routes store only `provider_name`, `model_id`, and optional
 timeout. The gateway resolves endpoint URLs, protocols, credentials, auth
 style, and route-shaping metadata from the provider record when supervisors call
 `GetInferenceBundle`. Supported provider types for cluster inference are
-`openai`, `anthropic`, `nvidia`, and `google-vertex-ai`.
+`openai`, `anthropic`, `nvidia`, `deepinfra`, and `google-vertex-ai`.
 
 The bundle carries enough information for sandbox-local routers to construct
 upstream URLs without re-deriving provider-specific routing logic. Each resolved
@@ -343,6 +368,15 @@ The same relay pattern backs interactive SSH, command execution, file sync, and
 local service forwarding. The gateway tracks live sessions in memory and
 persists session records so tokens can expire or be revoked.
 
+Relay liveness has two backstops so a reset supervisor session cannot leave a
+request parked forever. The gateway runs server-side HTTP/2 keepalive on
+supervisor connections, and each exec relay's SSH client uses SSH keepalive: an
+exec channel may be legitimately silent for a long time (e.g. an agent whose
+stdout is redirected to a file), so the exec is never ended on output-idle
+alone — instead an unanswered keepalive on a wedged or orphaned relay closes the
+channel and returns the exec with an error. Once a command reports its exit
+status, the gateway also bounds how long it waits for the trailing channel close.
+
 `ForwardTcp` is the client-facing byte stream for SSH and service forwarding.
 The first frame is a `TcpForwardInit` that carries the sandbox ID, an
 authorization token from `CreateSshSession`, and an explicit target:
@@ -380,8 +414,8 @@ hook Job using the gateway image itself -- no separate cert-generation image,
 no extra mirror burden in air-gapped environments. In the default built-in PKI
 path the hook creates TLS and sandbox JWT Secrets. When cert-manager is enabled,
 cert-manager owns TLS Secrets and the hook runs with `--jwt-only` so the
-required sandbox JWT Secret still exists before the gateway StatefulSet mounts
-it, even if `pkiInitJob.enabled` remains true. On package-managed local
+required sandbox JWT Secret still exists before the gateway workload mounts it,
+even if `pkiInitJob.enabled` remains true. On package-managed local
 gateways, the same command runs from the systemd
 unit's `ExecStartPre` to bootstrap PKI into the configured local TLS directory
 on first start. The Linux package unit defaults that directory to
@@ -437,6 +471,21 @@ driver's own table.
 Driver-specific values that are not part of the inheritance allowlist
 (e.g. Podman `socket_path`, VM `vcpus`) only come from the driver's own
 table.
+
+### Package-managed gateway registry
+
+The CLI reads its active-gateway and per-gateway metadata from
+`$XDG_CONFIG_HOME/openshell/`. It also looks for a package-manager owned
+system config root at `/etc/openshell`, using the same layout as the per-user
+config root: `active_gateway` plus `gateways/<name>/metadata.json`. Packages
+or runtimes that need a different location can override that root with a
+non-empty absolute `OPENSHELL_SYSTEM_GATEWAY_DIR`; empty or relative values
+fall back to `/etc/openshell` and emit a warning. The CLI falls back to this
+system config when no per-user `metadata.json` exists; malformed user metadata
+still shadows the system entry, but stray empty directories do not.
+
+System entries are read-only from the CLI, so `gateway remove` rejects a pure
+system entry instead of pretending to delete package-manager owned state.
 
 ## Operational Constraints
 
