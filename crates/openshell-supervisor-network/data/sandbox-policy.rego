@@ -137,6 +137,7 @@ endpoint_allowed(policy, network) if {
 binary_allowed(policy, exec) if {
 	some b
 	b := policy.binaries[_]
+	binary_identity_matches(b, exec)
 	not contains(b.path, "*")
 	b.path == exec.path
 }
@@ -145,6 +146,7 @@ binary_allowed(policy, exec) if {
 binary_allowed(policy, exec) if {
 	some b
 	b := policy.binaries[_]
+	binary_identity_matches(b, exec)
 	not contains(b.path, "*")
 	ancestor := exec.ancestors[_]
 	b.path == ancestor
@@ -155,15 +157,45 @@ binary_allowed(policy, exec) if {
 # spoofable via execve and must not be used as a grant-access signal.
 binary_allowed(policy, exec) if {
 	some b in policy.binaries
+	binary_identity_matches(b, exec)
 	contains(b.path, "*")
 	all_paths := array.concat([exec.path], exec.ancestors)
 	some p in all_paths
 	glob.match(b.path, ["/"], p)
 }
 
+binary_identity_matches(b, exec) if {
+	object.get(b, "uid", 0) == 0
+	object.get(b, "gid", 0) == 0
+}
+
+binary_identity_matches(b, exec) if {
+	uid := object.get(b, "uid", 0)
+	uid != 0
+	exec.uid == uid
+	object.get(b, "gid", 0) == 0
+}
+
+binary_identity_matches(b, exec) if {
+	gid := object.get(b, "gid", 0)
+	gid != 0
+	exec.gid == gid
+	object.get(b, "uid", 0) == 0
+}
+
+binary_identity_matches(b, exec) if {
+	uid := object.get(b, "uid", 0)
+	gid := object.get(b, "gid", 0)
+	uid != 0
+	gid != 0
+	exec.uid == uid
+	exec.gid == gid
+}
+
 user_declared_binary_allowed(policy, exec) if {
 	some b
 	b := policy.binaries[_]
+	binary_identity_matches(b, exec)
 	not object.get(b, "advisor_proposed", false)
 	not contains(b.path, "*")
 	b.path == exec.path
@@ -172,6 +204,7 @@ user_declared_binary_allowed(policy, exec) if {
 user_declared_binary_allowed(policy, exec) if {
 	some b
 	b := policy.binaries[_]
+	binary_identity_matches(b, exec)
 	not object.get(b, "advisor_proposed", false)
 	not contains(b.path, "*")
 	ancestor := exec.ancestors[_]
@@ -180,6 +213,7 @@ user_declared_binary_allowed(policy, exec) if {
 
 user_declared_binary_allowed(policy, exec) if {
 	some b in policy.binaries
+	binary_identity_matches(b, exec)
 	not object.get(b, "advisor_proposed", false)
 	contains(b.path, "*")
 	all_paths := array.concat([exec.path], exec.ancestors)

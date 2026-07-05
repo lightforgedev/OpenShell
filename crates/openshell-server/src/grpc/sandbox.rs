@@ -845,6 +845,7 @@ pub(super) async fn handle_exec_sandbox(
     let stdin_payload = req.stdin;
     let timeout_seconds = req.timeout_seconds;
     let request_tty = req.tty;
+    let run_as_user = req.run_as_user;
 
     let sandbox_id = sandbox.object_id().to_string();
 
@@ -866,6 +867,7 @@ pub(super) async fn handle_exec_sandbox(
             stdin_payload,
             timeout_seconds,
             request_tty,
+            &run_as_user,
         )
         .await
         {
@@ -1285,6 +1287,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
     let timeout_seconds = req.timeout_seconds;
     let cols = if req.cols == 0 { 80 } else { req.cols };
     let rows = if req.rows == 0 { 24 } else { req.rows };
+    let run_as_user = req.run_as_user;
 
     let sandbox_id = sandbox.object_id().to_string();
 
@@ -1312,6 +1315,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
             timeout_seconds,
             cols,
             rows,
+            &run_as_user,
         )
         .await
         {
@@ -1503,6 +1507,14 @@ fn exec_ssh_client_config() -> russh::client::Config {
     }
 }
 
+fn exec_ssh_user(run_as_user: &str) -> &str {
+    if run_as_user.is_empty() {
+        "sandbox"
+    } else {
+        run_as_user
+    }
+}
+
 /// Treat channel EOF before an exit status as relay failure, not exit code 1.
 fn exec_loop_result(exit_code: Option<i32>) -> Result<i32, Status> {
     exit_code.map_or_else(
@@ -1554,6 +1566,7 @@ async fn stream_exec_over_relay(
     stdin_payload: Vec<u8>,
     timeout_seconds: u32,
     request_tty: bool,
+    run_as_user: &str,
 ) -> Result<(), Status> {
     let command_preview: String = command.chars().take(120).collect();
     info!(
@@ -1574,6 +1587,7 @@ async fn stream_exec_over_relay(
         command,
         stdin_payload,
         request_tty,
+        run_as_user,
         tx.clone(),
     );
 
@@ -1630,6 +1644,7 @@ async fn stream_interactive_exec_over_relay(
     timeout_seconds: u32,
     cols: u32,
     rows: u32,
+    run_as_user: &str,
 ) -> Result<(), Status> {
     let command_preview: String = command.chars().take(120).collect();
     info!(
@@ -1650,6 +1665,7 @@ async fn stream_interactive_exec_over_relay(
         input_stream,
         cols,
         rows,
+        run_as_user,
         tx.clone(),
     );
 
@@ -1701,6 +1717,7 @@ async fn run_interactive_exec_with_russh(
     mut input_stream: tonic::Streaming<ExecSandboxInput>,
     cols: u32,
     rows: u32,
+    run_as_user: &str,
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
 ) -> Result<i32, Status> {
     use openshell_core::proto::exec_sandbox_input::Payload;
@@ -1727,7 +1744,7 @@ async fn run_interactive_exec_with_russh(
         .map_err(|e| Status::internal(format!("failed to establish ssh transport: {e}")))?;
 
     match client
-        .authenticate_none("sandbox")
+        .authenticate_none(exec_ssh_user(run_as_user))
         .await
         .map_err(|e| Status::internal(format!("failed to authenticate ssh session: {e}")))?
     {
@@ -1874,6 +1891,7 @@ async fn run_exec_with_russh(
     command: &str,
     stdin_payload: Vec<u8>,
     request_tty: bool,
+    run_as_user: &str,
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
 ) -> Result<i32, Status> {
     // Defense-in-depth: validate command at the transport boundary.
@@ -1898,7 +1916,7 @@ async fn run_exec_with_russh(
         .map_err(|e| Status::internal(format!("failed to establish ssh transport: {e}")))?;
 
     match client
-        .authenticate_none("sandbox")
+        .authenticate_none(exec_ssh_user(run_as_user))
         .await
         .map_err(|e| Status::internal(format!("failed to authenticate ssh session: {e}")))?
     {

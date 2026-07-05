@@ -5,7 +5,7 @@
 
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
-use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
+use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard, ProcessIds};
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::activity::{ActivitySender, try_record_activity};
@@ -88,6 +88,8 @@ struct ConnectDecision {
     binary: Option<PathBuf>,
     /// PID owning the socket.
     binary_pid: Option<u32>,
+    /// Effective UID/GID for the socket-owning process.
+    process_ids: Option<ProcessIds>,
     /// Ancestor binary paths from process tree walk.
     ancestors: Vec<PathBuf>,
     /// Cmdline-derived absolute paths (for script detection).
@@ -1095,6 +1097,7 @@ async fn handle_tcp_connection(
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect(),
+        process_ids: decision.process_ids,
         secret_resolver: secret_resolver.clone(),
         activity_tx: activity_tx.clone(),
         dynamic_credentials: dynamic_credentials.clone(),
@@ -1374,6 +1377,7 @@ async fn handle_tcp_connection(
 struct ResolvedIdentity {
     bin_path: PathBuf,
     binary_pid: u32,
+    process_ids: ProcessIds,
     ancestors: Vec<PathBuf>,
     cmdline_paths: Vec<PathBuf>,
     bin_hash: String,
@@ -1383,6 +1387,7 @@ struct ResolvedIdentity {
 #[derive(Debug, Eq, PartialEq)]
 struct PolicyIdentityKey {
     bin_path: PathBuf,
+    process_ids: ProcessIds,
     ancestors: Vec<PathBuf>,
     cmdline_paths: Vec<PathBuf>,
     bin_hash: String,
@@ -1393,6 +1398,7 @@ impl ResolvedIdentity {
     fn policy_key(&self) -> PolicyIdentityKey {
         PolicyIdentityKey {
             bin_path: self.bin_path.clone(),
+            process_ids: self.process_ids,
             ancestors: self.ancestors.clone(),
             cmdline_paths: self.cmdline_paths.clone(),
             bin_hash: self.bin_hash.clone(),
@@ -1408,6 +1414,7 @@ struct IdentityError {
     reason: String,
     binary: Option<PathBuf>,
     binary_pid: Option<u32>,
+    process_ids: Option<ProcessIds>,
     ancestors: Vec<PathBuf>,
 }
 
@@ -1422,8 +1429,19 @@ fn resolve_owner_identity(
             reason: format!("failed to resolve peer binary for PID {owner_pid}: {e}"),
             binary: None,
             binary_pid: Some(owner_pid),
+            process_ids: None,
             ancestors: vec![],
         })?;
+
+    let (uid, gid) =
+        crate::procfs::effective_process_ids(owner_pid).ok_or_else(|| IdentityError {
+            reason: format!("failed to resolve effective UID/GID for PID {owner_pid}"),
+            binary: Some(bin_path.clone()),
+            binary_pid: Some(owner_pid),
+            process_ids: None,
+            ancestors: vec![],
+        })?;
+    let process_ids = ProcessIds { uid, gid };
 
     let bin_hash = identity_cache
         .verify_or_cache(&bin_path)
@@ -1431,6 +1449,7 @@ fn resolve_owner_identity(
             reason: format!("binary integrity check failed: {e}"),
             binary: Some(bin_path.clone()),
             binary_pid: Some(owner_pid),
+            process_ids: Some(process_ids),
             ancestors: vec![],
         })?;
 
@@ -1446,6 +1465,7 @@ fn resolve_owner_identity(
                 ),
                 binary: Some(bin_path.clone()),
                 binary_pid: Some(owner_pid),
+                process_ids: Some(process_ids),
                 ancestors: ancestors.clone(),
             })?;
     }
@@ -1457,6 +1477,7 @@ fn resolve_owner_identity(
     Ok(ResolvedIdentity {
         bin_path,
         binary_pid: owner_pid,
+        process_ids,
         ancestors,
         cmdline_paths,
         bin_hash,
@@ -1487,6 +1508,7 @@ fn resolve_process_identity(
             reason: format!("failed to resolve peer binary: {e}"),
             binary: None,
             binary_pid: None,
+            process_ids: None,
             ancestors: vec![],
         })?;
 
@@ -1507,6 +1529,7 @@ fn resolve_process_identity(
             ),
             binary: None,
             binary_pid: None,
+            process_ids: None,
             ancestors: vec![],
         });
     };
@@ -1533,6 +1556,7 @@ fn resolve_process_identity(
             ),
             binary: None,
             binary_pid: None,
+            process_ids: None,
             ancestors: vec![],
         });
     }
@@ -1560,6 +1584,7 @@ fn evaluate_opa_tcp(
     let deny = |reason: String,
                 binary: Option<PathBuf>,
                 binary_pid: Option<u32>,
+                process_ids: Option<ProcessIds>,
                 ancestors: Vec<PathBuf>,
                 cmdline_paths: Vec<PathBuf>|
      -> ConnectDecision {
@@ -1568,6 +1593,7 @@ fn evaluate_opa_tcp(
             generation: engine.current_generation(),
             binary,
             binary_pid,
+            process_ids,
             ancestors,
             cmdline_paths,
         }
@@ -1577,6 +1603,7 @@ fn evaluate_opa_tcp(
     if pid == 0 {
         return deny(
             "entrypoint process not yet spawned".into(),
+            None,
             None,
             None,
             vec![],
@@ -1594,6 +1621,7 @@ fn evaluate_opa_tcp(
                 err.reason,
                 err.binary,
                 err.binary_pid,
+                err.process_ids,
                 err.ancestors,
                 vec![],
             );
@@ -1603,6 +1631,7 @@ fn evaluate_opa_tcp(
     let ResolvedIdentity {
         bin_path,
         binary_pid,
+        process_ids,
         ancestors,
         cmdline_paths,
         bin_hash,
@@ -1617,12 +1646,15 @@ fn evaluate_opa_tcp(
         cmdline_paths: cmdline_paths.clone(),
     };
 
-    let result = match engine.evaluate_network_action_with_generation(&input) {
+    let result = match engine
+        .evaluate_network_action_with_generation_and_process_ids(&input, Some(process_ids))
+    {
         Ok((action, generation)) => ConnectDecision {
             action,
             generation,
             binary: Some(bin_path),
             binary_pid: Some(binary_pid),
+            process_ids: Some(process_ids),
             ancestors,
             cmdline_paths,
         },
@@ -1630,6 +1662,7 @@ fn evaluate_opa_tcp(
             format!("policy evaluation error: {e}"),
             Some(bin_path),
             Some(binary_pid),
+            Some(process_ids),
             ancestors,
             cmdline_paths,
         ),
@@ -1658,6 +1691,7 @@ fn evaluate_opa_tcp(
         generation: engine.current_generation(),
         binary: None,
         binary_pid: None,
+        process_ids: None,
         ancestors: vec![],
         cmdline_paths: vec![],
     }
@@ -2151,7 +2185,9 @@ fn query_l7_route_snapshot(
         cmdline_paths: decision.cmdline_paths.clone(),
     };
 
-    match engine.query_endpoint_configs_with_generation(&input) {
+    match engine
+        .query_endpoint_configs_with_generation_and_process_ids(&input, decision.process_ids)
+    {
         Ok((vals, generation)) => Some(L7RouteSnapshot {
             configs: vals
                 .into_iter()
@@ -2210,7 +2246,7 @@ fn query_tls_mode(
         cmdline_paths: decision.cmdline_paths.clone(),
     };
 
-    match engine.query_endpoint_config(&input) {
+    match engine.query_endpoint_config_with_process_ids(&input, decision.process_ids) {
         Ok(Some(val)) => crate::l7::parse_tls_mode(&val),
         _ => crate::l7::TlsMode::Auto,
     }
@@ -2751,7 +2787,7 @@ fn query_allowed_ips(
         cmdline_paths: decision.cmdline_paths.clone(),
     };
 
-    match engine.query_allowed_ips(&input) {
+    match engine.query_allowed_ips_with_process_ids(&input, decision.process_ids) {
         Ok(ips) => ips,
         Err(e) => {
             let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -2793,7 +2829,7 @@ fn query_exact_declared_endpoint_host(
         cmdline_paths: decision.cmdline_paths.clone(),
     };
 
-    match engine.query_exact_declared_endpoint_host(&input) {
+    match engine.query_exact_declared_endpoint_host_with_process_ids(&input, decision.process_ids) {
         Ok(is_exact_declared) => is_exact_declared,
         Err(e) => {
             let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -3385,6 +3421,7 @@ async fn handle_forward_proxy(
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect(),
+        process_ids: decision.process_ids,
         secret_resolver: secret_resolver.clone(),
         activity_tx: activity_tx.cloned(),
         dynamic_credentials: dynamic_credentials.clone(),
@@ -4760,6 +4797,7 @@ network_policies:
             binary_path: "/usr/bin/curl".into(),
             ancestors: vec![],
             cmdline_paths: vec![],
+            process_ids: None,
             secret_resolver: None,
             activity_tx: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
@@ -4799,6 +4837,7 @@ network_policies:
             generation: engine.current_generation(),
             binary: Some(PathBuf::from("/usr/bin/node")),
             binary_pid: None,
+            process_ids: None,
             ancestors: vec![],
             cmdline_paths: vec![],
         };
@@ -4818,6 +4857,7 @@ network_policies:
             binary_path: "/usr/bin/node".to_string(),
             ancestors: vec![],
             cmdline_paths: vec![],
+            process_ids: None,
             secret_resolver: None,
             activity_tx: None,
             dynamic_credentials: None,
@@ -4986,6 +5026,7 @@ network_policies:
             binary_path: "/usr/bin/node".to_string(),
             ancestors: vec![],
             cmdline_paths: vec![],
+            process_ids: None,
             secret_resolver: resolver,
             activity_tx: None,
             dynamic_credentials: None,
@@ -5029,6 +5070,7 @@ network_policies:
             binary_path: "/usr/bin/node".to_string(),
             ancestors: vec![],
             cmdline_paths: vec![],
+            process_ids: None,
             secret_resolver: None,
             activity_tx: None,
             dynamic_credentials: None,

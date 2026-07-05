@@ -1,0 +1,51 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Nested Org Sandbox Tracker"
+sidebar-title: "Nested Org Tracker"
+description: "Implementation tracker for nested organization sandbox feasibility work."
+keywords: "OpenShell, Nested Sandbox, Tracker, Multi Tenant"
+position: 5
+---
+
+Nested organization sandbox mode is not implemented.
+This tracker lists the required changes before multiple customer organizations can safely share one outer container.
+Rows marked `done` are local spike evidence only unless they link to CI artifacts.
+
+## Tracker
+
+| Status | Work | Acceptance |
+|---|---|---|
+| done | UID/GID binary policy | Same binary can be allowed for one agent UID/GID and denied for another inside one org sandbox. |
+| done | Supervisor-managed exec user | `openshell sandbox exec --user <name>` runs a command as a non-root sandbox OS user. |
+| done | Local pooled-container smoke | Local spike showed separate org containers in one Docker host can be isolated by separate networks; shared networks leak reachability. |
+| done | Real OpenShell sibling marker smoke | Local spike showed two gateway-managed sandboxes did not expose Org B's in-sandbox marker through Org B's Docker container IP. This is one negative reachability check, not general sibling isolation. |
+| pending | Org identity contract | Define gateway-minted immutable `org_id`; never trust labels, client input, or in-sandbox state as the org source. Propagate it through sandbox context, policy input, cache keys, OCSF/logs, relay/session metadata, and denial/activity aggregation. |
+| pending | Per-org user namespace or UID range contract | Use per-org user namespaces and uid/gid maps, or globally disjoint UID/GID ranges, so same numeric UID in two orgs is not the same kernel principal. |
+| pending | Per-org netns allocator | Support multiple inner netns instances with unique names, veth names, CIDRs, proxy bind addresses, and cleanup. |
+| pending | Per-org DNS/metadata scope | Bind DNS and metadata emulators to org-local network scope and credentials. |
+| pending | Per-org mount/root lifecycle | Create private root/work/tmp/run/dev-shm/sys/proc-sys namespaces and Landlock preparation per org. |
+| pending | Per-org PID/proc boundary | Hide sibling org process metadata while preserving proxy socket-owner identity. Leading candidate: proxy identity resolver stays in the root/init PID namespace; org process trees run in child PID namespaces. |
+| pending | Per-org IPC boundary | Prevent shared memory and semaphores from crossing org scope; abstract Unix sockets must be covered by per-org netns. |
+| pending | Per-org keyring boundary | Disable or scope session/user keyrings per org. |
+| pending | Per-org cgroup manager | Create and enforce cgroup v2 pids, CPU, memory, and IO subtrees; fail closed when delegation is unavailable. |
+| pending | Org-scoped secret broker | Bind provider credentials, sandbox JWTs, metadata tokens, and relay tokens to org identity. |
+| pending | Nested lifecycle API | Create/delete/restart/watch nested org sandboxes below one outer runtime. |
+| pending | Linux adversarial evidence harness | Prove two orgs in one outer container cannot cross network, filesystem, proc, IPC, keyring, cgroup, secret, policy, or audit boundaries. Include active `/proc` scrape, abstract-socket enumeration, signal attempts, credential replay, and resource-pressure attempts. |
+| pending | Fly feasibility proof | Verify whether Fly exposes enough namespace/cgroup capabilities for nested mode. |
+
+## Open Risks
+
+| Risk | Blocking question |
+|---|---|
+| Cgroup delegation | Can the outer container write delegated cgroup v2 subtrees on target hosts and Fly Machines? |
+| PID/proc design | Can OpenShell keep the proxy identity resolver in the root/init PID namespace while running org process trees in child PID namespaces? |
+| User namespace support | Can the target runtime safely create per-org user namespaces, or must AEGIS allocate globally disjoint UID/GID ranges? |
+| Capability set | Can the outer runtime safely grant namespace setup capabilities without increasing escape blast radius? |
+| Cleanup | Can nested namespace, cgroup, mount, socket, and credential cleanup be made crash-safe? |
+| Audit completeness | Can every policy and lifecycle event carry org identity without label spoofing or missing-context fallbacks? |
+
+## Current Recommendation
+
+Prefer pooled hosts with separate org containers.
+Revisit nested org mode only after the tracker items above have Linux evidence.

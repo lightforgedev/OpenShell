@@ -686,6 +686,9 @@ message ExecSandboxRequest {
 
   // Initial terminal rows (used when tty=true, 0 = use default).
   uint32 rows = 9;
+
+  // Optional OS user for this exec. Empty uses the sandbox policy user.
+  string run_as_user = 10;
 }
 
 // One stdout chunk from a sandbox exec.

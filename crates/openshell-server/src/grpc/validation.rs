@@ -31,6 +31,8 @@ pub(super) const MAX_EXEC_COMMAND_ARGS: usize = 1024;
 pub(super) const MAX_EXEC_ARG_LEN: usize = 32 * 1024; // 32 KiB
 /// Maximum length of the workdir field (bytes).
 pub(super) const MAX_EXEC_WORKDIR_LEN: usize = 4096;
+/// Maximum length of a requested OS user name/UID.
+pub(super) const MAX_EXEC_RUN_AS_USER_LEN: usize = 128;
 
 /// Validate fields of an `ExecSandboxRequest` for control characters and size
 /// limits before constructing a shell command string.
@@ -64,6 +66,26 @@ pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(
             )));
         }
         reject_control_chars(&req.workdir, "workdir")?;
+    }
+    if !req.run_as_user.is_empty() {
+        if req.run_as_user.len() > MAX_EXEC_RUN_AS_USER_LEN {
+            return Err(Status::invalid_argument(format!(
+                "run_as_user exceeds {MAX_EXEC_RUN_AS_USER_LEN} byte limit"
+            )));
+        }
+        reject_control_chars(&req.run_as_user, "run_as_user")?;
+        if !req
+            .run_as_user
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        {
+            return Err(Status::invalid_argument(
+                "run_as_user must contain only ASCII letters, digits, '_', '-', or '.'",
+            ));
+        }
+        if req.run_as_user == "root" || req.run_as_user.parse::<u32>().is_ok_and(|uid| uid == 0) {
+            return Err(Status::invalid_argument("run_as_user must not be root"));
+        }
     }
     Ok(())
 }
@@ -1056,6 +1078,43 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_exec_request_fields(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_exec_request_allows_run_as_user() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "id".to_string(),
+            command: vec!["id".to_string()],
+            run_as_user: "ubuntu".to_string(),
+            ..Default::default()
+        };
+        assert!(validate_exec_request_fields(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_exec_request_rejects_root_run_as_user() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "id".to_string(),
+            command: vec!["id".to_string()],
+            run_as_user: "root".to_string(),
+            ..Default::default()
+        };
+        let err = validate_exec_request_fields(&req).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("root"));
+    }
+
+    #[test]
+    fn validate_exec_request_rejects_numeric_root_alias() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "id".to_string(),
+            command: vec!["id".to_string()],
+            run_as_user: "00".to_string(),
+            ..Default::default()
+        };
+        let err = validate_exec_request_fields(&req).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("root"));
     }
 
     #[test]

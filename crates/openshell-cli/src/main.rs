@@ -1454,6 +1454,10 @@ enum SandboxCommands {
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
 
+        /// OS user to run the command as inside the sandbox.
+        #[arg(long, value_name = "USER")]
+        user: Option<String>,
+
         /// Command and arguments to execute.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -2860,6 +2864,7 @@ async fn main() -> Result<()> {
                             tty,
                             no_tty,
                             envs,
+                            user,
                             command,
                         } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
@@ -2880,6 +2885,7 @@ async fn main() -> Result<()> {
                                 timeout,
                                 tty_override,
                                 &env_map,
+                                user.as_deref(),
                                 &tls,
                             )
                             .await?;

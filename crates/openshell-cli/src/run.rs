@@ -2870,6 +2870,7 @@ pub async fn sandbox_exec_grpc(
     timeout_seconds: u32,
     tty_override: Option<bool>,
     environment: &HashMap<String, String>,
+    run_as_user: Option<&str>,
     tls: &TlsOptions,
 ) -> Result<i32> {
     let mut client = grpc_client(server, tls).await?;
@@ -2931,6 +2932,7 @@ pub async fn sandbox_exec_grpc(
             workdir,
             timeout_seconds,
             environment,
+            run_as_user,
         )
         .await;
     }
@@ -2945,6 +2947,7 @@ pub async fn sandbox_exec_grpc(
             timeout_seconds,
             stdin: stdin_payload,
             tty,
+            run_as_user: run_as_user.unwrap_or_default().to_string(),
             ..Default::default()
         })
         .await
@@ -3288,6 +3291,7 @@ async fn sandbox_exec_interactive_grpc(
     workdir: Option<&str>,
     timeout_seconds: u32,
     environment: &HashMap<String, String>,
+    run_as_user: Option<&str>,
 ) -> Result<i32> {
     use openshell_core::proto::{ExecSandboxInput, ExecSandboxWindowResize, exec_sandbox_input};
     use tokio_stream::wrappers::ReceiverStream;
@@ -3309,6 +3313,8 @@ async fn sandbox_exec_interactive_grpc(
                 tty: true,
                 cols: u32::from(cols),
                 rows: u32::from(rows),
+                run_as_user: run_as_user.unwrap_or_default().to_string(),
+                ..Default::default()
             })),
         })
         .await

@@ -1,0 +1,96 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Nested Org Sandbox Feasibility"
+sidebar-title: "Nested Org Feasibility"
+description: "Design analysis for running multiple organization sandboxes inside one outer OpenShell runtime."
+keywords: "OpenShell, Sandbox, Multi Tenant, Namespace, Cgroup, Security"
+position: 2
+---
+
+Nested organization sandboxes are feasible only if each organization receives its own kernel-backed boundary inside the outer runtime.
+Separating customer organizations with Linux users alone is not an acceptable tenant boundary.
+This document is a design posture, not a runtime guard; OpenShell does not implement nested organization sandbox mode yet.
+
+## Decision
+
+| Topology | Decision | Reason |
+|---|---|---|
+| Multiple agent users in one org sandbox | Supported direction. | UID/GID-scoped binary policy and per-agent homes govern agents inside one tenant. |
+| Multiple org containers on one host or VM | Preferred pooled topology. | The container runtime owns per-org namespaces, cgroups, filesystems, and lifecycle. |
+| Multiple org users in one shared namespace | Reject as design posture. | Shared loopback, `/proc`, IPC, filesystem, credentials, and cgroup state make tenant isolation fragile. Runtime enforcement requires the org identity and nested-boundary work below. |
+| Multiple org sandboxes in one outer container | Possible spike only. | Requires OpenShell to create a nested per-org sandbox boundary before launching any org process. |
+
+## Requirement Gate
+
+| Field | Requirement |
+|---|---|
+| Product outcome | Lower runtime cost than one host or VM per organization without collapsing tenant trust boundaries. |
+| Trust boundary | Customer organization, not agent user. |
+| Minimum bar | Org A cannot observe, signal, connect to, read, exhaust, or reuse Org B runtime state. |
+| Evidence bar | Linux smoke with two orgs in one outer container plus policy/audit assertions. |
+| Fail-closed rule | If any per-org namespace, cgroup, policy, or secret boundary cannot be created, the org sandbox must not start. |
+| Residual risk | Nested mode shares one kernel. It cannot contain kernel LPEs or cache/timing side channels as strongly as VM-per-org, and is weaker than container-per-org unless every listed boundary is enforced. |
+
+## Existing Primitives
+
+| Primitive | Current support | Reuse |
+|---|---|---|
+| Inner network namespace | `openshell-supervisor-process/src/netns/mod.rs` creates one netns, veth pair, proxy-side IP, sandbox-side IP, and fd for `setns`. | Reuse after adding multi-netns lifecycle and non-conflicting CIDR allocation. |
+| Process launch ordering | `openshell-supervisor-process/src/process.rs` enters netns and child mount namespace before privilege drop, Landlock, and runtime seccomp. | Reuse as the namespace-entry point for org processes. |
+| Mount namespace primitive | `process.rs` uses `unshare(CLONE_NEWNS)` and `setns(CLONE_NEWNS)` to hide supervisor identity sockets. | Reuse as proof of primitive; extend to org root/work/tmp overlays. |
+| Landlock and seccomp | Static controls are prepared before launch; runtime seccomp blocks namespace creation and cross-process inspection syscalls. | Keep ordering; org namespace setup must happen before runtime seccomp. |
+| UID/GID binary policy | OPA input and proxy identity now include effective UID/GID. | Keep for per-agent controls inside one org; add org identity for multi-org mode. |
+| Sandbox metadata labels | Public sandbox objects have labels. | Use as a compatibility path, but nested mode should use a reserved validated org identity. |
+| Kubernetes user namespaces | `SandboxTemplate.user_namespaces` can request `hostUsers: false` on supporting Kubernetes clusters. | Treat as prior art; nested mode needs an explicit per-org userns or globally disjoint UID strategy. |
+
+## Missing Boundaries
+
+| Boundary | Required change | Risk if missed |
+|---|---|---|
+| Org identity | Add gateway-minted immutable `org_id` to sandbox/session/policy/audit context. Never trust client labels or in-sandbox state as the org source. | Policy cache or audit can merge tenants. |
+| User namespace or UID ranges | Add per-org user namespaces and uid/gid maps, or assign globally disjoint UID/GID ranges per org. | The same numeric UID in two orgs is the same kernel principal. |
+| Network | Create one netns and proxy instance per org. Add CIDR/IP allocator; current netns uses fixed `10.200.0.0/24`. | Shared loopback or route exposes sibling org services. |
+| DNS and metadata | Run DNS/metadata emulators inside the org network scope or bind them to org-specific addresses. | Org A can query Org B metadata, credentials, or service discovery. |
+| Mount/root | Create per-org mount namespace, root/work tree, `/tmp`, `/run`, and `/dev/shm`. | Shared writable paths leak tokens, source, sockets, caches, or lock files. |
+| `/sys` and kernel knobs | Hide or make read-only `/sys`, `/proc/sys`, and other kernel-control surfaces. | One org can observe or influence host/kernel state visible to siblings. |
+| PID/proc | Add per-org PID namespace or equivalent `/proc` isolation that preserves proxy identity lookup. Leading candidate: keep the proxy identity resolver in the root/init PID namespace and run each org process tree in a child PID namespace. | Org A can inspect Org B process metadata or discover handles. |
+| IPC | Add per-org IPC namespace or remove shared IPC surfaces; abstract Unix sockets are covered by per-org network namespaces, not IPC namespaces. | Shared semaphores, shared memory, or sockets leak cross-org state. |
+| Kernel keyrings | Disable or scope session/user keyrings per org. | Credentials can leak through shared keyring ownership or lookup. |
+| Cgroups | Create per-org cgroup v2 subtrees for pids, CPU, memory, and IO. | One org can starve or fork-bomb siblings. |
+| Secrets | Replace shared env/file secrets with org-scoped broker handles. | Provider or platform tokens can be read or replayed by another org. |
+| Control sockets | Scope SSH, relay, provider, and internal Unix sockets by org. | One org can connect to another org control plane path. |
+| Audit and logs | Include org identity in OCSF/log context, denial aggregation, activity aggregation, and policy revision events. | Tenant attribution becomes ambiguous. |
+| Lifecycle | Add nested org create/delete/restart/watch ownership. | Cleanup leaves stale namespaces, cgroups, sockets, or credentials. |
+
+## Implementation Path
+
+| Phase | Work | Exit criteria |
+|---|---|---|
+| 0. Keep pooled containers | Use separate org containers inside a pooled host or VM. | Current safer cost-tier remains available while nested mode is designed. |
+| 1. Org identity and userns contract | Add gateway-minted immutable `org_id`; choose per-org user namespaces or globally disjoint UID/GID ranges. | Missing or mismatched org identity denies launch and network evaluation; UID/GID collision across orgs is impossible. |
+| 2. Multi-netns manager | Generalize `NetworkNamespace` to allocate per-org names and CIDRs. | Two orgs have isolated loopback and cannot reach each other except through an explicit shared control path. |
+| 3. Org filesystem namespace | Create per-org root/work/tmp/run/dev-shm/sys/proc-sys mount namespace before Landlock. | Org A cannot read Org B runtime files, sockets, temp/cache paths, or kernel-control surfaces. |
+| 4. Org process boundary | Add PID/proc and IPC isolation while preserving proxy socket-owner identity. Leading topology: proxy identity resolver remains in the root/init PID namespace; org process trees run in child PID namespaces. | Org A cannot list, inspect, signal, or attach to Org B processes. |
+| 5. Org resource boundary | Add cgroup v2 subtree creation and required-limit validation. | CPU, memory, pids, and IO pressure are bounded per org. |
+| 6. Secret/control isolation | Bind provider credentials, sandbox JWTs, SSH relay tokens, and metadata service to org scope. | Org A cannot read or replay Org B credentials or relay paths. |
+| 7. Evidence harness | Add a Linux smoke that runs two orgs in one outer container. | Smoke proves network, file, proc, IPC, cgroup, secret, policy, and audit separation. |
+
+## Feasibility
+
+| Item | Feasibility | Notes |
+|---|---|---|
+| Org identity plumbing | Medium | Straightforward API/data-flow work; hard part is complete propagation. |
+| User namespace or UID ranges | Hard | Required before nested org claims. Without it, identical UID/GID values across orgs are the same kernel principal. |
+| Per-org network namespaces | Medium | Existing netns code is reusable; allocator and multi-instance lifecycle are missing. |
+| Per-org mount/root namespaces | Hard | Existing mount namespace code only hides supervisor identity sockets. Root/work/tmp overlays are new. |
+| PID/proc isolation | Hard | Proxy currently depends on procfs identity reads. Leading candidate keeps the proxy in the root/init PID namespace for `/proc/<pid>/status` socket-owner identity and launches org process trees in child PID namespaces to hide siblings. |
+| Cgroup subtrees | Hard | Current code checks the outer `pids.max`; it does not manage per-tenant cgroups. Docker/Fly may not delegate writable cgroups. |
+| Secret broker | Medium-hard | Provider paths exist, but tenant replay prevention must be explicit. |
+| Nested lifecycle | Hard | Current gateway lifecycle is sandbox-level, not nested-org-level. |
+
+## Recommendation
+
+Use separate org containers in a pooled host or VM as the near-term design.
+Treat nested org sandboxes inside one outer container as a later spike.
+Do not ship same-namespace multi-org users for customer workloads.

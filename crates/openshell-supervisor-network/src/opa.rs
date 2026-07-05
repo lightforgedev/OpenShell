@@ -55,11 +55,52 @@ pub struct NetworkInput {
     pub cmdline_paths: Vec<PathBuf>,
 }
 
+/// Effective process identity for a socket-owning process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessIds {
+    pub uid: u32,
+    pub gid: u32,
+}
+
 /// Sandbox configuration extracted from OPA data at startup.
 pub struct SandboxConfig {
     pub filesystem: FilesystemPolicy,
     pub landlock: LandlockPolicy,
     pub process: ProcessPolicy,
+}
+
+fn network_input_json(input: &NetworkInput, process_ids: Option<ProcessIds>) -> serde_json::Value {
+    let ancestor_strs: Vec<String> = input
+        .ancestors
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let cmdline_strs: Vec<String> = input
+        .cmdline_paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+
+    let mut exec = serde_json::Map::new();
+    exec.insert(
+        "path".to_string(),
+        serde_json::Value::String(input.binary_path.to_string_lossy().into_owned()),
+    );
+    exec.insert("ancestors".to_string(), serde_json::json!(ancestor_strs));
+    exec.insert("cmdline_paths".to_string(), serde_json::json!(cmdline_strs));
+
+    if let Some(ids) = process_ids {
+        exec.insert("uid".to_string(), serde_json::json!(ids.uid));
+        exec.insert("gid".to_string(), serde_json::json!(ids.gid));
+    }
+
+    serde_json::json!({
+        "exec": exec,
+        "network": {
+            "host": input.host,
+            "port": input.port,
+        }
+    })
 }
 
 /// Embedded OPA policy engine.
@@ -244,27 +285,15 @@ impl OpaEngine {
     /// `allow_network` rule, and returns a `PolicyDecision` with the result,
     /// deny reason, and matched policy name.
     pub fn evaluate_network(&self, input: &NetworkInput) -> Result<PolicyDecision> {
-        let ancestor_strs: Vec<String> = input
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let cmdline_strs: Vec<String> = input
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let input_json = serde_json::json!({
-            "exec": {
-                "path": input.binary_path.to_string_lossy(),
-                "ancestors": ancestor_strs,
-                "cmdline_paths": cmdline_strs,
-            },
-            "network": {
-                "host": input.host,
-                "port": input.port,
-            }
-        });
+        self.evaluate_network_with_process_ids(input, None)
+    }
+
+    pub fn evaluate_network_with_process_ids(
+        &self,
+        input: &NetworkInput,
+        process_ids: Option<ProcessIds>,
+    ) -> Result<PolicyDecision> {
+        let input_json = network_input_json(input, process_ids);
 
         let mut engine = self
             .engine
@@ -314,27 +343,15 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(NetworkAction, u64)> {
-        let ancestor_strs: Vec<String> = input
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let cmdline_strs: Vec<String> = input
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let input_json = serde_json::json!({
-            "exec": {
-                "path": input.binary_path.to_string_lossy(),
-                "ancestors": ancestor_strs,
-                "cmdline_paths": cmdline_strs,
-            },
-            "network": {
-                "host": input.host,
-                "port": input.port,
-            }
-        });
+        self.evaluate_network_action_with_generation_and_process_ids(input, None)
+    }
+
+    pub fn evaluate_network_action_with_generation_and_process_ids(
+        &self,
+        input: &NetworkInput,
+        process_ids: Option<ProcessIds>,
+    ) -> Result<(NetworkAction, u64)> {
+        let input_json = network_input_json(input, process_ids);
 
         let mut engine = self
             .engine
@@ -491,12 +508,33 @@ impl OpaEngine {
         Ok(self.query_endpoint_config_with_generation(input)?.0)
     }
 
+    pub fn query_endpoint_config_with_process_ids(
+        &self,
+        input: &NetworkInput,
+        process_ids: Option<ProcessIds>,
+    ) -> Result<Option<regorus::Value>> {
+        Ok(self
+            .query_endpoint_config_with_generation_and_process_ids(input, process_ids)?
+            .0)
+    }
+
     /// Query L7 endpoint config and return the policy generation used for the query.
     pub fn query_endpoint_config_with_generation(
         &self,
         input: &NetworkInput,
     ) -> Result<(Option<regorus::Value>, u64)> {
-        let (configs, generation) = self.query_endpoint_configs_with_generation(input)?;
+        let (configs, generation) =
+            self.query_endpoint_configs_with_generation_and_process_ids(input, None)?;
+        Ok((configs.into_iter().next(), generation))
+    }
+
+    pub fn query_endpoint_config_with_generation_and_process_ids(
+        &self,
+        input: &NetworkInput,
+        process_ids: Option<ProcessIds>,
+    ) -> Result<(Option<regorus::Value>, u64)> {
+        let (configs, generation) =
+            self.query_endpoint_configs_with_generation_and_process_ids(input, process_ids)?;
         Ok((configs.into_iter().next(), generation))
     }
 
@@ -505,27 +543,15 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(Vec<regorus::Value>, u64)> {
-        let ancestor_strs: Vec<String> = input
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let cmdline_strs: Vec<String> = input
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let input_json = serde_json::json!({
-            "exec": {
-                "path": input.binary_path.to_string_lossy(),
-                "ancestors": ancestor_strs,
-                "cmdline_paths": cmdline_strs,
-            },
-            "network": {
-                "host": input.host,
-                "port": input.port,
-            }
-        });
+        self.query_endpoint_configs_with_generation_and_process_ids(input, None)
+    }
+
+    pub fn query_endpoint_configs_with_generation_and_process_ids(
+        &self,
+        input: &NetworkInput,
+        process_ids: Option<ProcessIds>,
+    ) -> Result<(Vec<regorus::Value>, u64)> {
+        let input_json = network_input_json(input, process_ids);
 
         let mut engine = self
             .engine
@@ -561,6 +587,17 @@ impl OpaEngine {
             .unwrap_or_default())
     }
 
+    pub fn query_allowed_ips_with_process_ids(
+        &self,
+        input: &NetworkInput,
+        process_ids: Option<ProcessIds>,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .query_endpoint_config_with_process_ids(input, process_ids)?
+            .map(|val| get_str_array(&val, "allowed_ips"))
+            .unwrap_or_default())
+    }
+
     /// Return true when the matched endpoint is an exact declared hostname.
     ///
     /// This intentionally excludes wildcard and hostless endpoints. The proxy
@@ -569,27 +606,15 @@ impl OpaEngine {
     /// denial while preserving separate handling for `allowed_ips` and advisor
     /// proposals.
     pub fn query_exact_declared_endpoint_host(&self, input: &NetworkInput) -> Result<bool> {
-        let ancestor_strs: Vec<String> = input
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let cmdline_strs: Vec<String> = input
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let input_json = serde_json::json!({
-            "exec": {
-                "path": input.binary_path.to_string_lossy(),
-                "ancestors": ancestor_strs,
-                "cmdline_paths": cmdline_strs,
-            },
-            "network": {
-                "host": input.host,
-                "port": input.port,
-            }
-        });
+        self.query_exact_declared_endpoint_host_with_process_ids(input, None)
+    }
+
+    pub fn query_exact_declared_endpoint_host_with_process_ids(
+        &self,
+        input: &NetworkInput,
+        process_ids: Option<ProcessIds>,
+    ) -> Result<bool> {
+        let input_json = network_input_json(input, process_ids);
 
         let mut engine = self
             .engine
@@ -1332,6 +1357,12 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                         if advisor_proposed {
                             entry["advisor_proposed"] = true.into();
                         }
+                        if b.uid > 0 {
+                            entry["uid"] = b.uid.into();
+                        }
+                        if b.gid > 0 {
+                            entry["gid"] = b.gid.into();
+                        }
                         entry
                     };
                     let mut entries = vec![binary_entry(&b.path)];
@@ -1461,6 +1492,312 @@ mod tests {
             decision.reason
         );
         assert_eq!(decision.matched_policy.as_deref(), Some("claude_code"));
+    }
+
+    #[test]
+    fn uid_scoped_binary_allows_matching_process_identity() {
+        let data = r#"
+network_policies:
+  agent_a_curl:
+    endpoints:
+      - host: api.github.com
+        port: 443
+    binaries:
+      - path: /usr/bin/curl
+        uid: 20001
+        gid: 20001
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "api.github.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let decision = engine
+            .evaluate_network_with_process_ids(
+                &input,
+                Some(ProcessIds {
+                    uid: 20001,
+                    gid: 20001,
+                }),
+            )
+            .unwrap();
+
+        assert!(
+            decision.allowed,
+            "Expected matching UID/GID to allow, got: {}",
+            decision.reason
+        );
+        assert_eq!(decision.matched_policy.as_deref(), Some("agent_a_curl"));
+    }
+
+    #[test]
+    fn uid_scoped_binary_denies_different_process_identity() {
+        let data = r#"
+network_policies:
+  agent_a_curl:
+    endpoints:
+      - host: api.github.com
+        port: 443
+    binaries:
+      - path: /usr/bin/curl
+        uid: 20001
+        gid: 20001
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "api.github.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let decision = engine
+            .evaluate_network_with_process_ids(
+                &input,
+                Some(ProcessIds {
+                    uid: 20002,
+                    gid: 20002,
+                }),
+            )
+            .unwrap();
+
+        assert!(!decision.allowed);
+        assert!(
+            decision.reason.contains("not allowed"),
+            "Expected binary denial, got: {}",
+            decision.reason
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uid_scoped_policy_uses_procfs_effective_ids_for_two_os_users() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Child, Command};
+        use std::time::{Duration, Instant};
+
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        fn sleep_binary() -> &'static str {
+            ["/bin/sleep", "/usr/bin/sleep"]
+                .into_iter()
+                .find(|path| Path::new(path).exists())
+                .expect("sleep binary exists")
+        }
+
+        fn wait_for_process_ids(pid: u32, expected: (u32, u32)) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if crate::procfs::effective_process_ids(pid) == Some(expected) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for PID {pid} effective UID/GID {expected:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        if crate::procfs::effective_process_ids(std::process::id()).map(|(uid, _gid)| uid)
+            != Some(0)
+        {
+            eprintln!("skipping UID/GID procfs policy test: requires root to spawn test users");
+            return;
+        }
+
+        let binary_path = std::fs::canonicalize(sleep_binary()).expect("canonicalize sleep binary");
+        let mut agent_a_cmd = Command::new(sleep_binary());
+        agent_a_cmd.arg("30").uid(20_001).gid(20_001);
+        let agent_a = ChildGuard(agent_a_cmd.spawn().expect("spawn agent A process"));
+
+        let mut agent_b_cmd = Command::new(sleep_binary());
+        agent_b_cmd.arg("30").uid(20_002).gid(20_002);
+        let agent_b = ChildGuard(agent_b_cmd.spawn().expect("spawn agent B process"));
+
+        let agent_a_ids = (20_001, 20_001);
+        let agent_b_ids = (20_002, 20_002);
+        wait_for_process_ids(agent_a.0.id(), agent_a_ids);
+        wait_for_process_ids(agent_b.0.id(), agent_b_ids);
+
+        let data = format!(
+            r#"
+network_policies:
+  agent_a_sleep:
+    endpoints:
+      - host: api.github.com
+        port: 443
+    binaries:
+      - path: "{}"
+        uid: 20001
+        gid: 20001
+"#,
+            binary_path.display()
+        );
+        let engine = OpaEngine::from_strings(TEST_POLICY, &data).unwrap();
+        let input = NetworkInput {
+            host: "api.github.com".into(),
+            port: 443,
+            binary_path,
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let agent_a_decision = engine
+            .evaluate_network_with_process_ids(
+                &input,
+                Some(ProcessIds {
+                    uid: agent_a_ids.0,
+                    gid: agent_a_ids.1,
+                }),
+            )
+            .unwrap();
+        let agent_b_decision = engine
+            .evaluate_network_with_process_ids(
+                &input,
+                Some(ProcessIds {
+                    uid: agent_b_ids.0,
+                    gid: agent_b_ids.1,
+                }),
+            )
+            .unwrap();
+
+        assert!(
+            agent_a_decision.allowed,
+            "agent A UID/GID should allow same binary: {}",
+            agent_a_decision.reason
+        );
+        assert!(
+            !agent_b_decision.allowed,
+            "agent B UID/GID should deny same binary"
+        );
+    }
+
+    #[test]
+    fn uid_scoped_binary_denies_missing_process_identity() {
+        let data = r#"
+network_policies:
+  agent_a_curl:
+    endpoints:
+      - host: api.github.com
+        port: 443
+    binaries:
+      - path: /usr/bin/curl
+        uid: 20001
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "api.github.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let decision = engine.evaluate_network(&input).unwrap();
+
+        assert!(!decision.allowed);
+    }
+
+    #[test]
+    fn unscoped_binary_keeps_legacy_any_uid_behavior() {
+        let data = r#"
+network_policies:
+  curl:
+    endpoints:
+      - host: api.github.com
+        port: 443
+    binaries:
+      - path: /usr/bin/curl
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "api.github.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        assert!(engine.evaluate_network(&input).unwrap().allowed);
+        assert!(
+            engine
+                .evaluate_network_with_process_ids(
+                    &input,
+                    Some(ProcessIds {
+                        uid: 20002,
+                        gid: 20002,
+                    }),
+                )
+                .unwrap()
+                .allowed
+        );
+    }
+
+    #[test]
+    fn uid_scoped_endpoint_config_query_requires_matching_process_identity() {
+        let data = r#"
+network_policies:
+  agent_a_curl:
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/repos/**" }
+    binaries:
+      - path: /usr/bin/curl
+        uid: 20001
+        gid: 20001
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "api.github.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let (matching, _) = engine
+            .query_endpoint_configs_with_generation_and_process_ids(
+                &input,
+                Some(ProcessIds {
+                    uid: 20001,
+                    gid: 20001,
+                }),
+            )
+            .unwrap();
+        let (other, _) = engine
+            .query_endpoint_configs_with_generation_and_process_ids(
+                &input,
+                Some(ProcessIds {
+                    uid: 20002,
+                    gid: 20002,
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(matching.len(), 1);
+        assert!(other.is_empty());
     }
 
     #[test]
