@@ -44,6 +44,25 @@ This document is a design posture, not a runtime guard; OpenShell does not imple
 | Sandbox metadata labels | Public sandbox objects have labels. | Use as a compatibility path, but nested mode should use a reserved validated org identity. |
 | Kubernetes user namespaces | `SandboxTemplate.user_namespaces` can request `hostUsers: false` on supporting Kubernetes clusters. | Treat as prior art; nested mode needs an explicit per-org userns or globally disjoint UID strategy. |
 
+## 2026-07-06 Code Constraint Scan
+
+| Area | Current code assumption | Nested-org requirement |
+|---|---|---|
+| Public and internal APIs | `Sandbox`, `ExecSandboxRequest`, `CreateSshSessionRequest`, `TcpForwardInit`, `RelayOpen`, and `SupervisorHello` route by `sandbox_id`; `run_as_user` is the only per-exec identity. | Add nested org lifecycle and route exec/SSH/TCP relay by `sandbox_id + org_id`. `run_as_user` remains an agent/user selector, not tenant identity. |
+| Auth scope | Sandbox JWT principals are scoped to one sandbox. | Bind org operations to a gateway-minted immutable org identity; nested mode rejects label-derived or in-sandbox-derived org identity. |
+| Driver boundary | Docker/Podman/VM drivers create one container/VM per sandbox. | A single outer container must recreate those boundaries inside `openshell-sandbox`; otherwise use separate org containers. |
+| Netns | `NetworkNamespace::create()` creates one netns with fixed `10.200.0.1/24` and `10.200.0.2/24`. | Add allocator for per-org namespace names, veth names, CIDRs, proxy bind addresses, nft rules, and cleanup. |
+| Process launch | `ProcessHandle::spawn` receives one netns fd and hardcodes proxy URL `http://10.200.0.1:<port>`. | Launch from an `OrgRuntimeContext` carrying org netns fd, proxy URL, mount/root, cgroup, provider env, and policy identity. |
+| Networking supervisor | `run_networking()` starts one proxy, OPA engine, policy-local context, binary identity cache, provider state, and entrypoint PID. | Prefer one proxy/OPA/cache/policy-local/provider state per org. Shared proxy mode must key every route, policy generation, cache, and event by org. |
+| Binary TOFU cache | `BinaryIdentityCache` is keyed by path only. | Use per-org caches or key by `org_id + root identity + path`; `/usr/bin/curl` in different org roots must not collide. |
+| Provider credentials | `ProviderCredentialState`, metadata loopback, dynamic credentials, and policy polling are per sandbox. | Allocate them per org; never store org provider secrets in shared outer env or shared files. |
+| OCSF and aggregation | `SandboxContext` is a process-wide singleton with sandbox identity only; denial/activity aggregation flushes by sandbox name. | Add per-event org attribution or per-org event context; policy/audit/denial/activity persistence must carry org identity. |
+| Mount/root | Current mount namespace only hides a supervisor identity socket. | Add per-org root/work/tmp/run/dev-shm/proc/sys mount lifecycle and cleanup before Landlock/seccomp. |
+| PID/proc | Proxy identity resolution depends on `/proc/<entrypoint_pid>` and socket owner scans. | Run org process trees in child PID namespaces while proxy resolver remains in root/init PID namespace, or provide an equivalent resolver. |
+| IPC/keyrings | No org-scoped IPC or keyring boundary is implemented. | Add IPC namespace and keyring disable/scope policy; test abstract sockets, shm, semaphores, and key lookup. |
+| Cgroups | Supervisor only checks outer `pids.max`. | Add cgroup v2 subtree manager for pids, CPU, memory, and IO; fail closed when delegation is unavailable. |
+| Runtime capabilities | Docker driver grants `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, `SYSLOG`, and unconfined AppArmor for current namespace work. | Local Docker spike is plausible. Production/Fly must prove capabilities, userns, cgroup delegation, `ip`, `nft`, and `/var/run/netns` before nested mode can start. |
+
 ## Missing Boundaries
 
 | Boundary | Required change | Risk if missed |
@@ -75,6 +94,15 @@ This document is a design posture, not a runtime guard; OpenShell does not imple
 | 5. Org resource boundary | Add cgroup v2 subtree creation and required-limit validation. | CPU, memory, pids, and IO pressure are bounded per org. |
 | 6. Secret/control isolation | Bind provider credentials, sandbox JWTs, SSH relay tokens, and metadata service to org scope. | Org A cannot read or replay Org B credentials or relay paths. |
 | 7. Evidence harness | Add a Linux smoke that runs two orgs in one outer container. | Smoke proves network, file, proc, IPC, cgroup, secret, policy, and audit separation. |
+
+## Minimal Implementation Shape
+
+| Object | Ownership | Required fields |
+|---|---|---|
+| `NestedOrgRuntimeManager` | Outer sandbox supervisor | Create/delete/watch/recover org runtimes; reject launch if any required boundary cannot be created. |
+| `OrgRuntimeContext` | One per org | `org_id`, userns/UID map, netns fd/name/CIDR, proxy URL, OPA engine, identity cache, policy-local context, provider state, mount root, PID namespace/init pid, IPC/keyring mode, cgroup path, relay/socket paths. |
+| `ProcessLaunchContext` | One exec/SSH command | `sandbox_id`, `org_id`, `run_as_user`, env, cwd, org netns fd, org proxy URL, org mount namespace/root, org cgroup, provider env. |
+| `OrgAuditContext` | One event/decision | `sandbox_id`, `org_id`, `run_as_user`, UID/GID, policy generation, proxy id, denial/activity source. |
 
 ## Feasibility
 

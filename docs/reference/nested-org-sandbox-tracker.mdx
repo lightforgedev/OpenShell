@@ -21,8 +21,11 @@ Rows marked `done` are local spike evidence only unless they link to CI artifact
 | done | Local pooled-container smoke | Local spike showed separate org containers in one Docker host can be isolated by separate networks; shared networks leak reachability. |
 | done | Real OpenShell sibling marker smoke | Local spike showed two gateway-managed sandboxes did not expose Org B's in-sandbox marker through Org B's Docker container IP. This is one negative reachability check, not general sibling isolation. |
 | pending | Org identity contract | Define gateway-minted immutable `org_id`; never trust labels, client input, or in-sandbox state as the org source. Propagate it through sandbox context, policy input, cache keys, OCSF/logs, relay/session metadata, and denial/activity aggregation. |
+| pending | Nested org API/relay routing | Add org target to nested lifecycle, exec, SSH, TCP forward, and supervisor relay paths. Existing `run_as_user` remains per-agent only. |
+| pending | Nested org runtime manager | Add an outer-supervisor manager that owns per-org runtime contexts and crash cleanup. Context includes org netns, proxy, OPA, identity cache, policy-local state, provider state, mount/root, PID/proc boundary, IPC/keyring mode, cgroup, and sockets. |
 | pending | Per-org user namespace or UID range contract | Use per-org user namespaces and uid/gid maps, or globally disjoint UID/GID ranges, so same numeric UID in two orgs is not the same kernel principal. |
 | pending | Per-org netns allocator | Support multiple inner netns instances with unique names, veth names, CIDRs, proxy bind addresses, and cleanup. |
+| pending | Per-org proxy/OPA/cache | Prefer one proxy, OPA engine, policy-local context, and `BinaryIdentityCache` per org. If shared, every route/cache/policy generation/event key must include org identity. |
 | pending | Per-org DNS/metadata scope | Bind DNS and metadata emulators to org-local network scope and credentials. |
 | pending | Per-org mount/root lifecycle | Create private root/work/tmp/run/dev-shm/sys/proc-sys namespaces and Landlock preparation per org. |
 | pending | Per-org PID/proc boundary | Hide sibling org process metadata while preserving proxy socket-owner identity. Leading candidate: proxy identity resolver stays in the root/init PID namespace; org process trees run in child PID namespaces. |
@@ -34,6 +37,20 @@ Rows marked `done` are local spike evidence only unless they link to CI artifact
 | pending | Linux adversarial evidence harness | Prove two orgs in one outer container cannot cross network, filesystem, proc, IPC, keyring, cgroup, secret, policy, or audit boundaries. Include active `/proc` scrape, abstract-socket enumeration, signal attempts, credential replay, and resource-pressure attempts. |
 | pending | Fly feasibility proof | Verify whether Fly exposes enough namespace/cgroup capabilities for nested mode. |
 
+## Code Constraints Found 2026-07-06
+
+| File/area | Constraint | Work item |
+|---|---|---|
+| `proto/openshell.proto` | Sandbox lifecycle, exec, SSH, TCP forward, supervisor hello, and relay messages identify only `sandbox_id`. | Add nested org contract; validate `org_id` on every nested operation. |
+| `openshell-server/src/supervisor_session.rs` | One supervisor session and pending relay pool per sandbox. | Route relay open/claim by `sandbox_id + org_id` or carry org in relay target. |
+| `openshell-supervisor-process/src/netns/mod.rs` | One fixed-CIDR netns per sandbox. | Add per-org CIDR/IP allocator and cleanup. |
+| `openshell-supervisor-process/src/process.rs` | One netns fd and hardcoded proxy URL `10.200.0.1`; mount namespace only hides supervisor identity socket. | Add org launch context with org proxy URL, mount/root, cgroup, and provider env. |
+| `openshell-supervisor-network/src/run.rs` | One proxy, OPA, policy-local context, provider state, binary cache, and entrypoint PID. | Instantiate these per org. |
+| `openshell-supervisor-network/src/identity.rs` | Binary identity TOFU cache key is executable path only. | Use per-org cache or key by org/root/path. |
+| `openshell-core/src/provider_credentials.rs` | Credential resolver generations are sandbox-scoped. | Split provider credentials by org. |
+| `openshell-ocsf/src/ctx.rs` | OCSF context is one process-wide sandbox context. | Add per-event org context/fields. |
+| Docker driver | Local containers have namespace setup capabilities; Fly capability set is unknown. | Add capability probe; nested mode refuses to start when userns/netns/mount/cgroup prerequisites are missing. |
+
 ## Open Risks
 
 | Risk | Blocking question |
@@ -44,6 +61,7 @@ Rows marked `done` are local spike evidence only unless they link to CI artifact
 | Capability set | Can the outer runtime safely grant namespace setup capabilities without increasing escape blast radius? |
 | Cleanup | Can nested namespace, cgroup, mount, socket, and credential cleanup be made crash-safe? |
 | Audit completeness | Can every policy and lifecycle event carry org identity without label spoofing or missing-context fallbacks? |
+| Shared-kernel residual risk | Is this tier acceptable for customers that require VM/container-runtime tenant isolation, given nested mode still shares one kernel and outer privileged supervisor? |
 
 ## Current Recommendation
 
