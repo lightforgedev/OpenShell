@@ -25,7 +25,7 @@ This document is a design posture, not a runtime guard; OpenShell has org identi
 
 | Scope | Status |
 |---|---|
-| Org identity API foundation | Implemented: optional `org_id` on exec, SSH session, TCP forward, persisted SSH session, and `RelayOpen`; invalid values reject; SSH forward tokens are bound to `sandbox_id + org_id`. |
+| Org identity API foundation | Implemented: optional `org_id` on exec, SSH session, TCP forward, persisted SSH session, and `RelayOpen`; invalid values reject; SSH forward tokens are bound to `sandbox_id + org_id`. The shared validator accepts only non-empty safe carrier ids that avoid path/CLI-ambiguous forms: no slash/space/control bytes, no overlength values, no `.`/`..`, no leading `.`, and no leading `-`. Empty id remains the legacy sandbox-level path. |
 | Relay OCSF attribution | Implemented: relay open/closed/failed events emit non-empty `RelayOpen.org_id` as `unmapped.org_id`; empty `org_id` preserves legacy event shape. |
 | Binary identity cache scope | Implemented: `BinaryIdentityCache` can key by org/root/path for future nested org mode; live proxy callers still use the legacy scope. |
 | Relay org-id boundary validation | Implemented: relay registry rejects invalid org ids before pending relay state or `RelayOpen` emission. |
@@ -43,6 +43,17 @@ This document is a design posture, not a runtime guard; OpenShell has org identi
 | Evidence bar | Linux smoke with two orgs in one outer container plus policy/audit assertions. |
 | Fail-closed rule | If any per-org namespace, cgroup, policy, or secret boundary cannot be created, the org sandbox must not start. |
 | Residual risk | Nested mode shares one kernel. It cannot contain kernel LPEs or cache/timing side channels as strongly as VM-per-org, and is weaker than container-per-org unless every listed boundary is enforced. |
+
+## Edge-Case Bar
+
+| Boundary | Current edge coverage | Not yet proven |
+|---|---|---|
+| Carrier validation | Exec, TCP forward init, and relay open share the same org-id validator. Covered negatives: slash, space, null, newline, carriage return, overlength, `.`/`..`, leading `.`, and leading `-`. | Gateway-minted immutable org identity; org identity still must not be treated as trusted tenancy until gateway/runtime binding exists. |
+| Relay state mutation | Invalid org ids reject before pending relay insertion and before `RelayOpen` emission. | Live two-org relay claim/replay negative test. |
+| SSH/forward binding | SSH session persistence and forward-token validation include `org_id`. | Active cross-org token replay test after nested org lifecycle exists. |
+| Binary policy | UID/GID-scoped binary policy covers allow/deny for same binary across agent users; missing process identity fails closed. | Org/root-scoped live proxy identity lookup and TOFU cache isolation. |
+| Network policy | Policy-engine evaluation covers UID-scoped decisions. | Live curl-through-proxy allow/deny with two OS users and then two nested org runtimes. |
+| Tenant isolation | Design requires per-org userns or disjoint UID ranges, netns, mount/root, PID/proc, IPC/keyring, cgroup, secrets, lifecycle, and audit scope. | Full adversarial Linux harness inside one outer container. |
 
 ## Existing Primitives
 

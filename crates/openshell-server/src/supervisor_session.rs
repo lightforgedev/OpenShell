@@ -1038,7 +1038,7 @@ mod tests {
         registry.register("sbx".to_string(), "s1".to_string(), tx, make_shutdown());
 
         let err = registry
-            .open_relay_for_org("sbx", "org/alpha", Duration::from_secs(1))
+            .open_relay_for_org("sbx", "..", Duration::from_secs(1))
             .await
             .expect_err("invalid org_id must be rejected");
 
