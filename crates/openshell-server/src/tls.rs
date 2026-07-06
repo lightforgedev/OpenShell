@@ -338,6 +338,7 @@ fn tls_ocsf_ctx() -> SandboxContext {
     SandboxContext {
         sandbox_id: String::new(),
         sandbox_name: String::new(),
+        org_id: None,
         container_image: "openshell/gateway".to_string(),
         hostname: "openshell-gateway".to_string(),
         product_version: openshell_core::VERSION.to_string(),

@@ -113,6 +113,18 @@ fn relay_target_kind(open: &RelayOpen) -> &'static str {
     }
 }
 
+fn relay_org_id(open: &RelayOpen) -> Option<&str> {
+    (!open.org_id.is_empty()).then_some(open.org_id.as_str())
+}
+
+fn relay_context(ctx: &SandboxContext, open: &RelayOpen) -> SandboxContext {
+    let mut ctx = ctx.clone();
+    if let Some(org_id) = relay_org_id(open) {
+        ctx.org_id = Some(org_id.to_string());
+    }
+    ctx
+}
+
 fn relay_target_message(
     open: &RelayOpen,
     state: &str,
@@ -127,10 +139,16 @@ fn relay_target_message(
         }
     };
 
+    let mut fields = vec![format!("channel_id={}", open.channel_id)];
+    if let Some(org_id) = relay_org_id(open) {
+        fields.push(format!("org_id={org_id}"));
+    }
+    fields.push(format!("target={target}"));
+
     format!(
-        "{} {state} (channel_id={}, target={target})",
+        "{} {state} ({})",
         relay_target_kind(open),
-        open.channel_id
+        fields.join(", ")
     )
 }
 
@@ -390,23 +408,22 @@ fn handle_gateway_message(
             let ssh_socket_path = ssh_socket_path.to_path_buf();
             let tx = tx.clone();
 
-            let event = relay_open_event(openshell_ocsf::ctx::ctx(), &relay_open, &ssh_socket_path);
+            let event_ctx = relay_context(openshell_ocsf::ctx::ctx(), &relay_open);
+            let event = relay_open_event(&event_ctx, &relay_open, &ssh_socket_path);
             ocsf_emit!(event);
 
             tokio::spawn(async move {
                 let event_open = relay_open.clone();
                 match handle_relay_open(relay_open, &ssh_socket_path, netns_fd, channel, tx).await {
                     Ok(()) => {
-                        let event = relay_closed_event(
-                            openshell_ocsf::ctx::ctx(),
-                            &event_open,
-                            &ssh_socket_path,
-                        );
+                        let event_ctx = relay_context(openshell_ocsf::ctx::ctx(), &event_open);
+                        let event = relay_closed_event(&event_ctx, &event_open, &ssh_socket_path);
                         ocsf_emit!(event);
                     }
                     Err(e) => {
+                        let event_ctx = relay_context(openshell_ocsf::ctx::ctx(), &event_open);
                         let event = relay_failed_event(
-                            openshell_ocsf::ctx::ctx(),
+                            &event_ctx,
                             &event_open,
                             &ssh_socket_path,
                             &e.to_string(),
@@ -720,6 +737,7 @@ mod ocsf_event_tests {
         SandboxContext {
             sandbox_id: "sbx-1".into(),
             sandbox_name: "sandbox".into(),
+            org_id: None,
             container_image: "img".into(),
             hostname: "host".into(),
             product_version: "0.0.1".into(),
@@ -757,13 +775,17 @@ mod ocsf_event_tests {
     }
 
     fn ssh_relay_open(channel_id: &str) -> RelayOpen {
+        ssh_relay_open_for_org(channel_id, "")
+    }
+
+    fn ssh_relay_open_for_org(channel_id: &str, org_id: &str) -> RelayOpen {
         RelayOpen {
             channel_id: channel_id.to_string(),
             target: Some(relay_open::Target::Ssh(
                 openshell_core::proto::SshRelayTarget::default(),
             )),
             service_id: String::new(),
-            org_id: String::new(),
+            org_id: org_id.to_string(),
         }
     }
 
@@ -832,6 +854,39 @@ mod ocsf_event_tests {
             msg.contains("target=unix:/run/openshell/ssh.sock"),
             "message: {msg}"
         );
+    }
+
+    #[test]
+    fn relay_open_event_includes_org_id_when_present() {
+        let open = ssh_relay_open_for_org("ch-42", "org.alpha-1");
+        let base_ctx = ctx();
+        let event_ctx = relay_context(&base_ctx, &open);
+        let event = relay_open_event(&event_ctx, &open, ssh_socket_path());
+        let na = network_activity(&event);
+
+        let msg = na.base.message.as_deref().unwrap_or_default();
+        assert!(msg.contains("org_id=org.alpha-1"), "message: {msg}");
+        assert_eq!(
+            na.base
+                .unmapped
+                .as_ref()
+                .and_then(|value| value.get("org_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("org.alpha-1")
+        );
+    }
+
+    #[test]
+    fn relay_open_event_omits_empty_org_id() {
+        let open = ssh_relay_open("ch-42");
+        let base_ctx = ctx();
+        let event_ctx = relay_context(&base_ctx, &open);
+        let event = relay_open_event(&event_ctx, &open, ssh_socket_path());
+        let na = network_activity(&event);
+
+        let msg = na.base.message.as_deref().unwrap_or_default();
+        assert!(!msg.contains("org_id="), "message: {msg}");
+        assert!(na.base.unmapped.is_none());
     }
 
     #[test]
