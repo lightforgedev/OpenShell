@@ -8,8 +8,9 @@ keywords: "OpenShell, Nested Sandbox, Tracker, Multi Tenant"
 position: 5
 ---
 
-Nested organization sandbox mode is not implemented.
-This tracker lists the required changes before multiple customer organizations can safely share one outer container.
+Full nested organization sandbox mode is not implemented.
+The first runtime slice adds optional org identity to existing exec/SSH/TCP relay control paths, but it does not create nested per-org boundaries.
+This tracker lists the remaining changes before multiple customer organizations can safely share one outer container.
 Rows marked `done` are local spike evidence only unless they link to CI artifacts.
 
 ## Tracker
@@ -20,8 +21,9 @@ Rows marked `done` are local spike evidence only unless they link to CI artifact
 | done | Supervisor-managed exec user | `openshell sandbox exec --user <name>` runs a command as a non-root sandbox OS user. |
 | done | Local pooled-container smoke | Local spike showed separate org containers in one Docker host can be isolated by separate networks; shared networks leak reachability. |
 | done | Real OpenShell sibling marker smoke | Local spike showed two gateway-managed sandboxes did not expose Org B's in-sandbox marker through Org B's Docker container IP. This is one negative reachability check, not general sibling isolation. |
-| pending | Org identity contract | Define gateway-minted immutable `org_id`; never trust labels, client input, or in-sandbox state as the org source. Propagate it through sandbox context, policy input, cache keys, OCSF/logs, relay/session metadata, and denial/activity aggregation. |
-| pending | Nested org API/relay routing | Add org target to nested lifecycle, exec, SSH, TCP forward, and supervisor relay paths. Existing `run_as_user` remains per-agent only. |
+| done | Org identity API/relay foundation | Optional `org_id` is validated on exec/SSH/TCP forward requests, propagated to `RelayOpen`, persisted on SSH sessions, returned in create-session responses, and enforced on SSH forward-token validation. Empty `org_id` preserves legacy sandbox-level behavior. |
+| pending | Org identity contract | Define gateway-minted immutable `org_id`; never trust labels, client input, or in-sandbox state as the org source. Propagate it through sandbox context, nested lifecycle, policy input, cache keys, OCSF/logs, denial/activity aggregation, and audit persistence. |
+| pending | Nested org API/relay routing | Add org target to nested lifecycle and supervisor runtime selection. Existing `run_as_user` remains per-agent only. |
 | pending | Nested org runtime manager | Add an outer-supervisor manager that owns per-org runtime contexts and crash cleanup. Context includes org netns, proxy, OPA, identity cache, policy-local state, provider state, mount/root, PID/proc boundary, IPC/keyring mode, cgroup, and sockets. |
 | pending | Per-org user namespace or UID range contract | Use per-org user namespaces and uid/gid maps, or globally disjoint UID/GID ranges, so same numeric UID in two orgs is not the same kernel principal. |
 | pending | Per-org netns allocator | Support multiple inner netns instances with unique names, veth names, CIDRs, proxy bind addresses, and cleanup. |
@@ -41,8 +43,8 @@ Rows marked `done` are local spike evidence only unless they link to CI artifact
 
 | File/area | Constraint | Work item |
 |---|---|---|
-| `proto/openshell.proto` | Sandbox lifecycle, exec, SSH, TCP forward, supervisor hello, and relay messages identify only `sandbox_id`. | Add nested org contract; validate `org_id` on every nested operation. |
-| `openshell-server/src/supervisor_session.rs` | One supervisor session and pending relay pool per sandbox. | Route relay open/claim by `sandbox_id + org_id` or carry org in relay target. |
+| `proto/openshell.proto` | Exec, SSH, TCP forward, and relay messages now carry optional `org_id`; sandbox lifecycle and supervisor hello remain sandbox-scoped. | Add nested lifecycle contract and gateway-minted org identity. |
+| `openshell-server/src/supervisor_session.rs` | `RelayOpen` carries `org_id`, but there is still one supervisor session and pending relay pool per sandbox. | Route relay claim to an org runtime context once nested runtime manager exists. |
 | `openshell-supervisor-process/src/netns/mod.rs` | One fixed-CIDR netns per sandbox. | Add per-org CIDR/IP allocator and cleanup. |
 | `openshell-supervisor-process/src/process.rs` | One netns fd and hardcoded proxy URL `10.200.0.1`; mount namespace only hides supervisor identity socket. | Add org launch context with org proxy URL, mount/root, cgroup, and provider env. |
 | `openshell-supervisor-network/src/run.rs` | One proxy, OPA, policy-local context, provider state, binary cache, and entrypoint PID. | Instantiate these per org. |
@@ -67,3 +69,13 @@ Rows marked `done` are local spike evidence only unless they link to CI artifact
 
 Prefer pooled hosts with separate org containers.
 Revisit nested org mode only after the tracker items above have Linux evidence.
+
+## 2026-07-06 Runtime Slice
+
+| Item | Result |
+|---|---|
+| Branch | `hugo/nested-org-runtime-slice` |
+| Implemented | Optional `org_id` on `CreateSshSessionRequest`, `CreateSshSessionResponse`, `ExecSandboxRequest`, `TcpForwardInit`, `SshSession`, and `RelayOpen`. |
+| Enforcement | Invalid `org_id` is rejected; SSH forward token validation requires matching `sandbox_id + org_id`; empty org remains legacy-compatible. |
+| Not implemented | Gateway-minted immutable org identity, nested lifecycle, per-org runtime manager, policy/audit org attribution, and kernel-backed org boundaries. |
+| Linux validation | `cargo test -p openshell-server validate_exec_request --lib`, `cargo test -p openshell-server tcp_forward_init --lib`, and `cargo test -p openshell-server create_ssh_session_persists_org_id --lib` passed inside `rust:latest` with Debian `libz3-dev`. |

@@ -3078,6 +3078,7 @@ async fn create_forward_session_token(
     let response = client
         .create_ssh_session(CreateSshSessionRequest {
             sandbox_id: sandbox_id.to_string(),
+            org_id: String::new(),
         })
         .await
         .map_err(ForwardTcpConnectionError::from_status)?;
@@ -3189,6 +3190,7 @@ async fn forward_one_tcp_connection(
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
             TcpForwardInit {
                 sandbox_id,
+                org_id: String::new(),
                 service_id,
                 target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
                     host: target_host,
