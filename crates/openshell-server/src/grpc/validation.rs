@@ -93,7 +93,7 @@ pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(
     Ok(())
 }
 
-pub(super) fn validate_optional_org_id(org_id: &str) -> Result<(), Status> {
+pub(crate) fn validate_optional_org_id(org_id: &str) -> Result<(), Status> {
     if org_id.is_empty() {
         return Ok(());
     }

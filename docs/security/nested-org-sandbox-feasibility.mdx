@@ -28,6 +28,7 @@ This document is a design posture, not a runtime guard; OpenShell has org identi
 | Org identity API foundation | Implemented: optional `org_id` on exec, SSH session, TCP forward, persisted SSH session, and `RelayOpen`; invalid values reject; SSH forward tokens are bound to `sandbox_id + org_id`. |
 | Relay OCSF attribution | Implemented: relay open/closed/failed events emit non-empty `RelayOpen.org_id` as `unmapped.org_id`; empty `org_id` preserves legacy event shape. |
 | Binary identity cache scope | Implemented: `BinaryIdentityCache` can key by org/root/path for future nested org mode; live proxy callers still use the legacy scope. |
+| Relay org-id boundary validation | Implemented: relay registry rejects invalid org ids before pending relay state or `RelayOpen` emission. |
 | Legacy behavior | Preserved: empty `org_id` selects the existing sandbox-level runtime. |
 | Runtime isolation | Not implemented: no per-org netns, mount/root, PID/proc, IPC/keyring, cgroup, proxy/OPA/cache, credential, or lifecycle boundary exists yet. |
 | Trust source | Not implemented: `org_id` is currently a validated request/control field, not yet gateway-minted immutable identity. |

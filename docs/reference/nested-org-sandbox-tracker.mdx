@@ -25,6 +25,7 @@ Rows marked `done` are local spike evidence only unless they link to CI artifact
 | done | Org identity API/relay foundation | Optional `org_id` is validated on exec/SSH/TCP forward requests, propagated to `RelayOpen`, persisted on SSH sessions, returned in create-session responses, and enforced on SSH forward-token validation. Empty `org_id` preserves legacy sandbox-level behavior. |
 | done | Relay OCSF org attribution | Relay open/closed/failed events clone the base sandbox context with `RelayOpen.org_id` and emit it as `unmapped.org_id`; empty `org_id` keeps legacy event shape. |
 | done | Binary identity cache scope API | `BinaryIdentityCache` supports explicit org/root cache scope so the same binary path can be isolated across future nested org roots; current proxy callers still use the legacy sandbox scope. |
+| done | Relay org-id boundary validation | `SupervisorSessionRegistry::open_relay_with_target` rejects invalid org ids before pending relay insertion or `RelayOpen` emission, protecting future internal callers. |
 | pending | Org identity contract | Define gateway-minted immutable `org_id`; never trust labels, client input, or in-sandbox state as the org source. Propagate it through nested lifecycle, policy input, cache keys, denial/activity aggregation, and audit persistence. |
 | pending | Nested org API/relay routing | Add org target to nested lifecycle and supervisor runtime selection. Existing `run_as_user` remains per-agent only. |
 | pending | Nested org runtime manager | Add an outer-supervisor manager that owns per-org runtime contexts and crash cleanup. Context includes org netns, proxy, OPA, identity cache, policy-local state, provider state, mount/root, PID/proc boundary, IPC/keyring mode, cgroup, and sockets. |
@@ -47,7 +48,7 @@ Rows marked `done` are local spike evidence only unless they link to CI artifact
 | File/area | Constraint | Work item |
 |---|---|---|
 | `proto/openshell.proto` | Exec, SSH, TCP forward, and relay messages now carry optional `org_id`; sandbox lifecycle and supervisor hello remain sandbox-scoped. | Add nested lifecycle contract and gateway-minted org identity. |
-| `openshell-server/src/supervisor_session.rs` | `RelayOpen` carries `org_id`, but there is still one supervisor session and pending relay pool per sandbox. | Route relay claim to an org runtime context once nested runtime manager exists. |
+| `openshell-server/src/supervisor_session.rs` | `RelayOpen` carries validated `org_id`, but there is still one supervisor session and pending relay pool per sandbox. | Route relay claim to an org runtime context once nested runtime manager exists. |
 | `openshell-supervisor-process/src/netns/mod.rs` | One fixed-CIDR netns per sandbox. | Add per-org CIDR/IP allocator and cleanup. |
 | `openshell-supervisor-process/src/process.rs` | One netns fd and hardcoded proxy URL `10.200.0.1`; mount namespace only hides supervisor identity socket. | Add org launch context with org proxy URL, mount/root, cgroup, and provider env. |
 | `openshell-supervisor-network/src/run.rs` | One proxy, OPA, policy-local context, provider state, binary cache, and entrypoint PID. | Instantiate these per org. |
@@ -100,3 +101,12 @@ Revisit nested org mode only after the tracker items above have Linux evidence.
 | Implemented | `BinaryIdentityScope` and scoped cache keys for `BinaryIdentityCache`; legacy `verify_or_cache(path)` still maps to the default sandbox scope. |
 | Not implemented | Live proxy org/root scope wiring, per-org proxy/cache ownership, and fail-closed runtime checks for missing org/root identity remain pending. |
 | Validation | Built/tested inside `openshell/ci:dev`: `cargo test --locked -p openshell-supervisor-network identity --lib` and `cargo check --locked -p openshell-supervisor-network` passed. |
+
+## 2026-07-06 Relay Org Validation Slice
+
+| Item | Result |
+|---|---|
+| Branch | `hugo/nested-org-relay-org-validation` |
+| Implemented | Reused the existing org-id validator at `SupervisorSessionRegistry::open_relay_with_target`; invalid org ids fail before pending relay state or `RelayOpen` emission. |
+| Not implemented | Gateway-minted org identity and org runtime routing remain pending. |
+| Validation | Built/tested inside `openshell/ci:dev`: `cargo test --locked -p openshell-server open_relay_for_org_rejects_invalid_org_id_before_pending_insert --lib`, `cargo test --locked -p openshell-server validate_exec_request_rejects_invalid_org_id --lib`, and `cargo check --locked -p openshell-server` passed. |
