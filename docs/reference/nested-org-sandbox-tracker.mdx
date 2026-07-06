@@ -24,6 +24,7 @@ Rows marked `done` are local spike evidence only unless they link to CI artifact
 | done | Real OpenShell sibling marker smoke | Local spike showed two gateway-managed sandboxes did not expose Org B's in-sandbox marker through Org B's Docker container IP. This is one negative reachability check, not general sibling isolation. |
 | done | Org identity API/relay foundation | Optional `org_id` is validated on exec/SSH/TCP forward requests, propagated to `RelayOpen`, persisted on SSH sessions, returned in create-session responses, and enforced on SSH forward-token validation. Empty `org_id` preserves legacy sandbox-level behavior. |
 | done | Relay OCSF org attribution | Relay open/closed/failed events clone the base sandbox context with `RelayOpen.org_id` and emit it as `unmapped.org_id`; empty `org_id` keeps legacy event shape. |
+| done | Binary identity cache scope API | `BinaryIdentityCache` supports explicit org/root cache scope so the same binary path can be isolated across future nested org roots; current proxy callers still use the legacy sandbox scope. |
 | pending | Org identity contract | Define gateway-minted immutable `org_id`; never trust labels, client input, or in-sandbox state as the org source. Propagate it through nested lifecycle, policy input, cache keys, denial/activity aggregation, and audit persistence. |
 | pending | Nested org API/relay routing | Add org target to nested lifecycle and supervisor runtime selection. Existing `run_as_user` remains per-agent only. |
 | pending | Nested org runtime manager | Add an outer-supervisor manager that owns per-org runtime contexts and crash cleanup. Context includes org netns, proxy, OPA, identity cache, policy-local state, provider state, mount/root, PID/proc boundary, IPC/keyring mode, cgroup, and sockets. |
@@ -50,7 +51,7 @@ Rows marked `done` are local spike evidence only unless they link to CI artifact
 | `openshell-supervisor-process/src/netns/mod.rs` | One fixed-CIDR netns per sandbox. | Add per-org CIDR/IP allocator and cleanup. |
 | `openshell-supervisor-process/src/process.rs` | One netns fd and hardcoded proxy URL `10.200.0.1`; mount namespace only hides supervisor identity socket. | Add org launch context with org proxy URL, mount/root, cgroup, and provider env. |
 | `openshell-supervisor-network/src/run.rs` | One proxy, OPA, policy-local context, provider state, binary cache, and entrypoint PID. | Instantiate these per org. |
-| `openshell-supervisor-network/src/identity.rs` | Binary identity TOFU cache key is executable path only. | Use per-org cache or key by org/root/path. |
+| `openshell-supervisor-network/src/identity.rs` | Binary identity TOFU cache supports `org_id + root_id + path` key scope, but current proxy callers still use the legacy sandbox scope because no org runtime context reaches the proxy yet. | Wire runtime org/root scope into proxy identity resolution once nested runtime manager exists. |
 | `openshell-core/src/provider_credentials.rs` | Credential resolver generations are sandbox-scoped. | Split provider credentials by org. |
 | `openshell-ocsf/src/ctx.rs` | OCSF context is one process-wide sandbox context; relay events can clone it with per-event `org_id` in `unmapped`. | Extend this pattern to policy, denial/activity aggregation, and persistent audit once org runtime context exists. |
 | Docker driver | Local containers have namespace setup capabilities; Fly capability set is unknown. | Add capability probe; nested mode refuses to start when userns/netns/mount/cgroup prerequisites are missing. |
@@ -90,3 +91,12 @@ Revisit nested org mode only after the tracker items above have Linux evidence.
 | Implemented | `SandboxContext` carries optional `org_id`; common OCSF fields emit non-empty org ids as `unmapped.org_id`; relay open/closed/failed events derive a per-relay context from `RelayOpen.org_id`; relay messages include `org_id=...` only when present. |
 | Not implemented | Network proxy policy input, OPA generation, binary identity cache keys, denial/activity aggregation, persistent audit rows, and nested runtime routing remain pending. |
 | Validation | Built/tested inside `openshell/ci:dev`: `cargo test --locked -p openshell-ocsf common_fields --lib`, `cargo test --locked -p openshell-supervisor-process relay_open_event --lib`, `cargo test --locked -p openshell-supervisor-process relay --lib`, and `cargo check --locked -p openshell-server -p openshell-sandbox -p openshell-supervisor-process -p openshell-ocsf` passed. |
+
+## 2026-07-06 Identity Cache Scope Slice
+
+| Item | Result |
+|---|---|
+| Branch | `hugo/nested-org-identity-cache-scope` |
+| Implemented | `BinaryIdentityScope` and scoped cache keys for `BinaryIdentityCache`; legacy `verify_or_cache(path)` still maps to the default sandbox scope. |
+| Not implemented | Live proxy org/root scope wiring, per-org proxy/cache ownership, and fail-closed runtime checks for missing org/root identity remain pending. |
+| Validation | Built/tested inside `openshell/ci:dev`: `cargo test --locked -p openshell-supervisor-network identity --lib` and `cargo check --locked -p openshell-supervisor-network` passed. |
