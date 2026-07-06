@@ -73,10 +73,49 @@ struct CachedBinary {
     fingerprint: FileFingerprint,
 }
 
+/// Scope for binary TOFU cache entries.
+///
+/// Current single-sandbox mode uses [`BinaryIdentityScope::legacy`]. Nested org
+/// mode must use a scope derived from gateway-minted org identity plus the org
+/// root identity so the same path in different org roots cannot collide.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub struct BinaryIdentityScope {
+    org_id: Option<String>,
+    root_id: Option<String>,
+}
+
+impl BinaryIdentityScope {
+    pub fn legacy() -> Self {
+        Self::default()
+    }
+
+    pub fn org_root(org_id: impl Into<String>, root_id: impl Into<String>) -> Self {
+        Self {
+            org_id: Some(org_id.into()),
+            root_id: Some(root_id.into()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct BinaryIdentityKey {
+    scope: BinaryIdentityScope,
+    path: PathBuf,
+}
+
+impl BinaryIdentityKey {
+    fn new(scope: &BinaryIdentityScope, path: &Path) -> Self {
+        Self {
+            scope: scope.clone(),
+            path: path.to_path_buf(),
+        }
+    }
+}
+
 /// Thread-safe cache of binary SHA256 hashes for TOFU enforcement.
 pub struct BinaryIdentityCache {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    hashes: Mutex<HashMap<PathBuf, CachedBinary>>,
+    hashes: Mutex<HashMap<BinaryIdentityKey, CachedBinary>>,
 }
 
 impl Default for BinaryIdentityCache {
@@ -100,10 +139,33 @@ impl BinaryIdentityCache {
     ///   Returns `Ok(hash)` if it matches, `Err` if the hash changed (binary tampered).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn verify_or_cache(&self, path: &Path) -> Result<String> {
-        self.verify_or_cache_with_hasher(path, procfs::file_sha256)
+        self.verify_or_cache_scoped(&BinaryIdentityScope::legacy(), path)
     }
 
-    fn verify_or_cache_with_hasher<F>(&self, path: &Path, mut hash_file: F) -> Result<String>
+    /// Verify or cache a binary in an explicit org/root scope.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn verify_or_cache_scoped(
+        &self,
+        scope: &BinaryIdentityScope,
+        path: &Path,
+    ) -> Result<String> {
+        self.verify_or_cache_scoped_with_hasher(scope, path, procfs::file_sha256)
+    }
+
+    #[cfg(test)]
+    fn verify_or_cache_with_hasher<F>(&self, path: &Path, hash_file: F) -> Result<String>
+    where
+        F: FnMut(&Path) -> Result<String>,
+    {
+        self.verify_or_cache_scoped_with_hasher(&BinaryIdentityScope::legacy(), path, hash_file)
+    }
+
+    fn verify_or_cache_scoped_with_hasher<F>(
+        &self,
+        scope: &BinaryIdentityScope,
+        path: &Path,
+        mut hash_file: F,
+    ) -> Result<String>
     where
         F: FnMut(&Path) -> Result<String>,
     {
@@ -111,28 +173,31 @@ impl BinaryIdentityCache {
         let metadata = std::fs::metadata(path)
             .map_err(|error| miette::miette!("Failed to stat {}: {error}", path.display()))?;
         let fingerprint = FileFingerprint::from_metadata(&metadata);
+        let key = BinaryIdentityKey::new(scope, path);
 
         let cached = self
             .hashes
             .lock()
             .map_err(|_| miette::miette!("Binary identity cache lock poisoned"))?
-            .get(path)
+            .get(&key)
             .cloned();
 
         if let Some(cached_binary) = &cached
             && cached_binary.fingerprint == fingerprint
         {
             debug!(
-                "      verify_or_cache: {}ms CACHE HIT path={}",
+                "      verify_or_cache: {}ms CACHE HIT scope={:?} path={}",
                 start.elapsed().as_millis(),
+                scope,
                 path.display()
             );
             return Ok(cached_binary.hash.clone());
         }
 
         debug!(
-            "      verify_or_cache: CACHE MISS size={} path={}",
+            "      verify_or_cache: CACHE MISS size={} scope={:?} path={}",
             metadata.len(),
+            scope,
             path.display()
         );
 
@@ -143,19 +208,20 @@ impl BinaryIdentityCache {
             .lock()
             .map_err(|_| miette::miette!("Binary identity cache lock poisoned"))?;
 
-        if let Some(existing) = hashes.get(path)
+        if let Some(existing) = hashes.get(&key)
             && existing.hash != current_hash
         {
             return Err(miette::miette!(
-                "Binary integrity violation: {} hash changed (cached: {}, current: {})",
+                "Binary integrity violation: {} hash changed in scope {:?} (cached: {}, current: {})",
                 path.display(),
+                scope,
                 existing.hash,
                 current_hash
             ));
         }
 
         hashes.insert(
-            path.to_path_buf(),
+            key,
             CachedBinary {
                 hash: current_hash.clone(),
                 fingerprint,
@@ -163,8 +229,9 @@ impl BinaryIdentityCache {
         );
 
         debug!(
-            "      verify_or_cache TOTAL (cold): {}ms path={}",
+            "      verify_or_cache TOTAL (cold): {}ms scope={:?} path={}",
             start.elapsed().as_millis(),
+            scope,
             path.display()
         );
 
@@ -226,6 +293,33 @@ mod tests {
 
         assert_eq!(hash1, hash2);
         assert_eq!(hash_calls, 1);
+    }
+
+    #[test]
+    fn scoped_cache_keys_do_not_collide_for_same_path() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"binary content").unwrap();
+        tmp.flush().unwrap();
+
+        let cache = BinaryIdentityCache::new();
+        let org_a = BinaryIdentityScope::org_root("org-a", "root-a");
+        let org_b = BinaryIdentityScope::org_root("org-b", "root-b");
+
+        let hash_a = cache
+            .verify_or_cache_scoped_with_hasher(&org_a, tmp.path(), |_| Ok("hash-a".to_string()))
+            .unwrap();
+        let hash_b = cache
+            .verify_or_cache_scoped_with_hasher(&org_b, tmp.path(), |_| Ok("hash-b".to_string()))
+            .unwrap();
+        let hash_a_again = cache
+            .verify_or_cache_scoped_with_hasher(&org_a, tmp.path(), |_| {
+                panic!("unchanged scoped fingerprint should hit cache")
+            })
+            .unwrap();
+
+        assert_eq!(hash_a, "hash-a");
+        assert_eq!(hash_b, "hash-b");
+        assert_eq!(hash_a_again, hash_a);
     }
 
     #[test]

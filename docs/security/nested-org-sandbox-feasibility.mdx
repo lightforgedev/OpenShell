@@ -27,6 +27,7 @@ This document is a design posture, not a runtime guard; OpenShell has org identi
 |---|---|
 | Org identity API foundation | Implemented: optional `org_id` on exec, SSH session, TCP forward, persisted SSH session, and `RelayOpen`; invalid values reject; SSH forward tokens are bound to `sandbox_id + org_id`. |
 | Relay OCSF attribution | Implemented: relay open/closed/failed events emit non-empty `RelayOpen.org_id` as `unmapped.org_id`; empty `org_id` preserves legacy event shape. |
+| Binary identity cache scope | Implemented: `BinaryIdentityCache` can key by org/root/path for future nested org mode; live proxy callers still use the legacy scope. |
 | Legacy behavior | Preserved: empty `org_id` selects the existing sandbox-level runtime. |
 | Runtime isolation | Not implemented: no per-org netns, mount/root, PID/proc, IPC/keyring, cgroup, proxy/OPA/cache, credential, or lifecycle boundary exists yet. |
 | Trust source | Not implemented: `org_id` is currently a validated request/control field, not yet gateway-minted immutable identity. |
@@ -64,7 +65,7 @@ This document is a design posture, not a runtime guard; OpenShell has org identi
 | Netns | `NetworkNamespace::create()` creates one netns with fixed `10.200.0.1/24` and `10.200.0.2/24`. | Add allocator for per-org namespace names, veth names, CIDRs, proxy bind addresses, nft rules, and cleanup. |
 | Process launch | `ProcessHandle::spawn` receives one netns fd and hardcodes proxy URL `http://10.200.0.1:<port>`. | Launch from an `OrgRuntimeContext` carrying org netns fd, proxy URL, mount/root, cgroup, provider env, and policy identity. |
 | Networking supervisor | `run_networking()` starts one proxy, OPA engine, policy-local context, binary identity cache, provider state, and entrypoint PID. | Prefer one proxy/OPA/cache/policy-local/provider state per org. Shared proxy mode must key every route, policy generation, cache, and event by org. |
-| Binary TOFU cache | `BinaryIdentityCache` is keyed by path only. | Use per-org caches or key by `org_id + root identity + path`; `/usr/bin/curl` in different org roots must not collide. |
+| Binary TOFU cache | `BinaryIdentityCache` supports scoped keys, but proxy identity resolution has no org/root runtime context yet and still uses the legacy scope. | Pass org/root scope from `OrgRuntimeContext`; `/usr/bin/curl` in different org roots must not collide. |
 | Provider credentials | `ProviderCredentialState`, metadata loopback, dynamic credentials, and policy polling are per sandbox. | Allocate them per org; never store org provider secrets in shared outer env or shared files. |
 | OCSF and aggregation | `SandboxContext` supports optional org attribution; relay events set it from `RelayOpen.org_id`. Denial/activity aggregation still flushes by sandbox name. | Extend org attribution to policy/audit/denial/activity persistence once runtime org context exists. |
 | Mount/root | Current mount namespace only hides a supervisor identity socket. | Add per-org root/work/tmp/run/dev-shm/proc/sys mount lifecycle and cleanup before Landlock/seccomp. |
