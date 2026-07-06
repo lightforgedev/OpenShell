@@ -78,4 +78,4 @@ Revisit nested org mode only after the tracker items above have Linux evidence.
 | Implemented | Optional `org_id` on `CreateSshSessionRequest`, `CreateSshSessionResponse`, `ExecSandboxRequest`, `TcpForwardInit`, `SshSession`, and `RelayOpen`. |
 | Enforcement | Invalid `org_id` is rejected; SSH forward token validation requires matching `sandbox_id + org_id`; empty org remains legacy-compatible. |
 | Not implemented | Gateway-minted immutable org identity, nested lifecycle, per-org runtime manager, policy/audit org attribution, and kernel-backed org boundaries. |
-| Linux validation | `cargo test -p openshell-server validate_exec_request --lib`, `cargo test -p openshell-server tcp_forward_init --lib`, and `cargo test -p openshell-server create_ssh_session_persists_org_id --lib` passed inside `rust:latest` with Debian `libz3-dev`. |
+| Linux validation | Built `openshell/ci:dev` from `deploy/docker/Dockerfile.ci`; inside that CI container, focused core/supervisor/server tests and `cargo check -p openshell-cli -p openshell-tui` passed on commit `2c3432a0`. |
