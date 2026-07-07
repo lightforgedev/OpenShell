@@ -33,6 +33,12 @@ log_level           = "info"
 compute_drivers     = ["docker"]
 disable_tls         = true
 
+[openshell.settings]
+# Container logs should surface warnings/findings, not every successful OCSF
+# activity event. JSONL export remains independently controlled by
+# ocsf_json_enabled for full-fidelity audit capture.
+ocsf_shorthand_min_severity = "medium"
+
 [openshell.drivers.docker]
 # Default image pulled for `openshell sandbox create` without --from.
 default_image     = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"

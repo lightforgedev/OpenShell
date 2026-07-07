@@ -3713,6 +3713,49 @@ fn upsert_setting_value(
     }
 }
 
+pub(crate) async fn seed_global_settings_from_config(
+    store: &Store,
+    configured: &BTreeMap<String, toml::Value>,
+) -> Result<(), Status> {
+    if configured.is_empty() {
+        return Ok(());
+    }
+
+    let mut global_settings = load_global_settings(store).await?;
+    let mut changed = false;
+    for (key, value) in configured {
+        let stored = toml_setting_to_stored(key, value)?;
+        changed |= upsert_setting_value(&mut global_settings.settings, key, stored);
+    }
+    if changed {
+        global_settings.revision = global_settings.revision.wrapping_add(1);
+        save_global_settings(store, &global_settings).await?;
+    }
+    Ok(())
+}
+
+fn toml_setting_to_stored(key: &str, value: &toml::Value) -> Result<StoredSettingValue, Status> {
+    let setting = validate_registered_setting_key(key)?;
+    match (setting.kind, value) {
+        (SettingValueKind::String, toml::Value::String(v)) => {
+            if let Err(allowed) = setting.validate_string_value(v) {
+                return Err(Status::invalid_argument(format!(
+                    "setting '{key}' expects one of [{}]; got '{}'",
+                    allowed.join(", "),
+                    v
+                )));
+            }
+            Ok(StoredSettingValue::String(v.clone()))
+        }
+        (SettingValueKind::Bool, toml::Value::Boolean(v)) => Ok(StoredSettingValue::Bool(*v)),
+        (SettingValueKind::Int, toml::Value::Integer(v)) => Ok(StoredSettingValue::Int(*v)),
+        (expected, _) => Err(Status::invalid_argument(format!(
+            "setting '{key}' expects {} value",
+            expected.as_str()
+        ))),
+    }
+}
+
 pub(super) async fn load_global_settings(store: &Store) -> Result<StoredSettings, Status> {
     load_settings_record(store, GLOBAL_SETTINGS_OBJECT_TYPE, GLOBAL_SETTINGS_NAME).await
 }
@@ -9408,6 +9451,43 @@ mod tests {
         let settings = load_global_settings(&store).await.unwrap();
         assert!(settings.settings.is_empty());
         assert_eq!(settings.revision, 0);
+    }
+
+    #[tokio::test]
+    async fn seed_global_settings_from_config_persists_registered_toml_settings() {
+        let store = test_store().await;
+        let configured = BTreeMap::from([(
+            settings::OCSF_SHORTHAND_MIN_SEVERITY_KEY.to_string(),
+            toml::Value::String("medium".to_string()),
+        )]);
+
+        seed_global_settings_from_config(&store, &configured)
+            .await
+            .unwrap();
+
+        let loaded = load_global_settings(&store).await.unwrap();
+        assert_eq!(
+            loaded
+                .settings
+                .get(settings::OCSF_SHORTHAND_MIN_SEVERITY_KEY),
+            Some(&StoredSettingValue::String("medium".to_string()))
+        );
+        assert_eq!(loaded.revision, 1);
+    }
+
+    #[tokio::test]
+    async fn seed_global_settings_from_config_rejects_unknown_setting() {
+        let store = test_store().await;
+        let configured = BTreeMap::from([(
+            "unknown".to_string(),
+            toml::Value::String("medium".to_string()),
+        )]);
+
+        let err = seed_global_settings_from_config(&store, &configured)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
     }
 
     #[tokio::test]

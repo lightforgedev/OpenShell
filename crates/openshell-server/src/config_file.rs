@@ -55,6 +55,14 @@ pub struct OpenShellRoot {
     #[serde(default)]
     pub gateway: GatewayFileSection,
 
+    /// Gateway-global runtime settings seeded on gateway startup.
+    ///
+    /// Values use the same registered settings model as `openshell settings
+    /// set --global`. Unknown keys or wrong value types are rejected at
+    /// startup so config typos fail closed.
+    #[serde(default)]
+    pub settings: BTreeMap<String, toml::Value>,
+
     /// `[openshell.drivers.<name>]` tables — passed verbatim to each driver
     /// crate's `Deserialize` impl after the gateway-side inheritance merge.
     /// Stored as raw [`toml::Value`] so each driver can evolve its schema
