@@ -308,6 +308,7 @@ async fn proxy_to_endpoint(
         .supervisor_sessions
         .open_relay_with_target(
             sandbox.object_id(),
+            "",
             relay_open::Target::Tcp(TcpRelayTarget {
                 host: RELAY_TARGET_HOST.to_string(),
                 port: u32::from(target_port),

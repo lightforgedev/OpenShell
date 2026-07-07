@@ -539,6 +539,9 @@ message DeleteSandboxResponse {
 message CreateSshSessionRequest {
   // Sandbox id.
   string sandbox_id = 1;
+  // Optional nested organization runtime id. Empty selects the legacy
+  // sandbox-level runtime.
+  string org_id = 2;
 }
 
 // Create SSH session response.
@@ -551,6 +554,10 @@ message CreateSshSessionRequest {
 message CreateSshSessionResponse {
   // Sandbox id. [A-Za-z0-9._-]{1,128}.
   string sandbox_id = 1;
+
+  // Optional nested organization runtime id. Empty selects the legacy
+  // sandbox-level runtime.
+  string org_id = 9;
 
   // Session token for the gateway tunnel. URL-safe ASCII
   // ([A-Za-z0-9._~+/=-]) up to 4096 bytes. No shell metacharacters or
@@ -689,6 +696,10 @@ message ExecSandboxRequest {
 
   // Optional OS user for this exec. Empty uses the sandbox policy user.
   string run_as_user = 10;
+
+  // Optional nested organization runtime id. Empty selects the legacy
+  // sandbox-level runtime.
+  string org_id = 11;
 }
 
 // One stdout chunk from a sandbox exec.
@@ -719,6 +730,9 @@ message ExecSandboxEvent {
 message TcpForwardInit {
   // Sandbox id.
   string sandbox_id = 1;
+  // Optional nested organization runtime id. Empty selects the legacy
+  // sandbox-level runtime.
+  string org_id = 2;
   // Optional service identifier for audit/correlation.
   string service_id = 4;
   // Target the gateway should request from the supervisor.
@@ -775,6 +789,10 @@ message SshSession {
 
   // Revoked flag.
   bool revoked = 5;
+
+  // Optional nested organization runtime id this session is bound to. Empty
+  // selects the legacy sandbox-level runtime.
+  string org_id = 6;
 }
 
 // Watch sandbox request.
@@ -1472,6 +1490,9 @@ message RelayOpen {
   }
   // Optional service identifier for audit/correlation.
   string service_id = 5;
+  // Optional nested organization runtime id. Empty selects the legacy
+  // sandbox-level runtime.
+  string org_id = 6;
 }
 
 // Built-in SSH relay target.
