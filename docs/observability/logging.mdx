@@ -40,6 +40,23 @@ In the log file, OCSF events appear in a shorthand format with an `OCSF` level l
 
 The `OCSF` label at column 25 distinguishes structured events from standard `INFO` tracing at the same position. Both formats appear in the same file.
 
+## Shorthand Severity Threshold
+
+The shorthand OCSF layer emits every OCSF event when `ocsf_shorthand_min_severity` is unset. Set the runtime setting to reduce container-log noise without changing enforcement or JSONL audit capture:
+
+```shell
+openshell settings set --global --key ocsf_shorthand_min_severity --value medium
+```
+
+Allowed values are `informational`, `low`, `medium`, `high`, `critical`, and `fatal`. The setting can be global or per-sandbox and takes effect on the next settings poll cycle; no sandbox restart is required. Gateway TOML can seed the global default:
+
+```toml
+[openshell.settings]
+ocsf_shorthand_min_severity = "medium"
+```
+
+With `medium`, routine successful OCSF events such as `HTTP:POST [INFO]` are suppressed from shorthand logs, while denials and findings remain visible.
+
 When viewed through the CLI or TUI, which receive logs through gRPC, the same distinction applies:
 
 ```text
@@ -219,6 +236,10 @@ OCSF CONFIG:OTHER [MED] Skipping inaccessible Landlock path (best-effort) [path:
 ```
 
 Set `landlock.compatibility` to `hard_requirement` in the policy to make these failures fatal instead of degraded.
+
+## Known Issues
+
+When the supervisor cannot read `/proc/<pid>/root/<binary>` for symlink resolution, binary policy matching falls back to the literal process path and emits a warning. If a policy names a symlink such as `/usr/bin/python3`, either use the canonical target path in policy or run the supervisor with the capability needed to read the process root, such as `CAP_SYS_PTRACE` in Linux container deployments.
 
 ## Log File Location
 

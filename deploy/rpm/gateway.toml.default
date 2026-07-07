@@ -28,3 +28,8 @@ bind_address = "0.0.0.0:17670"
 # in order: Kubernetes, Podman, Docker. Pinning prevents unexpected driver
 # selection if Docker is also installed on the host.
 compute_drivers = ["podman"]
+
+[openshell.settings]
+# Keep user-service/container logs focused on warnings and findings. JSONL
+# audit export remains controlled separately by ocsf_json_enabled.
+ocsf_shorthand_min_severity = "medium"

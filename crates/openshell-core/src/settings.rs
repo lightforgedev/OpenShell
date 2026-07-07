@@ -76,6 +76,23 @@ impl RegisteredSetting {
 /// 5. Add a unit test in this module's `tests` section to cover the new key.
 pub const PROVIDERS_V2_ENABLED_KEY: &str = "providers_v2_enabled";
 
+/// Minimum OCSF severity rendered by the shorthand log layer.
+///
+/// Defaults to `informational` when unset. Operators commonly set this to
+/// `medium` for container logs while leaving JSONL export available for full
+/// fidelity audit capture.
+pub const OCSF_SHORTHAND_MIN_SEVERITY_KEY: &str = "ocsf_shorthand_min_severity";
+
+/// Allowed values for [`OCSF_SHORTHAND_MIN_SEVERITY_KEY`].
+pub const OCSF_SHORTHAND_MIN_SEVERITY_VALUES: &[&str] = &[
+    "informational",
+    "low",
+    "medium",
+    "high",
+    "critical",
+    "fatal",
+];
+
 /// Sandbox-level opt-in for the agent-driven policy proposal surface.
 ///
 /// When true, the supervisor installs the `policy_advisor` skill, serves
@@ -123,6 +140,13 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
         kind: SettingValueKind::Bool,
         allowed_string_values: None,
     },
+    // Minimum severity emitted by the human-readable OCSF shorthand log.
+    // Defaults to informational when unset.
+    RegisteredSetting {
+        key: OCSF_SHORTHAND_MIN_SEVERITY_KEY,
+        kind: SettingValueKind::String,
+        allowed_string_values: Some(OCSF_SHORTHAND_MIN_SEVERITY_VALUES),
+    },
     // Sandbox-level opt-in for the agent-driven policy proposal surface.
     // See AGENT_POLICY_PROPOSALS_ENABLED_KEY for details. Defaults to false.
     RegisteredSetting {
@@ -168,6 +192,7 @@ pub fn parse_bool_like(raw: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
+        OCSF_SHORTHAND_MIN_SEVERITY_KEY, OCSF_SHORTHAND_MIN_SEVERITY_VALUES,
         PROPOSAL_APPROVAL_MODE_KEY, PROPOSAL_APPROVAL_MODE_VALUES, PROVIDERS_V2_ENABLED_KEY,
         REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind, parse_bool_like,
         registered_keys_csv, setting_for_key,
@@ -234,6 +259,26 @@ mod tests {
                 .expect_err(&format!("expected '{bad}' to be rejected"));
             // Caller gets the allowed slice back for diagnostics.
             assert_eq!(err, PROPOSAL_APPROVAL_MODE_VALUES);
+        }
+    }
+
+    #[test]
+    fn ocsf_shorthand_min_severity_accepts_canonical_values_only() {
+        let setting = setting_for_key(OCSF_SHORTHAND_MIN_SEVERITY_KEY)
+            .expect("ocsf_shorthand_min_severity should be registered");
+        assert_eq!(setting.kind, SettingValueKind::String);
+        assert_eq!(
+            setting.allowed_string_values,
+            Some(OCSF_SHORTHAND_MIN_SEVERITY_VALUES)
+        );
+        for value in OCSF_SHORTHAND_MIN_SEVERITY_VALUES {
+            assert!(setting.validate_string_value(value).is_ok());
+        }
+        for bad in ["info", "med", "warn", "3", "Medium", ""] {
+            let err = setting
+                .validate_string_value(bad)
+                .expect_err(&format!("expected '{bad}' to be rejected"));
+            assert_eq!(err, OCSF_SHORTHAND_MIN_SEVERITY_VALUES);
         }
     }
 

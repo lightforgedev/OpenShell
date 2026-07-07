@@ -31,7 +31,7 @@ Package-managed gateways do not require a TOML file. Create one at the package's
 
 ## Layout
 
-The file is rooted at `[openshell]`. Gateway-wide settings live under `[openshell.gateway]`. Each compute driver owns its own `[openshell.drivers.<name>]` table. Shared keys set at gateway scope are inherited into driver tables when not overridden.
+The file is rooted at `[openshell]`. Gateway-wide process settings live under `[openshell.gateway]`. Runtime settings seeded into the gateway settings store live under `[openshell.settings]`. Each compute driver owns its own `[openshell.drivers.<name>]` table. Shared keys set at gateway scope are inherited into driver tables when not overridden.
 
 ```toml
 [openshell]
@@ -45,6 +45,9 @@ version = 1
 
 [openshell.gateway.oidc]
 # ... JWT bearer auth ...
+
+[openshell.settings]
+# ... global runtime settings ...
 
 [openshell.drivers.kubernetes]
 # ... driver-specific settings ...
@@ -132,6 +135,12 @@ roles_claim   = "realm_access.roles"
 admin_role    = "openshell-admin"
 user_role     = "openshell-user"
 scopes_claim  = ""
+
+[openshell.settings]
+# Suppress routine successful OCSF shorthand events in container logs while
+# keeping denials/findings visible. Full JSONL export is controlled separately
+# by ocsf_json_enabled.
+ocsf_shorthand_min_severity = "medium"
 ```
 
 Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to authenticate CLI callers from verified client certificates. Kubernetes deployments must leave this unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
@@ -141,6 +150,8 @@ Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
 `image_pull_policy` is intentionally not a shared gateway key. Kubernetes and Docker use `Always`, `IfNotPresent`, or `Never`. Podman uses `always`, `missing`, `never`, or `newer`. Set it inside the relevant driver table.
+
+`[openshell.settings]` accepts registered runtime setting keys and seeds them as global settings at gateway startup. Unknown keys and wrong TOML value types are rejected during startup. These settings use the same validation and precedence as `openshell settings set --global`: gateway-global values override sandbox-scoped values.
 
 ## Driver References
 

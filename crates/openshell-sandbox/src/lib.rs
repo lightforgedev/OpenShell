@@ -16,7 +16,7 @@ mod metadata_server;
 use miette::Result;
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU8, AtomicU32};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -95,6 +95,7 @@ pub async fn run_sandbox(
     _health_port: u16,
     inference_routes: Option<String>,
     ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
+    ocsf_min_severity: Arc<AtomicU8>,
     network_enabled: bool,
     process_enabled: bool,
 ) -> Result<i32> {
@@ -407,6 +408,7 @@ pub async fn run_sandbox(
         let poll_endpoint = endpoint.to_string();
         let poll_engine = engine.clone();
         let poll_ocsf_enabled = ocsf_enabled.clone();
+        let poll_ocsf_min_severity = ocsf_min_severity.clone();
         let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
         let poll_policy_local = networking.as_ref().map(|n| n.policy_local_ctx.clone());
@@ -421,6 +423,7 @@ pub async fn run_sandbox(
             entrypoint_pid: poll_pid,
             interval_secs: poll_interval_secs,
             ocsf_enabled: poll_ocsf_enabled,
+            ocsf_min_severity: poll_ocsf_min_severity,
             provider_credentials: poll_provider_credentials,
             policy_local_ctx: poll_policy_local,
         };
@@ -1613,6 +1616,7 @@ struct PolicyPollLoopContext {
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
+    ocsf_min_severity: Arc<AtomicU8>,
     provider_credentials: ProviderCredentialState,
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
 }
@@ -1635,6 +1639,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     match client.poll_settings(&ctx.sandbox_id).await {
         Ok(result) => {
             apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+            apply_ocsf_shorthand_min_severity_setting(&ctx.ocsf_min_severity, &result.settings);
             current_config_revision = result.config_revision;
             current_policy_hash = result.policy_hash.clone();
             current_settings = result.settings;
@@ -1812,6 +1817,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
 
         // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
         apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+        apply_ocsf_shorthand_min_severity_setting(&ctx.ocsf_min_severity, &result.settings);
 
         // Apply the agent-proposals feature toggle. On a false→true transition
         // we lazily install the skill so a sandbox that started with the flag
@@ -1866,6 +1872,27 @@ fn apply_ocsf_json_setting(
     }
 }
 
+fn apply_ocsf_shorthand_min_severity_setting(
+    min_severity: &AtomicU8,
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+) {
+    use std::sync::atomic::Ordering;
+
+    let new_rank = extract_string_setting(
+        settings,
+        openshell_core::settings::OCSF_SHORTHAND_MIN_SEVERITY_KEY,
+    )
+    .and_then(ocsf_shorthand_severity_rank)
+    .unwrap_or_else(|| openshell_ocsf::severity_rank(SeverityId::Informational));
+    let prev_rank = min_severity.swap(new_rank, Ordering::Relaxed);
+    if new_rank != prev_rank {
+        info!(
+            ocsf_shorthand_min_severity = new_rank,
+            "OCSF shorthand minimum severity toggled"
+        );
+    }
+}
+
 /// Extract a bool value from an effective setting, if present.
 fn extract_bool_setting(
     settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
@@ -1880,6 +1907,33 @@ fn extract_bool_setting(
             setting_value::Value::BoolValue(b) => Some(*b),
             _ => None,
         })
+}
+
+fn extract_string_setting(
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    key: &str,
+) -> Option<String> {
+    use openshell_core::proto::setting_value;
+    settings
+        .get(key)
+        .and_then(|es| es.value.as_ref())
+        .and_then(|sv| sv.value.as_ref())
+        .and_then(|v| match v {
+            setting_value::Value::StringValue(s) => Some(s.clone()),
+            _ => None,
+        })
+}
+
+fn ocsf_shorthand_severity_rank(value: String) -> Option<u8> {
+    match value.as_str() {
+        "informational" => Some(openshell_ocsf::severity_rank(SeverityId::Informational)),
+        "low" => Some(openshell_ocsf::severity_rank(SeverityId::Low)),
+        "medium" => Some(openshell_ocsf::severity_rank(SeverityId::Medium)),
+        "high" => Some(openshell_ocsf::severity_rank(SeverityId::High)),
+        "critical" => Some(openshell_ocsf::severity_rank(SeverityId::Critical)),
+        "fatal" => Some(openshell_ocsf::severity_rank(SeverityId::Fatal)),
+        _ => None,
+    }
 }
 
 /// Log individual setting changes between two snapshots.
@@ -1973,6 +2027,17 @@ mod tests {
         }
     }
 
+    fn effective_string(value: &str) -> openshell_core::proto::EffectiveSetting {
+        openshell_core::proto::EffectiveSetting {
+            value: Some(openshell_core::proto::SettingValue {
+                value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                    value.to_string(),
+                )),
+            }),
+            scope: openshell_core::proto::SettingScope::Global.into(),
+        }
+    }
+
     #[test]
     fn apply_ocsf_json_setting_enables_from_initial_settings_snapshot() {
         let enabled = AtomicBool::new(false);
@@ -1992,6 +2057,36 @@ mod tests {
         apply_ocsf_json_setting(&enabled, &settings);
 
         assert!(!enabled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn apply_ocsf_shorthand_min_severity_uses_settings_snapshot() {
+        let min_severity = AtomicU8::new(openshell_ocsf::severity_rank(SeverityId::Informational));
+        let mut settings = std::collections::HashMap::new();
+        settings.insert(
+            openshell_core::settings::OCSF_SHORTHAND_MIN_SEVERITY_KEY.to_string(),
+            effective_string("medium"),
+        );
+
+        apply_ocsf_shorthand_min_severity_setting(&min_severity, &settings);
+
+        assert_eq!(
+            min_severity.load(Ordering::Relaxed),
+            openshell_ocsf::severity_rank(SeverityId::Medium)
+        );
+    }
+
+    #[test]
+    fn apply_ocsf_shorthand_min_severity_defaults_to_informational_when_unset() {
+        let min_severity = AtomicU8::new(openshell_ocsf::severity_rank(SeverityId::High));
+        let settings = std::collections::HashMap::new();
+
+        apply_ocsf_shorthand_min_severity_setting(&min_severity, &settings);
+
+        assert_eq!(
+            min_severity.load(Ordering::Relaxed),
+            openshell_ocsf::severity_rank(SeverityId::Informational)
+        );
     }
 
     // ---- Policy disk discovery tests ----
