@@ -42,6 +42,8 @@ const TUNNEL_PROTOCOL_PEEK_POLL: std::time::Duration = std::time::Duration::from
 const TUNNEL_PROTOCOL_PEEK_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 const INFERENCE_LOCAL_HOST: &str = "inference.local";
 const INFERENCE_LOCAL_PORT: u16 = 443;
+#[cfg(target_os = "linux")]
+const SIDECAR_SUPERVISOR_TOPOLOGY: &str = "sidecar";
 
 /// Hostnames injected by compute drivers as `/etc/hosts` aliases for the host
 /// machine. Traffic to these names is eligible for the trusted-gateway SSRF
@@ -1426,7 +1428,7 @@ fn resolve_owner_identity(
         })?;
 
     let bin_hash = identity_cache
-        .verify_or_cache(&bin_path)
+        .verify_or_cache_process_exe(&bin_path, owner_pid)
         .map_err(|e| IdentityError {
             reason: format!("binary integrity check failed: {e}"),
             binary: Some(bin_path.clone()),
@@ -1434,11 +1436,15 @@ fn resolve_owner_identity(
             ancestors: vec![],
         })?;
 
-    let ancestors = crate::procfs::collect_ancestor_binaries(owner_pid, entrypoint_pid);
+    let ancestor_identities = collect_ancestor_identities(owner_pid, entrypoint_pid);
+    let ancestors: Vec<PathBuf> = ancestor_identities
+        .iter()
+        .map(|(_, path)| path.clone())
+        .collect();
 
-    for ancestor in &ancestors {
+    for (ancestor_pid, ancestor) in &ancestor_identities {
         identity_cache
-            .verify_or_cache(ancestor)
+            .verify_or_cache_process_exe(ancestor, *ancestor_pid)
             .map_err(|e| IdentityError {
                 reason: format!(
                     "ancestor integrity check failed for {}: {e}",
@@ -1463,6 +1469,31 @@ fn resolve_owner_identity(
     })
 }
 
+#[cfg(target_os = "linux")]
+fn collect_ancestor_identities(start_pid: u32, stop_pid: u32) -> Vec<(u32, PathBuf)> {
+    const MAX_DEPTH: usize = 64;
+    let mut ancestors = Vec::new();
+    let mut current = start_pid;
+
+    for _ in 0..MAX_DEPTH {
+        let parent_pid = match crate::procfs::read_ppid(current) {
+            Some(parent) if parent > 0 && parent != current => parent,
+            _ => break,
+        };
+
+        if let Ok(path) = crate::procfs::binary_path(parent_pid.cast_signed()) {
+            ancestors.push((parent_pid, path));
+        }
+
+        if parent_pid == stop_pid || parent_pid == 1 {
+            break;
+        }
+        current = parent_pid;
+    }
+
+    ancestors
+}
+
 /// Resolve the identity of the process owning a TCP peer connection.
 ///
 /// Walks `/proc/<entrypoint_pid>/net/tcp` to find the socket inode, locates
@@ -1472,10 +1503,10 @@ fn resolve_owner_identity(
 ///
 /// This is the identity-resolution block of [`evaluate_opa_tcp`] extracted
 /// into a standalone helper so it can be exercised by Linux-only regression
-/// tests without a full OPA engine. The key invariant under test is that on
-/// a hot-swap of the peer binary, the failure mode is
-/// `"Binary integrity violation"` (from the identity cache) rather than
-/// `"Failed to stat ... (deleted)"` (from the kernel-tainted path).
+/// tests without a full OPA engine. The key hot-swap invariant under test is
+/// that display paths are stripped for policy/logging, while integrity hashing
+/// reads the live executable via `/proc/<pid>/exe` instead of the replacement
+/// file that now exists at the display path.
 #[cfg(target_os = "linux")]
 fn resolve_process_identity(
     entrypoint_pid: u32,
@@ -1573,8 +1604,17 @@ fn evaluate_opa_tcp(
         }
     };
 
-    let pid = entrypoint_pid.load(Ordering::Acquire);
-    if pid == 0 {
+    if !crate::opa::network_binary_identity_required() {
+        let result = evaluate_endpoint_only_opa(engine, host, port);
+        debug!(
+            "evaluate_opa_tcp endpoint-only: host={host} port={port} action={:?}",
+            result.action
+        );
+        return result;
+    }
+
+    let entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
+    let Some(proc_net_anchor_pid) = proc_net_anchor_pid(entrypoint_pid) else {
         return deny(
             "entrypoint process not yet spawned".into(),
             None,
@@ -1582,12 +1622,12 @@ fn evaluate_opa_tcp(
             vec![],
             vec![],
         );
-    }
+    };
 
     let total_start = std::time::Instant::now();
     let peer_port = peer_addr.port();
 
-    let identity = match resolve_process_identity(pid, peer_port, identity_cache) {
+    let identity = match resolve_process_identity(proc_net_anchor_pid, peer_port, identity_cache) {
         Ok(id) => id,
         Err(err) => {
             return deny(
@@ -1641,6 +1681,52 @@ fn evaluate_opa_tcp(
     result
 }
 
+#[cfg(target_os = "linux")]
+fn proc_net_anchor_pid(entrypoint_pid: u32) -> Option<u32> {
+    if entrypoint_pid != 0 {
+        return Some(entrypoint_pid);
+    }
+    sidecar_topology_enabled().then(std::process::id)
+}
+
+#[cfg(target_os = "linux")]
+fn sidecar_topology_enabled() -> bool {
+    std::env::var(openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY)
+        .is_ok_and(|value| value == SIDECAR_SUPERVISOR_TOPOLOGY)
+}
+
+fn evaluate_endpoint_only_opa(engine: &OpaEngine, host: &str, port: u16) -> ConnectDecision {
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: PathBuf::new(),
+        binary_sha256: String::new(),
+        ancestors: vec![],
+        cmdline_paths: vec![],
+    };
+
+    match engine.evaluate_network_action_with_generation(&input) {
+        Ok((action, generation)) => ConnectDecision {
+            action,
+            generation,
+            binary: None,
+            binary_pid: None,
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        },
+        Err(e) => ConnectDecision {
+            action: NetworkAction::Deny {
+                reason: format!("policy evaluation error: {e}"),
+            },
+            generation: engine.current_generation(),
+            binary: None,
+            binary_pid: None,
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        },
+    }
+}
+
 /// Non-Linux stub: OPA identity binding requires /proc.
 #[cfg(not(target_os = "linux"))]
 fn evaluate_opa_tcp(
@@ -1648,9 +1734,13 @@ fn evaluate_opa_tcp(
     engine: &OpaEngine,
     _identity_cache: &BinaryIdentityCache,
     _entrypoint_pid: &AtomicU32,
-    _host: &str,
-    _port: u16,
+    host: &str,
+    port: u16,
 ) -> ConnectDecision {
+    if !crate::opa::network_binary_identity_required() {
+        return evaluate_endpoint_only_opa(engine, host, port);
+    }
+
     ConnectDecision {
         action: NetworkAction::Deny {
             reason: "identity binding unavailable on this platform".into(),
@@ -2152,14 +2242,24 @@ fn query_l7_route_snapshot(
     };
 
     match engine.query_endpoint_configs_with_generation(&input) {
-        Ok((vals, generation)) => Some(L7RouteSnapshot {
-            configs: vals
+        Ok((vals, generation)) => {
+            let configs: Vec<_> = vals
                 .into_iter()
                 .filter_map(|val| crate::l7::parse_l7_config(&val))
                 .map(|config| L7ConfigSnapshot { config })
-                .collect(),
-            generation,
-        }),
+                .collect();
+            debug!(
+                host,
+                port,
+                generation,
+                config_count = configs.len(),
+                "Forward proxy L7 route lookup complete"
+            );
+            Some(L7RouteSnapshot {
+                configs,
+                generation,
+            })
+        }
         Err(e) => {
             let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Fail)
@@ -3337,10 +3437,29 @@ async fn handle_forward_proxy(
         }
     };
     let policy_str = matched_policy.as_deref().unwrap_or("-");
+    debug!(
+        host = %host_lc,
+        port,
+        binary = %binary_str,
+        binary_pid = %pid_str,
+        matched_policy = %policy_str,
+        decision_generation = decision.generation,
+        current_generation = opa_engine.current_generation(),
+        action = ?decision.action,
+        "Forward proxy L4 policy decision"
+    );
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
     let forward_generation_guard = match opa_engine.generation_guard(decision.generation) {
         Ok(guard) => guard,
         Err(e) => {
+            warn!(
+                host = %host_lc,
+                port,
+                decision_generation = decision.generation,
+                current_generation = opa_engine.current_generation(),
+                error = %e,
+                "Forward proxy rejected request because policy generation changed after L4 decision"
+            );
             emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
             emit_activity_simple(activity_tx, true, "policy_stale");
             respond(
@@ -3401,6 +3520,15 @@ async fn handle_forward_proxy(
         && !route.configs.is_empty()
     {
         if route.generation != forward_generation_guard.captured_generation() {
+            warn!(
+                host = %host_lc,
+                port,
+                decision_generation = decision.generation,
+                guard_generation = forward_generation_guard.captured_generation(),
+                route_generation = route.generation,
+                current_generation = opa_engine.current_generation(),
+                "Forward proxy rejected request because L7 route lookup used a different policy generation"
+            );
             emit_l7_tunnel_close_after_policy_change(
                 &host_lc,
                 port,
@@ -3426,6 +3554,14 @@ async fn handle_forward_proxy(
         let tunnel_engine = match opa_engine.clone_engine_for_tunnel(route.generation) {
             Ok(engine) => engine,
             Err(e) => {
+                warn!(
+                    host = %host_lc,
+                    port,
+                    route_generation = route.generation,
+                    current_generation = opa_engine.current_generation(),
+                    error = %e,
+                    "Forward proxy rejected request because L7 tunnel engine could not be cloned"
+                );
                 emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
                 emit_activity_simple(activity_tx, true, "policy_stale");
                 respond(
@@ -4105,6 +4241,14 @@ async fn handle_forward_proxy(
     };
 
     if let Err(e) = forward_generation_guard.ensure_current() {
+        warn!(
+            host = %host_lc,
+            port,
+            captured_generation = forward_generation_guard.captured_generation(),
+            current_generation = forward_generation_guard.current_generation(),
+            error = %e,
+            "Forward proxy rejected request because policy changed before upstream connect"
+        );
         emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
         emit_activity_simple(activity_tx, true, "policy_stale");
         respond(
@@ -4243,6 +4387,14 @@ async fn handle_forward_proxy(
     };
 
     if let Err(e) = forward_generation_guard.ensure_current() {
+        warn!(
+            host = %host_lc,
+            port,
+            captured_generation = forward_generation_guard.captured_generation(),
+            current_generation = forward_generation_guard.current_generation(),
+            error = %e,
+            "Forward proxy rejected request because policy changed before relay"
+        );
         emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
         respond(
             client,
@@ -4378,6 +4530,46 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn endpoint_only_opa_allows_declared_endpoint_without_process_identity() {
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let data = r#"
+version: 1
+network_policies:
+  test_l7:
+    name: test_l7
+    endpoints:
+      - host: host.k3d.internal
+        port: 56123
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: /allowed
+    binaries:
+      - path: /usr/bin/curl
+"#;
+        let engine = OpaEngine::from_strings_with_binary_identity_required(policy, data, false)
+            .expect("relaxed engine");
+
+        let decision = evaluate_endpoint_only_opa(&engine, "host.k3d.internal", 56123);
+        assert_eq!(
+            decision.action,
+            NetworkAction::Allow {
+                matched_policy: Some("test_l7".to_string()),
+            }
+        );
+        assert!(decision.binary.is_none());
+        assert!(decision.ancestors.is_empty());
+
+        let denied = evaluate_endpoint_only_opa(&engine, "api.example.com", 443);
+        assert!(
+            matches!(denied.action, NetworkAction::Deny { .. }),
+            "endpoint-only mode must still deny undeclared endpoints"
+        );
+    }
 
     fn websocket_l7_config(
         protocol: crate::l7::L7Protocol,
@@ -7992,27 +8184,23 @@ network_policies:
         assert_eq!(resp_str[body_start..].len(), cl);
     }
 
-    /// End-to-end regression for the `docker cp` hot-swap hazard that
-    /// motivated `binary_path()` stripping the kernel's `" (deleted)"`
-    /// suffix (PR #844).
+    /// End-to-end regression for the `docker cp` hot-swap hazard around
+    /// unlinked process executables.
     ///
-    /// Before the strip, the identity-resolution chain inside
-    /// `evaluate_opa_tcp` failed with `"Failed to stat
-    /// /opt/openshell/bin/openshell-sandbox (deleted)"` because
-    /// `BinaryIdentityCache::verify_or_cache()` tried to `metadata()` the
-    /// tainted path. That masked the real security signal: a live process
-    /// was now bound to a *different* binary on disk than the one that was
-    /// TOFU-cached. After the strip, `binary_path()` returns a path that
-    /// stats fine, the cache rehashes the new bytes, and the hash mismatch
-    /// surfaces as a `Binary integrity violation` error — the contract this
-    /// PR is trying to establish.
+    /// `binary_path()` strips the kernel's `" (deleted)"` suffix so policy
+    /// identity and logs use a clean display path. Integrity verification must
+    /// not hash that display path after a hot-swap, because it may now point to
+    /// unrelated replacement bytes. It hashes `/proc/<pid>/exe` instead, which
+    /// resolves to the live executable inode even after the original path was
+    /// unlinked.
     ///
     /// Test shape (from the review comment on the initial PR):
     /// 1. Start a `TcpListener` in the test process.
     /// 2. Copy `/bin/bash` to a temp path we control.
     /// 3. Prime `BinaryIdentityCache` with that temp binary's hash.
     /// 4. Spawn the temp bash as a child with a `/dev/tcp` one-liner that
-    ///    opens a real TCP connection to the listener and holds it open.
+    ///    opens a real TCP connection to the listener and holds it open
+    ///    inside the bash process.
     /// 5. Accept the connection on the listener side and capture the peer's
     ///    ephemeral port — that's what `resolve_process_identity` uses to
     ///    walk `/proc/net/tcp` back to the child PID.
@@ -8022,13 +8210,12 @@ network_policies:
     ///    now readlink to `" (deleted)"` OR the overwritten file, depending
     ///    on whether the filesystem reused the inode.
     /// 7. Call `resolve_process_identity` and assert:
-    ///    - the error reason contains `"Binary integrity violation"` (the
-    ///      cache detected the tampered on-disk bytes), and
-    ///    - the error reason does NOT contain `"Failed to stat"` or
-    ///      `"(deleted)"` (the old pre-strip failure mode).
+    ///    - identity resolution succeeds using the live executable hash, and
+    ///    - the returned display path does not contain the kernel-added
+    ///      `"(deleted)"` suffix.
     #[cfg(target_os = "linux")]
     #[test]
-    fn resolve_process_identity_surfaces_binary_integrity_violation_on_hot_swap() {
+    fn resolve_process_identity_hashes_live_exe_after_hot_swap() {
         use crate::identity::BinaryIdentityCache;
         use std::io::Read;
         use std::net::TcpListener;
@@ -8060,9 +8247,12 @@ network_policies:
         assert!(!v1_hash.is_empty());
 
         // 4. Spawn the temp bash with a /dev/tcp one-liner that opens a real
-        //    connection to the listener and sleeps to keep it open. The
-        //    `read -t` blocks on stdin so the shell stays resident.
-        let script = format!("exec 3<>/dev/tcp/127.0.0.1/{listener_port}; sleep 30 <&3");
+        //    connection to the listener and blocks in bash's `read` builtin
+        //    to keep it open. Do not use an external command like `sleep`:
+        //    it inherits the socket fd and intentionally trips the shared
+        //    socket ambiguity guard instead of exercising the hot-swap path.
+        let script =
+            format!("exec 3<>/dev/tcp/127.0.0.1/{listener_port}; read -r -t 30 _ <&3 || true");
         let mut child = Command::new(&bash_v1)
             .arg("-c")
             .arg(&script)
@@ -8106,10 +8296,11 @@ network_policies:
         std::fs::write(&bash_v1, tampered_bytes).expect("write replacement bytes");
 
         // 7. Resolve identity through the real helper and assert the
-        //    contract: we want "Binary integrity violation", not
-        //    "Failed to stat ... (deleted)".
+        //    contract: hash the live executable via /proc/<pid>/exe while
+        //    returning a clean display path for policy/logging.
         let test_pid = std::process::id();
         let result = resolve_process_identity(test_pid, peer_port, &cache);
+        let child_pid = child.id();
 
         // Always clean up the child before asserting so a failure doesn't
         // leak a sleeping process across test runs.
@@ -8117,40 +8308,29 @@ network_policies:
         let _ = child.wait();
 
         match result {
-            Ok(_) => panic!(
-                "resolve_process_identity unexpectedly succeeded after hot-swap; \
-                 the cache should have detected the tampered on-disk bytes"
-            ),
-            Err(err) => {
-                assert!(
-                    err.reason.contains("Binary integrity violation"),
-                    "expected 'Binary integrity violation' error, got: {}",
-                    err.reason
+            Ok(identity) => {
+                assert_eq!(
+                    identity.binary_pid, child_pid,
+                    "expected the hot-swapped bash child to own the socket"
+                );
+                assert_eq!(
+                    identity.bin_path, bash_v1,
+                    "expected stripped display path to remain the original binary path"
                 );
                 assert!(
-                    !err.reason.contains("Failed to stat"),
-                    "pre-PR-#844 failure mode leaked: {}",
-                    err.reason
+                    !identity.bin_path.to_string_lossy().contains("(deleted)"),
+                    "resolved binary path still tainted: {}",
+                    identity.bin_path.display()
                 );
-                assert!(
-                    !err.reason.contains("(deleted)"),
-                    "resolved path still contains '(deleted)' suffix: {}",
-                    err.reason
+                assert_eq!(
+                    identity.bin_hash, v1_hash,
+                    "expected integrity hash from the live executable, not replacement bytes"
                 );
-                // The binary field should be populated — we did resolve a
-                // path before failing.
-                assert!(
-                    err.binary.is_some(),
-                    "expected resolved binary path on integrity failure"
-                );
-                if let Some(path) = &err.binary {
-                    assert!(
-                        !path.to_string_lossy().contains("(deleted)"),
-                        "resolved binary path still tainted: {}",
-                        path.display()
-                    );
-                }
             }
+            Err(err) => panic!(
+                "resolve_process_identity failed after hot-swap; expected live-exe identity: {}",
+                err.reason
+            ),
         }
     }
 

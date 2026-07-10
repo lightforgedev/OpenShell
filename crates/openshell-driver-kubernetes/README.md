@@ -53,9 +53,43 @@ pods do not need direct external ingress for SSH.
 
 ## Container Security Context
 
-The driver grants the sandbox agent container the Linux capabilities the
-supervisor needs for namespace setup and policy enforcement. It can also request
-a Kubernetes AppArmor profile through `app_armor_profile`.
+The default `combined` supervisor topology grants the sandbox agent container
+the Linux capabilities the supervisor needs for namespace setup and process,
+filesystem, and network policy enforcement.
+
+The `sidecar` supervisor topology moves pod-level network setup into a root init
+container. In the default process/binary-aware mode, the long-lived network
+sidecar runs as UID 0 with `allowPrivilegeEscalation: false`, drops default
+Linux capabilities, and adds only `SYS_PTRACE` plus `DAC_READ_SEARCH` for
+cross-UID workload `/proc` inspection. The agent container also runs as the
+resolved sandbox UID/GID with `allowPrivilegeEscalation: false` and
+`capabilities.drop: ["ALL"]`.
+Set `sidecar.process_binary_aware_network_policy = false` to run the network
+sidecar as the configured non-root `sidecar.proxy_uid`, omit the extra `/proc`
+inspection capabilities, and enforce endpoint/L7 network policy without
+matching `policy.binaries`.
+In this mode OpenShell preserves gateway session and SSH behavior, but the
+process supervisor does not perform root-to-sandbox privilege dropping or
+supervisor identity mount isolation. It still applies Landlock filesystem policy
+and child seccomp filters where the kernel/runtime supports them. Network
+endpoint and L7 policy remain enforced by the network sidecar, and
+sidecar pods use a shared process namespace so the network sidecar can resolve
+process/binary identity through `/proc/<entrypoint-pid>`.
+
+Sidecar mode keeps gateway credentials in the network sidecar. The agent
+container does not mount the projected service-account token used for sandbox
+token bootstrap, does not mount the sandbox client TLS secret, and does not get
+gateway callback environment variables. The process supervisor receives policy
+and provider environment state from the sidecar over a local control socket in
+the shared sidecar state volume. The sidecar accepts only the pre-workload
+process-supervisor connection, authenticates its UID/GID/PID with peer
+credentials, and removes the listener afterward. SSH relays use a Linux
+abstract socket whose peer PID must match that authenticated supervisor. Both
+supervisors exit if the control connection closes, coupling their container
+restart lifecycle before a new authoritative client can be established.
+
+The driver can request a Kubernetes AppArmor profile through
+`app_armor_profile`.
 
 Supported values are `Unconfined`, `RuntimeDefault`, and
 `Localhost/<profile-name>`. An empty or unset value omits

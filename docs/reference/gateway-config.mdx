@@ -179,9 +179,10 @@ supervisor_image_pull_policy   = "IfNotPresent"
 # Use the image volume on Kubernetes >= 1.35 (GA in 1.36); switch to "init-container"
 # on older clusters or where the ImageVolume feature gate is off.
 supervisor_sideload_method     = "image-volume"
-# "combined" runs networking and process supervision in the sandbox agent
-# container and preserves the existing Kubernetes sandbox behavior.
-supervisor_topology            = "combined"
+# "combined" runs the existing single supervisor container with full process,
+# filesystem, and network enforcement in the agent container. "sidecar" moves
+# pod-level network enforcement and gateway session handling into a network sidecar.
+topology                       = "combined"
 grpc_endpoint                  = "https://openshell-gateway.agents.svc:8080"
 ssh_socket_path                = "/run/openshell/ssh.sock"
 client_tls_secret_name         = "openshell-client-tls"
@@ -205,6 +206,18 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # back to 1000 on non-OpenShift clusters.
 # sandbox_uid = 1500
 # sandbox_gid = 1500
+
+[openshell.drivers.kubernetes.sidecar]
+# UID used by relaxed long-running network sidecars. Strict process/binary-aware
+# sidecars run as UID 0 so Kubernetes grants the required /proc inspection
+# capabilities into the effective set. In sidecar topology the network init
+# container installs nftables rules that exempt the effective sidecar UID.
+proxy_uid                      = 1337
+# Keep process/binary-aware network policy enabled in sidecar topology. Set
+# false to run the sidecar as proxy_uid, drop the sidecar's extra /proc
+# inspection capabilities, and enforce endpoint/L7 policy without matching
+# policy.binaries.
+process_binary_aware_network_policy = true
 ```
 
 ### Docker

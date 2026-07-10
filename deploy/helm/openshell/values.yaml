@@ -45,8 +45,22 @@ supervisor:
   # set this to "image-volume" explicitly.
   sideloadMethod: ""
   # -- Supervisor pod topology for Kubernetes sandboxes.
-  # "combined" runs networking and process supervision in the agent container.
+  # "combined" runs the current single supervisor container in the agent pod.
+  # "sidecar" runs network enforcement in a dedicated sidecar and the process
+  # supervisor as a low-capability wrapper in the agent container.
   topology: "combined"
+  sidecar:
+    # -- UID for relaxed long-running network sidecars in sidecar topology.
+    # Strict process/binary-aware sidecars run as UID 0 so Kubernetes grants
+    # the required /proc inspection capabilities into the effective set. The
+    # network init container installs nftables rules that exempt the effective
+    # sidecar UID.
+    proxyUid: 1337
+    # -- Keep process/binary-aware network policy enabled in sidecar topology.
+    # When false, the network sidecar runs as proxyUid, drops the extra /proc
+    # inspection capabilities, and enforces endpoint/L7 policy without matching
+    # policy.binaries.
+    processBinaryAwareNetworkPolicy: true
 
 # -- Image pull secrets attached to gateway and helper pods.
 imagePullSecrets: []
