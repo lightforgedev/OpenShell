@@ -3886,6 +3886,7 @@ version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "glob",
  "ipnet",
  "miette",
  "prost",
@@ -4048,6 +4049,7 @@ version = "0.0.0"
 dependencies = [
  "miette",
  "openshell-core",
+ "prost-types",
  "serde",
  "serde_json",
  "serde_yml",
@@ -4108,9 +4110,12 @@ dependencies = [
  "openshell-core",
  "openshell-ocsf",
  "openshell-policy",
+ "openshell-supervisor-middleware",
+ "openshell-supervisor-middleware-builtins",
  "openshell-supervisor-network",
  "openshell-supervisor-process",
  "prost",
+ "prost-types",
  "rustls 0.23.38",
  "serde",
  "serde_json",
@@ -4191,6 +4196,8 @@ dependencies = [
  "openshell-providers",
  "openshell-router",
  "openshell-server-macros",
+ "openshell-supervisor-middleware",
+ "openshell-supervisor-middleware-builtins",
  "petname",
  "pin-project-lite",
  "prost",
@@ -4234,6 +4241,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-supervisor-middleware"
+version = "0.0.0"
+dependencies = [
+ "miette",
+ "openshell-core",
+ "openshell-supervisor-middleware-builtins",
+ "prost",
+ "prost-types",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
+name = "openshell-supervisor-middleware-builtins"
+version = "0.0.0"
+dependencies = [
+ "miette",
+ "openshell-core",
+ "prost-types",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "openshell-supervisor-network"
 version = "0.0.0"
 dependencies = [
@@ -4255,6 +4290,9 @@ dependencies = [
  "openshell-ocsf",
  "openshell-policy",
  "openshell-router",
+ "openshell-supervisor-middleware",
+ "openshell-supervisor-middleware-builtins",
+ "prost-types",
  "rcgen",
  "regorus",
  "reqwest 0.12.28",
@@ -4272,8 +4310,10 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.4",
  "tokio-tungstenite 0.26.2",
+ "tonic",
  "tower-mcp-types",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "webpki-roots 1.0.7",
 ]

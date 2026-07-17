@@ -369,6 +369,17 @@ config path. A gateway-global policy can override sandbox-scoped policy. The
 sandbox supervisor polls for config revisions and hot-reloads dynamic policy
 when the policy engine accepts the update.
 
+External supervisor middleware registration is operator-owned configuration
+under `[[openshell.supervisor.middleware]]`. At startup the gateway connects to
+each service and validates its described bindings and operator body limit.
+Policies attach a complete external middleware by its operator-owned registration
+name. Manifest bindings are identified by operation and phase, and each manifest
+may declare at most one binding for an operation and phase pair.
+Before persisting a policy, the gateway asks each selected implementation to
+validate its config. The effective sandbox config contains only the registered
+services required by that policy; supervisors invoke those services directly on
+the request path.
+
 Provider credential expiry is enforced during gateway-to-sandbox credential
 resolution and again by the sandbox placeholder resolver. This keeps expired
 credentials from resolving even when a running sandbox still has retained
