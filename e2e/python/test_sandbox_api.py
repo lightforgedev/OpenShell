@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING
+
+from openshell._proto import openshell_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -58,6 +61,73 @@ def test_sandbox_api_crud_and_exec(
         )
         assert verify_file.exit_code == 0
         assert verify_file.stdout.strip() == "ok"
+
+
+def test_sandbox_interactive_exec_honors_tty(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    stdin_sentinel = b"streamed-stdin-sentinel"
+    stdout_sentinel = b"stdout-sentinel"
+    stderr_sentinel = b"stderr-sentinel"
+
+    def exec_interactive(sandbox_id: str, *, tty: bool) -> tuple[bytes, bytes]:
+        request = openshell_pb2.ExecSandboxInput(
+            start=openshell_pb2.ExecSandboxRequest(
+                sandbox_id=sandbox_id,
+                command=[
+                    "/bin/sh",
+                    "-c",
+                    "[ -t 0 ] && printf T || printf N; "
+                    "[ -t 1 ] && printf T || printf N; "
+                    "[ -t 2 ] && printf T || printf N; printf '\\n'; "
+                    "IFS= read -r stdin_value; "
+                    "printf 'stdin:%s\\n' \"$stdin_value\"; "
+                    "printf 'stdout-sentinel\\n'; "
+                    "printf 'stderr-sentinel\\n' >&2",
+                ],
+                tty=tty,
+                timeout_seconds=20,
+            )
+        )
+
+        done = threading.Event()
+
+        def requests():
+            yield request
+            yield openshell_pb2.ExecSandboxInput(stdin=stdin_sentinel + b"\n")
+            done.wait(timeout=30)
+
+        stdout: list[bytes] = []
+        stderr: list[bytes] = []
+        exit_code: int | None = None
+        try:
+            events = sandbox_client._stub.ExecSandboxInteractive(requests(), timeout=30)
+            for event in events:
+                payload = event.WhichOneof("payload")
+                if payload == "stdout":
+                    stdout.append(bytes(event.stdout.data))
+                elif payload == "stderr":
+                    stderr.append(bytes(event.stderr.data))
+                elif payload == "exit":
+                    exit_code = int(event.exit.exit_code)
+        finally:
+            done.set()
+
+        assert exit_code == 0
+        return b"".join(stdout), b"".join(stderr)
+
+    with sandbox(delete_on_exit=True) as sb:
+        stdout, stderr = exec_interactive(sb.id, tty=False)
+        assert b"NNN" in stdout
+        assert b"stdin:" + stdin_sentinel in stdout
+        assert stdout_sentinel in stdout
+        assert stdout_sentinel not in stderr
+        assert stderr_sentinel in stderr
+        assert stderr_sentinel not in stdout
+
+        stdout, stderr = exec_interactive(sb.id, tty=True)
+        assert b"TTT" in stdout + stderr
 
 
 def test_sandbox_labels_and_selectors(sandbox_client: SandboxClient) -> None:
