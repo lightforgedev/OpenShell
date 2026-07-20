@@ -2039,13 +2039,79 @@ mod tests {
             "github profile should include read-only GraphQL endpoint"
         );
         assert!(
-            proto
-                .endpoints
-                .iter()
-                .all(|endpoint| endpoint.access == "read-only"),
-            "github profile endpoints should all be read-only"
+            proto.endpoints.iter().all(|endpoint| {
+                // The REST/GraphQL API endpoints stay read-only. The git
+                // transport endpoint (github.com) carries explicit rules
+                // instead so it can allow clone/fetch while blocking push.
+                if endpoint.host == "github.com" {
+                    endpoint.access.is_empty()
+                } else {
+                    endpoint.access == "read-only"
+                }
+            }),
+            "github API endpoints should be read-only; git transport uses explicit rules"
         );
         assert_eq!(proto.binaries.len(), 4);
+    }
+
+    #[test]
+    fn github_git_transport_allows_clone_but_not_push() {
+        let profile = builtin_profile("github");
+        let proto = profile.to_proto();
+
+        let git_transport = proto
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.host == "github.com" && endpoint.port == 443)
+            .expect("github.com git transport endpoint");
+
+        // The git transport carries explicit rules rather than an access preset
+        // (an empty preset would otherwise expand to GET/HEAD/OPTIONS).
+        assert!(
+            git_transport.access.is_empty(),
+            "git transport must use explicit rules, not an access preset"
+        );
+
+        // Assert the EXACT allowed rule set. Clone/fetch over git smart HTTP
+        // performs GET */info/refs (ref discovery) followed by POST
+        // */git-upload-pack. A substring check alone is not enough: a broader or
+        // additional POST rule (e.g. POST **) would also permit push via
+        // git-receive-pack while still passing a "some rule allows upload-pack"
+        // check. Pinning the whole set fails on any such regression. See #1769.
+        let mut allowed: Vec<(&str, &str)> = git_transport
+            .rules
+            .iter()
+            .map(|rule| {
+                let allow = rule
+                    .allow
+                    .as_ref()
+                    .expect("git transport rules must be allow rules");
+                (allow.method.as_str(), allow.path.as_str())
+            })
+            .collect();
+        allowed.sort_unstable();
+
+        let mut expected = vec![
+            ("GET", "**"),
+            ("HEAD", "**"),
+            ("OPTIONS", "**"),
+            ("POST", "/**/git-upload-pack"),
+        ];
+        expected.sort_unstable();
+
+        assert_eq!(
+            allowed, expected,
+            "git transport allow rules must be exactly the read-only methods \
+             plus POST */git-upload-pack (clone/fetch); a broader or extra POST \
+             rule would enable push (git-receive-pack)"
+        );
+
+        // Blocking push must not depend on a deny rule, which could mask an
+        // over-broad allow and hide a regression.
+        assert!(
+            git_transport.deny_rules.is_empty(),
+            "git transport should block push via its narrow allow set, not deny rules"
+        );
     }
 
     #[test]
