@@ -10,6 +10,7 @@ position: 5
 
 Full nested organization sandbox mode is not implemented.
 The first runtime slice adds optional org identity to existing exec/SSH/TCP relay control paths, but it does not create nested per-org boundaries.
+The relay attribution slice records that org identity on relay OCSF events when present.
 This tracker lists the remaining changes before multiple customer organizations can safely share one outer container.
 Rows marked `done` are local spike evidence only unless they link to CI artifacts.
 
@@ -22,7 +23,8 @@ Rows marked `done` are local spike evidence only unless they link to CI artifact
 | done | Local pooled-container smoke | Local spike showed separate org containers in one Docker host can be isolated by separate networks; shared networks leak reachability. |
 | done | Real OpenShell sibling marker smoke | Local spike showed two gateway-managed sandboxes did not expose Org B's in-sandbox marker through Org B's Docker container IP. This is one negative reachability check, not general sibling isolation. |
 | done | Org identity API/relay foundation | Optional `org_id` is validated on exec/SSH/TCP forward requests, propagated to `RelayOpen`, persisted on SSH sessions, returned in create-session responses, and enforced on SSH forward-token validation. Empty `org_id` preserves legacy sandbox-level behavior. |
-| pending | Org identity contract | Define gateway-minted immutable `org_id`; never trust labels, client input, or in-sandbox state as the org source. Propagate it through sandbox context, nested lifecycle, policy input, cache keys, OCSF/logs, denial/activity aggregation, and audit persistence. |
+| done | Relay OCSF org attribution | Relay open/closed/failed events clone the base sandbox context with `RelayOpen.org_id` and emit it as `unmapped.org_id`; empty `org_id` keeps legacy event shape. |
+| pending | Org identity contract | Define gateway-minted immutable `org_id`; never trust labels, client input, or in-sandbox state as the org source. Propagate it through nested lifecycle, policy input, cache keys, denial/activity aggregation, and audit persistence. |
 | pending | Nested org API/relay routing | Add org target to nested lifecycle and supervisor runtime selection. Existing `run_as_user` remains per-agent only. |
 | pending | Nested org runtime manager | Add an outer-supervisor manager that owns per-org runtime contexts and crash cleanup. Context includes org netns, proxy, OPA, identity cache, policy-local state, provider state, mount/root, PID/proc boundary, IPC/keyring mode, cgroup, and sockets. |
 | pending | Per-org user namespace or UID range contract | Use per-org user namespaces and uid/gid maps, or globally disjoint UID/GID ranges, so same numeric UID in two orgs is not the same kernel principal. |
@@ -50,7 +52,7 @@ Rows marked `done` are local spike evidence only unless they link to CI artifact
 | `openshell-supervisor-network/src/run.rs` | One proxy, OPA, policy-local context, provider state, binary cache, and entrypoint PID. | Instantiate these per org. |
 | `openshell-supervisor-network/src/identity.rs` | Binary identity TOFU cache key is executable path only. | Use per-org cache or key by org/root/path. |
 | `openshell-core/src/provider_credentials.rs` | Credential resolver generations are sandbox-scoped. | Split provider credentials by org. |
-| `openshell-ocsf/src/ctx.rs` | OCSF context is one process-wide sandbox context. | Add per-event org context/fields. |
+| `openshell-ocsf/src/ctx.rs` | OCSF context is one process-wide sandbox context; relay events can clone it with per-event `org_id` in `unmapped`. | Extend this pattern to policy, denial/activity aggregation, and persistent audit once org runtime context exists. |
 | Docker driver | Local containers have namespace setup capabilities; Fly capability set is unknown. | Add capability probe; nested mode refuses to start when userns/netns/mount/cgroup prerequisites are missing. |
 
 ## Open Risks
@@ -79,3 +81,12 @@ Revisit nested org mode only after the tracker items above have Linux evidence.
 | Enforcement | Invalid `org_id` is rejected; SSH forward token validation requires matching `sandbox_id + org_id`; empty org remains legacy-compatible. |
 | Not implemented | Gateway-minted immutable org identity, nested lifecycle, per-org runtime manager, policy/audit org attribution, and kernel-backed org boundaries. |
 | Linux validation | Built `openshell/ci:dev` from `deploy/docker/Dockerfile.ci`; inside that CI container, focused core/supervisor/server tests and `cargo check -p openshell-cli -p openshell-tui` passed on commit `2c3432a0`. |
+
+## 2026-07-06 Relay Attribution Slice
+
+| Item | Result |
+|---|---|
+| Branch | `hugo/nested-org-policy-audit-context` |
+| Implemented | `SandboxContext` carries optional `org_id`; common OCSF fields emit non-empty org ids as `unmapped.org_id`; relay open/closed/failed events derive a per-relay context from `RelayOpen.org_id`; relay messages include `org_id=...` only when present. |
+| Not implemented | Network proxy policy input, OPA generation, binary identity cache keys, denial/activity aggregation, persistent audit rows, and nested runtime routing remain pending. |
+| Validation | Built/tested inside `openshell/ci:dev`: `cargo test --locked -p openshell-ocsf common_fields --lib`, `cargo test --locked -p openshell-supervisor-process relay_open_event --lib`, `cargo test --locked -p openshell-supervisor-process relay --lib`, and `cargo check --locked -p openshell-server -p openshell-sandbox -p openshell-supervisor-process -p openshell-ocsf` passed. |

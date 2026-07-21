@@ -176,13 +176,15 @@ use crate::objects::{Container, Device, Endpoint, Image, Metadata, Product};
 /// Immutable context created once at sandbox startup.
 ///
 /// Passed to every event builder to populate shared OCSF fields
-/// (metadata, container, device, proxy endpoint).
+/// (metadata, container, device, proxy endpoint, org attribution).
 #[derive(Debug, Clone)]
 pub struct SandboxContext {
     /// Sandbox unique identifier.
     pub sandbox_id: String,
     /// Sandbox display name.
     pub sandbox_name: String,
+    /// Optional customer organization identifier for nested-org deployments.
+    pub org_id: Option<String>,
     /// Container image reference.
     pub container_image: String,
     /// Device hostname.
@@ -248,6 +250,9 @@ impl SandboxContext {
         }
         base.set_device(self.device());
         base.set_container(self.container());
+        if let Some(org_id) = self.org_id.as_deref().filter(|id| !id.is_empty()) {
+            base.add_unmapped("org_id", org_id.to_string());
+        }
     }
 }
 
@@ -256,6 +261,7 @@ pub(crate) fn test_sandbox_context() -> SandboxContext {
     SandboxContext {
         sandbox_id: "sandbox-abc123".to_string(),
         sandbox_name: "my-sandbox".to_string(),
+        org_id: None,
         container_image: "ghcr.io/openshell/sandbox:latest".to_string(),
         hostname: "sandbox-abc123".to_string(),
         product_version: "0.1.0".to_string(),
@@ -299,5 +305,50 @@ mod tests {
         let ep = ctx.proxy_endpoint();
         assert_eq!(ep.ip.as_deref(), Some("10.42.0.1"));
         assert_eq!(ep.port, Some(3128));
+    }
+
+    #[test]
+    fn common_fields_include_org_id_when_present() {
+        let mut ctx = test_sandbox_context();
+        ctx.org_id = Some("org.alpha-1".to_string());
+        let mut base = BaseEventData::new(
+            4001,
+            "Network Activity",
+            4,
+            "Network Activity",
+            1,
+            "Open",
+            crate::SeverityId::Informational,
+            ctx.metadata(&["security_control"]),
+        );
+
+        ctx.apply_common_fields(&mut base, None, None);
+
+        assert_eq!(
+            base.unmapped
+                .as_ref()
+                .and_then(|value| value.get("org_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("org.alpha-1")
+        );
+    }
+
+    #[test]
+    fn common_fields_omit_org_id_when_absent() {
+        let ctx = test_sandbox_context();
+        let mut base = BaseEventData::new(
+            4001,
+            "Network Activity",
+            4,
+            "Network Activity",
+            1,
+            "Open",
+            crate::SeverityId::Informational,
+            ctx.metadata(&["security_control"]),
+        );
+
+        ctx.apply_common_fields(&mut base, None, None);
+
+        assert!(base.unmapped.is_none());
     }
 }

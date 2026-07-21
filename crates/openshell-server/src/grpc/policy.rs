@@ -219,6 +219,7 @@ fn build_gateway_policy_audit_message(
     let ctx = SandboxContext {
         sandbox_id: sandbox_id.to_string(),
         sandbox_name: sandbox_name.to_string(),
+        org_id: None,
         container_image: "openshell/gateway".to_string(),
         hostname: "openshell-gateway".to_string(),
         product_version: VERSION.to_string(),
