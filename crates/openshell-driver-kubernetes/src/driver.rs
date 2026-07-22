@@ -21,7 +21,7 @@ use kube::{Client, Error as KubeError};
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_WORKSPACE, SUPERVISOR_IMAGE_BINARY_PATH,
+    LABEL_SANDBOX_WORKSPACE, SUPERVISOR_IMAGE_BINARY_PATH, openshell_sandbox_label_selector,
 };
 use openshell_core::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
 use openshell_core::progress::{
@@ -744,10 +744,9 @@ impl KubernetesComputeDriver {
             .await?;
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
-            agent_sandbox_api.api.list(
-                &ListParams::default()
-                    .labels(&format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}")),
-            ),
+            agent_sandbox_api
+                .api
+                .list(&ListParams::default().labels(&openshell_sandbox_label_selector())),
         )
         .await
         {
@@ -755,8 +754,16 @@ impl KubernetesComputeDriver {
                 let mut sandboxes: Vec<Sandbox> = list
                     .items
                     .into_iter()
-                    .filter_map(|obj| sandbox_from_object(&self.config.namespace, obj).ok())
-                    .map(|(_, s)| s)
+                    .filter_map(|obj| {
+                        let name = obj.metadata.name.clone().unwrap_or_default();
+                        match sandbox_from_object(&self.config.namespace, obj) {
+                            Ok((_, s)) => Some(s),
+                            Err(err) => {
+                                warn!(object_name = %name, error = %err, "skipping unrecognized Sandbox in list");
+                                None
+                            }
+                        }
+                    })
                     .collect();
                 sandboxes.sort_by(|left, right| {
                     left.name
@@ -1034,8 +1041,7 @@ impl KubernetesComputeDriver {
             .supported_agent_sandbox_api(self.watch_client.clone())
             .await?;
         let event_api: Api<KubeEventObj> = Api::namespaced(self.watch_client.clone(), &namespace);
-        let watcher_config = watcher::Config::default()
-            .labels(&format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}"));
+        let watcher_config = watcher::Config::default().labels(&openshell_sandbox_label_selector());
         let mut sandbox_stream = watcher::watcher(agent_sandbox_api.api, watcher_config).boxed();
         let mut event_stream = watcher::watcher(event_api, watcher::Config::default()).boxed();
         let (tx, rx) = mpsc::channel(256);
@@ -1132,7 +1138,8 @@ impl KubernetesComputeDriver {
                             let _ = tx.send(Err(KubernetesDriverError::Message(err.to_string()))).await;
                             break;
                         }
-                    }
+                    },
+                    () = tx.closed() => break,
                 }
             }
         });
