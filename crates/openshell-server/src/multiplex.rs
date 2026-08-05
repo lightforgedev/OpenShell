@@ -43,6 +43,8 @@ use crate::{
     service_http_router,
 };
 
+const CONNECT_MANAGER_TEST_BEARER: &str = "aegis-connect-manager-test-v1";
+
 /// Request-ID generator that produces a UUID v4 for each inbound request.
 #[derive(Clone)]
 struct UuidRequestId;
@@ -174,6 +176,7 @@ impl MultiplexService {
                 .flatten(),
             self.state.config.mtls_auth.enabled,
             self.state.config.auth.allow_unauthenticated_users,
+            self.state.config.auth.allow_connect_manager_test_bearer,
         );
         let grpc_service =
             GrpcRateLimitService::new(grpc_service, self.state.grpc_rate_limiter.clone());
@@ -484,6 +487,7 @@ pub struct AuthGrpcRouter<S> {
     peer_identity: Option<Identity>,
     mtls_auth_enabled: bool,
     allow_unauthenticated_users: bool,
+    allow_connect_manager_test_bearer: bool,
 }
 
 impl<S> AuthGrpcRouter<S> {
@@ -493,7 +497,15 @@ impl<S> AuthGrpcRouter<S> {
         authenticator_chain: Option<AuthenticatorChain>,
         authz_policy: Option<AuthzPolicy>,
     ) -> Self {
-        Self::with_peer_identity(inner, authenticator_chain, authz_policy, None, false, false)
+        Self::with_peer_identity(
+            inner,
+            authenticator_chain,
+            authz_policy,
+            None,
+            false,
+            false,
+            false,
+        )
     }
 
     fn with_peer_identity(
@@ -503,6 +515,7 @@ impl<S> AuthGrpcRouter<S> {
         peer_identity: Option<Identity>,
         mtls_auth_enabled: bool,
         allow_unauthenticated_users: bool,
+        allow_connect_manager_test_bearer: bool,
     ) -> Self {
         Self {
             inner,
@@ -511,6 +524,7 @@ impl<S> AuthGrpcRouter<S> {
             peer_identity,
             mtls_auth_enabled,
             allow_unauthenticated_users,
+            allow_connect_manager_test_bearer,
         }
     }
 }
@@ -524,6 +538,25 @@ fn unauthenticated_dev_user_principal() -> Principal {
             scopes: vec!["openshell:all".to_string()],
             provider: crate::auth::identity::IdentityProvider::LocalDev,
         },
+    })
+}
+
+fn connect_manager_test_principal(headers: &http::HeaderMap) -> Option<Principal> {
+    let expected = format!("Bearer {CONNECT_MANAGER_TEST_BEARER}");
+    (headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        == Some(expected.as_str()))
+    .then(|| {
+        Principal::User(UserPrincipal {
+            identity: Identity {
+                subject: "aegis-connect-manager-test".to_string(),
+                display_name: Some("AEGIS Connect Manager Test".to_string()),
+                roles: vec!["openshell-admin".to_string()],
+                scopes: vec!["openshell:all".to_string()],
+                provider: crate::auth::identity::IdentityProvider::LocalDev,
+            },
+        })
     })
 }
 
@@ -552,6 +585,7 @@ where
         let peer_identity = self.peer_identity.clone();
         let mtls_auth_enabled = self.mtls_auth_enabled;
         let allow_unauthenticated_users = self.allow_unauthenticated_users;
+        let allow_connect_manager_test_bearer = self.allow_connect_manager_test_bearer;
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -564,7 +598,11 @@ where
                 return inner.ready().await?.call(req).await;
             }
 
-            let principal = if let Some(chain) = chain {
+            let principal = if allow_connect_manager_test_bearer
+                && let Some(principal) = connect_manager_test_principal(req.headers())
+            {
+                principal
+            } else if let Some(chain) = chain {
                 match chain.authenticate(req.headers(), &path).await {
                     Ok(Some(p)) => p,
                     Ok(None) => match (mtls_auth_enabled, peer_identity) {
@@ -1447,6 +1485,7 @@ mod tests {
                 Some(mtls_identity("openshell-client")),
                 true,
                 false,
+                false,
             );
 
             let res = router
@@ -1475,6 +1514,7 @@ mod tests {
                 Some(mtls_identity("openshell-client")),
                 true,
                 false,
+                false,
             );
 
             let res = router
@@ -1493,7 +1533,7 @@ mod tests {
         async fn mtls_auth_enabled_requires_peer_identity() {
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router =
-                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, true, false);
+                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, true, false, false);
 
             let res = router
                 .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
@@ -1509,8 +1549,15 @@ mod tests {
             let mock = Arc::new(MockAuthenticator::returning(Ok(None)));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
-            let mut router =
-                AuthGrpcRouter::with_peer_identity(recorder, Some(chain), None, None, false, true);
+            let mut router = AuthGrpcRouter::with_peer_identity(
+                recorder,
+                Some(chain),
+                None,
+                None,
+                false,
+                true,
+                false,
+            );
 
             let res = router
                 .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
@@ -1532,7 +1579,7 @@ mod tests {
         async fn unauthenticated_dev_user_authenticates_without_chain_when_enabled() {
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router =
-                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, false, true);
+                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, false, true, false);
 
             let res = router
                 .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
@@ -1545,6 +1592,48 @@ mod tests {
                 Some(Principal::User(user))
                     if user.identity.subject == "unauthenticated-local-dev"
             ));
+        }
+
+        #[tokio::test]
+        async fn connect_manager_test_bearer_is_accepted_only_when_enabled() {
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router =
+                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, false, false, true);
+            let mut request = empty_request("/openshell.v1.OpenShell/ListSandboxes");
+            request.headers_mut().insert(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer aegis-connect-manager-test-v1"),
+            );
+
+            let response = router.call(request).await.unwrap();
+
+            assert_eq!(response.status(), 200);
+            assert!(matches!(
+                seen.lock().unwrap().as_ref(),
+                Some(Principal::User(user)) if user.identity.subject == "aegis-connect-manager-test"
+            ));
+
+            let mock = Arc::new(MockAuthenticator::returning(Ok(None)));
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut disabled = AuthGrpcRouter::with_peer_identity(
+                recorder,
+                Some(AuthenticatorChain::new(vec![mock])),
+                None,
+                None,
+                false,
+                false,
+                false,
+            );
+            let mut request = empty_request("/openshell.v1.OpenShell/ListSandboxes");
+            request.headers_mut().insert(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer aegis-connect-manager-test-v1"),
+            );
+
+            let response = disabled.call(request).await.unwrap();
+
+            assert_eq!(grpc_status(&response).as_deref(), Some("16"));
+            assert!(seen.lock().unwrap().is_none());
         }
 
         #[tokio::test]

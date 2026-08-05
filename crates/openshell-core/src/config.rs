@@ -513,6 +513,11 @@ pub struct GatewayAuthConfig {
     /// gateway-minted sandbox JWTs.
     #[serde(default)]
     pub allow_unauthenticated_users: bool,
+    /// Enables the fixed, non-production bearer used only by the Connect
+    /// Manager local lifecycle E2E. It never calls an issuer and must remain
+    /// disabled in all release configurations.
+    #[serde(default)]
+    pub allow_connect_manager_test_bearer: bool,
 }
 
 const fn default_jwks_ttl_secs() -> u64 {
