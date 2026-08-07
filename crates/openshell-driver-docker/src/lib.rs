@@ -9,9 +9,9 @@ use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, CreateImageInfo,
-    DeviceRequest, EndpointSettings, HostConfig, Mount, MountTmpfsOptions, MountTypeEnum,
-    MountVolumeOptions, NetworkCreateRequest, NetworkingConfig, ProgressDetail, RestartPolicy,
-    RestartPolicyNameEnum, SystemInfo,
+    DeviceRequest, EndpointSettings, HostConfig, Mount, MountImageOptions, MountTmpfsOptions,
+    MountTypeEnum, MountVolumeOptions, NetworkCreateRequest, NetworkingConfig, ProgressDetail,
+    RestartPolicy, RestartPolicyNameEnum, SystemInfo,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -25,7 +25,8 @@ use openshell_core::config::{
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_NAMESPACE, SUPERVISOR_IMAGE_BINARY_PATH, supervisor_image_should_refresh,
+    LABEL_SANDBOX_NAMESPACE, SUPERVISOR_CONTAINER_DIR, SUPERVISOR_IMAGE_BINARY_PATH,
+    supervisor_image_should_refresh,
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
@@ -157,6 +158,12 @@ pub struct DockerComputeConfig {
     /// Optional override for the Linux `openshell-sandbox` binary mounted into containers.
     pub supervisor_bin: Option<PathBuf>,
 
+    /// Optional digest-pinned image mounted directly by the Docker daemon at
+    /// the in-container supervisor directory. This is required when the
+    /// gateway itself runs in a container and gateway-local bind paths are not
+    /// visible to the host Docker daemon.
+    pub supervisor_image_mount: Option<String>,
+
     /// Optional image used to extract the Linux `openshell-sandbox` binary.
     /// Ignored when `supervisor_bin` is set. See `resolve_supervisor_bin` for
     /// the full resolution order.
@@ -199,6 +206,7 @@ impl Default for DockerComputeConfig {
             sandbox_namespace: "default".to_string(),
             grpc_endpoint: String::new(),
             supervisor_bin: None,
+            supervisor_image_mount: None,
             supervisor_image: None,
             guest_tls_ca: None,
             guest_tls_cert: None,
@@ -230,7 +238,8 @@ struct DockerDriverRuntimeConfig {
     ssh_socket_path: String,
     stop_timeout_secs: u32,
     log_level: String,
-    supervisor_bin: PathBuf,
+    supervisor_bin: Option<PathBuf>,
+    supervisor_image_mount: Option<String>,
     guest_tls: Option<DockerGuestTlsPaths>,
     daemon_version: String,
     supports_gpu: bool,
@@ -398,7 +407,12 @@ impl DockerComputeDriver {
             gateway_port,
         );
         let daemon_arch = normalize_docker_arch(version.arch.as_deref().unwrap_or_default());
-        let supervisor_bin = resolve_supervisor_bin(&docker, &docker_config, &daemon_arch).await?;
+        let supervisor_image_mount = validate_supervisor_image_mount(&docker_config)?;
+        let supervisor_bin = if supervisor_image_mount.is_some() {
+            None
+        } else {
+            Some(resolve_supervisor_bin(&docker, &docker_config, &daemon_arch).await?)
+        };
         let guest_tls = docker_guest_tls_paths(&docker_config)?;
 
         let driver = Self {
@@ -414,6 +428,7 @@ impl DockerComputeDriver {
                 stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
                 log_level: config.log_level.clone(),
                 supervisor_bin,
+                supervisor_image_mount,
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
                 supports_gpu,
@@ -2037,11 +2052,12 @@ fn build_binds(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
 ) -> Result<Vec<String>, Status> {
-    let mut binds = vec![format!(
-        "{}:{}:ro,z",
-        config.supervisor_bin.display(),
-        SUPERVISOR_MOUNT_PATH
-    )];
+    let mut binds = config
+        .supervisor_bin
+        .as_ref()
+        .map(|path| format!("{}:{}:ro,z", path.display(), SUPERVISOR_MOUNT_PATH))
+        .into_iter()
+        .collect::<Vec<_>>();
     if let Some(tls) = &config.guest_tls {
         binds.push(format!("{}:{}:ro,z", tls.ca.display(), TLS_CA_MOUNT_PATH));
         binds.push(format!(
@@ -2325,7 +2341,20 @@ fn build_container_create_body_with_gpu_devices(
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
     let resource_limits = docker_resource_limits(template)?;
-    let user_mounts = docker_driver_mounts(driver_config)?;
+    let mut user_mounts = docker_driver_mounts(driver_config)?;
+    if let Some(image) = &config.supervisor_image_mount {
+        user_mounts.insert(
+            0,
+            Mount {
+                target: Some(SUPERVISOR_CONTAINER_DIR.to_string()),
+                source: Some(image.clone()),
+                typ: Some(MountTypeEnum::IMAGE),
+                read_only: Some(true),
+                image_options: Some(MountImageOptions::default()),
+                ..Default::default()
+            },
+        );
+    }
     let user_bind_strings = docker_driver_bind_strings(driver_config)?;
     let device_requests = gpu_device_ids.map(|device_ids| {
         vec![DeviceRequest {
@@ -2403,6 +2432,29 @@ fn build_container_create_body_with_gpu_devices(
         }),
         ..Default::default()
     })
+}
+
+fn validate_supervisor_image_mount(config: &DockerComputeConfig) -> CoreResult<Option<String>> {
+    let Some(image) = config.supervisor_image_mount.as_deref() else {
+        return Ok(None);
+    };
+    if config.supervisor_bin.is_some() || config.supervisor_image.is_some() {
+        return Err(Error::config(
+            "docker supervisor_image_mount is mutually exclusive with supervisor_bin and supervisor_image",
+        ));
+    }
+    let digest = image
+        .rsplit_once("@sha256:")
+        .filter(|(name, _)| !name.is_empty())
+        .map(|(_, digest)| digest);
+    if !digest.is_some_and(|digest| {
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return Err(Error::config(
+            "docker supervisor_image_mount must be digest-pinned",
+        ));
+    }
+    Ok(Some(image.to_string()))
 }
 
 /// Reject driver requests that arrive with neither a sandbox id nor a

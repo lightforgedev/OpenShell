@@ -103,7 +103,8 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
         stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
         log_level: "info".to_string(),
-        supervisor_bin: PathBuf::from("/tmp/openshell-sandbox"),
+        supervisor_bin: Some(PathBuf::from("/tmp/openshell-sandbox")),
+        supervisor_image_mount: None,
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
             cert: PathBuf::from("/tmp/tls.crt"),
@@ -642,6 +643,63 @@ fn build_binds_uses_docker_tls_directory() {
         targets
             .iter()
             .all(|target| target.starts_with(TLS_MOUNT_DIR) || target == SUPERVISOR_MOUNT_PATH)
+    );
+}
+
+#[test]
+fn supervisor_image_mount_replaces_gateway_local_bind() {
+    let image = concat!(
+        "example.com/openshell/supervisor@sha256:",
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    );
+    let mut config = runtime_config();
+    config.supervisor_bin = None;
+    config.supervisor_image_mount = Some(image.to_string());
+
+    let body = build_container_create_body(&test_sandbox(), &config).unwrap();
+    let host_config = body.host_config.unwrap();
+    let binds = host_config.binds.unwrap();
+    let mounts = host_config.mounts.unwrap();
+
+    assert!(
+        !binds
+            .iter()
+            .any(|bind| bind.contains(SUPERVISOR_MOUNT_PATH))
+    );
+    assert!(mounts.iter().any(|mount| {
+        mount.typ == Some(MountTypeEnum::IMAGE)
+            && mount.source.as_deref() == Some(image)
+            && mount.target.as_deref() == Some(SUPERVISOR_CONTAINER_DIR)
+            && mount.read_only == Some(true)
+    }));
+}
+
+#[test]
+fn supervisor_image_mount_requires_digest_and_exclusive_source() {
+    let mut config = DockerComputeConfig {
+        supervisor_image_mount: Some("example.com/openshell/supervisor:latest".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        validate_supervisor_image_mount(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("must be digest-pinned")
+    );
+
+    config.supervisor_image_mount = Some(
+        concat!(
+            "example.com/openshell/supervisor@sha256:",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        )
+        .to_string(),
+    );
+    config.supervisor_bin = Some(PathBuf::from("/tmp/openshell-sandbox"));
+    assert!(
+        validate_supervisor_image_mount(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("mutually exclusive")
     );
 }
 

@@ -75,8 +75,15 @@ openshell sandbox create \
 
 ## Supervisor Binary Resolution
 
-The Docker driver bind-mounts a host-side Linux `openshell-sandbox` binary into
-each sandbox container. Resolution order is:
+The Docker driver normally bind-mounts a host-side Linux `openshell-sandbox`
+binary into each sandbox container. When the gateway itself runs in a
+container against the host Docker socket, configure `supervisor_image_mount`
+with a digest-pinned supervisor image instead. The Docker daemon mounts that
+image directly at `/opt/openshell/bin`, avoiding gateway-local paths that the
+daemon cannot see. `supervisor_image_mount` is mutually exclusive with
+`supervisor_bin` and `supervisor_image`.
+
+Binary resolution order when `supervisor_image_mount` is absent:
 
 1. `supervisor_bin` in `[openshell.drivers.docker]`.
 2. `supervisor_image` in `[openshell.drivers.docker]`, extracting

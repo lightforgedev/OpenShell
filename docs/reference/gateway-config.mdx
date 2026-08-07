@@ -229,6 +229,9 @@ grpc_endpoint      = "https://host.openshell.internal:17670"
 supervisor_bin     = "/usr/local/libexec/openshell/openshell-sandbox"
 # When supervisor_bin is omitted, Docker extracts /openshell-sandbox from this image.
 supervisor_image   = "ghcr.io/nvidia/openshell/supervisor:latest"
+# Containerized gateways using the host Docker socket should replace both
+# supervisor_bin and supervisor_image with a digest-pinned daemon image mount:
+# supervisor_image_mount = "ghcr.io/nvidia/openshell/supervisor@sha256:<digest>"
 guest_tls_ca       = "/etc/openshell/certs/ca.pem"
 guest_tls_cert     = "/etc/openshell/certs/client.pem"
 guest_tls_key      = "/etc/openshell/certs/client-key.pem"
