@@ -672,6 +672,46 @@ fn supervisor_image_mount_replaces_gateway_local_bind() {
             && mount.target.as_deref() == Some(SUPERVISOR_CONTAINER_DIR)
             && mount.read_only == Some(true)
     }));
+    assert!(
+        !binds.iter().any(|bind| {
+            bind.contains(TLS_MOUNT_DIR) || bind.contains(SANDBOX_TOKEN_MOUNT_PATH)
+        })
+    );
+}
+
+#[test]
+fn gateway_material_archive_contains_restricted_token_and_tls_files() {
+    let tls = (b"ca".to_vec(), b"cert".to_vec(), b"key".to_vec());
+    let bytes = gateway_material_archive("signed-token", Some(&tls)).unwrap();
+    let mut archive = tar::Archive::new(bytes.as_slice());
+    let entries = archive.entries().unwrap();
+    let files = entries
+        .map(|entry| {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().into_owned();
+            let mode = entry.header().mode().unwrap();
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents).unwrap();
+            (path, (mode, contents))
+        })
+        .collect::<HashMap<_, _>>();
+
+    assert_eq!(
+        files.get("etc/openshell/auth/sandbox.jwt"),
+        Some(&(0o600, "signed-token\n".to_string()))
+    );
+    assert_eq!(
+        files.get("etc/openshell/tls/client/ca.crt"),
+        Some(&(0o644, "ca".to_string()))
+    );
+    assert_eq!(
+        files.get("etc/openshell/tls/client/tls.crt"),
+        Some(&(0o644, "cert".to_string()))
+    );
+    assert_eq!(
+        files.get("etc/openshell/tls/client/tls.key"),
+        Some(&(0o600, "key".to_string()))
+    );
 }
 
 #[test]

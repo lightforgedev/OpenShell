@@ -5,7 +5,6 @@
 
 #![allow(clippy::result_large_err)]
 
-use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, CreateImageInfo,
@@ -16,7 +15,9 @@ use bollard::models::{
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
     ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, StopContainerOptionsBuilder,
+    UploadToContainerOptionsBuilder,
 };
+use bollard::{Docker, body_full};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use openshell_core::config::{
@@ -758,11 +759,16 @@ impl DockerComputeDriver {
             .map_err(|status| {
                 DockerProvisioningFailure::new("ImagePullFailed", status.message())
             })?;
-        let token_file_created = write_sandbox_token_file(sandbox, &self.config)
-            .await
-            .map_err(|status| {
-                DockerProvisioningFailure::new("SandboxTokenWriteFailed", status.message())
-            })?;
+        let upload_gateway_materials = self.config.supervisor_image_mount.is_some();
+        let token_file_created = if upload_gateway_materials {
+            false
+        } else {
+            write_sandbox_token_file(sandbox, &self.config)
+                .await
+                .map_err(|status| {
+                    DockerProvisioningFailure::new("SandboxTokenWriteFailed", status.message())
+                })?
+        };
 
         let container_name = container_name_for_sandbox(sandbox);
         let gpu_devices = self
@@ -815,6 +821,28 @@ impl DockerComputeDriver {
             format!("Created Docker container \"{container_name}\""),
             HashMap::from([("container_name".to_string(), container_name.clone())]),
         );
+
+        if upload_gateway_materials
+            && let Err(status) = upload_gateway_materials_to_container(
+                &self.docker,
+                &container_name,
+                sandbox,
+                &self.config,
+            )
+            .await
+        {
+            let _ = self
+                .docker
+                .remove_container(
+                    &container_name,
+                    Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+                )
+                .await;
+            return Err(DockerProvisioningFailure::new(
+                "SandboxMaterialUploadFailed",
+                status.message(),
+            ));
+        }
 
         if let Err(err) = self.docker.start_container(&container_name, None).await {
             let cleanup = self
@@ -2058,7 +2086,9 @@ fn build_binds(
         .map(|path| format!("{}:{}:ro,z", path.display(), SUPERVISOR_MOUNT_PATH))
         .into_iter()
         .collect::<Vec<_>>();
-    if let Some(tls) = &config.guest_tls {
+    if config.supervisor_image_mount.is_none()
+        && let Some(tls) = &config.guest_tls
+    {
         binds.push(format!("{}:{}:ro,z", tls.ca.display(), TLS_CA_MOUNT_PATH));
         binds.push(format!(
             "{}:{}:ro,z",
@@ -2067,10 +2097,11 @@ fn build_binds(
         ));
         binds.push(format!("{}:{}:ro,z", tls.key.display(), TLS_KEY_MOUNT_PATH));
     }
-    if sandbox
-        .spec
-        .as_ref()
-        .is_some_and(|spec| !spec.sandbox_token.is_empty())
+    if config.supervisor_image_mount.is_none()
+        && sandbox
+            .spec
+            .as_ref()
+            .is_some_and(|spec| !spec.sandbox_token.is_empty())
     {
         binds.push(format!(
             "{}:{}:ro,z",
@@ -2079,6 +2110,87 @@ fn build_binds(
         ));
     }
     Ok(binds)
+}
+
+async fn upload_gateway_materials_to_container(
+    docker: &Docker,
+    container_name: &str,
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<(), Status> {
+    let token = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.sandbox_token.as_str())
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| Status::failed_precondition("sandbox token is required"))?;
+    let tls = if let Some(paths) = &config.guest_tls {
+        Some((
+            tokio::fs::read(&paths.ca)
+                .await
+                .map_err(|err| Status::internal(format!("read guest TLS CA failed: {err}")))?,
+            tokio::fs::read(&paths.cert)
+                .await
+                .map_err(|err| Status::internal(format!("read guest TLS cert failed: {err}")))?,
+            tokio::fs::read(&paths.key)
+                .await
+                .map_err(|err| Status::internal(format!("read guest TLS key failed: {err}")))?,
+        ))
+    } else {
+        None
+    };
+    let archive = gateway_material_archive(token, tls.as_ref())?;
+    docker
+        .upload_to_container(
+            container_name,
+            Some(UploadToContainerOptionsBuilder::default().path("/").build()),
+            body_full(archive.into()),
+        )
+        .await
+        .map_err(|err| internal_status("upload sandbox authentication material", err))
+}
+
+fn gateway_material_archive(
+    token: &str,
+    tls: Option<&(Vec<u8>, Vec<u8>, Vec<u8>)>,
+) -> Result<Vec<u8>, Status> {
+    let mut archive = tar::Builder::new(Vec::new());
+    append_gateway_material(
+        &mut archive,
+        "etc/openshell/auth/sandbox.jwt",
+        format!("{token}\n").as_bytes(),
+        0o600,
+    )?;
+    if let Some((ca, cert, key)) = tls {
+        append_gateway_material(&mut archive, "etc/openshell/tls/client/ca.crt", ca, 0o644)?;
+        append_gateway_material(
+            &mut archive,
+            "etc/openshell/tls/client/tls.crt",
+            cert,
+            0o644,
+        )?;
+        append_gateway_material(&mut archive, "etc/openshell/tls/client/tls.key", key, 0o600)?;
+    }
+    archive
+        .into_inner()
+        .map_err(|err| Status::internal(format!("finish sandbox material archive failed: {err}")))
+}
+
+fn append_gateway_material(
+    archive: &mut tar::Builder<Vec<u8>>,
+    path: &str,
+    contents: &[u8],
+    mode: u32,
+) -> Result<(), Status> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(contents.len() as u64);
+    header.set_mode(mode);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, path, contents)
+        .map_err(|err| Status::internal(format!("append sandbox material failed: {err}")))
 }
 
 fn sandbox_token_host_path(
