@@ -1439,6 +1439,10 @@ enum SandboxCommands {
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
 
+        /// Suppress warnings when --env values look like credentials.
+        #[arg(long = "no-credential-warnings")]
+        no_credential_warnings: bool,
+
         /// Approval mode for agent-authored policy proposals.
         ///
         /// `manual` (default): every proposal lands in the draft inbox for
@@ -2959,6 +2963,7 @@ async fn run_async() -> Result<()> {
                     no_auto_providers,
                     labels,
                     envs,
+                    no_credential_warnings,
                     approval_mode,
                     output,
                     command,
@@ -2996,6 +3001,7 @@ async fn run_async() -> Result<()> {
 
                     // Parse --env flags into a HashMap<String, String>.
                     let env_map = run::parse_env_pairs(&envs)?;
+                    run::warn_credential_env_vars(&env_map, no_credential_warnings);
 
                     // Parse --upload specs into [(local_path, sandbox_path, git_ignore)].
                     let upload_specs: Vec<(String, Option<String>, bool)> = upload
