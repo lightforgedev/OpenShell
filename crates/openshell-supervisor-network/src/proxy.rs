@@ -3,7 +3,7 @@
 
 //! HTTP CONNECT proxy with OPA policy evaluation and process-identity binding.
 
-mod destination;
+pub(crate) mod destination;
 mod egress;
 mod relay;
 
@@ -3101,7 +3101,7 @@ fn normalize_host_lookup_key(host: &str) -> &str {
 
 /// Returns `true` if `host` is one of the well-known driver-injected aliases
 /// for the host machine (e.g. `host.openshell.internal`).
-fn is_host_gateway_alias(host: &str) -> bool {
+pub(crate) fn is_host_gateway_alias(host: &str) -> bool {
     let h = normalize_host_lookup_key(host);
     HOST_GATEWAY_ALIASES
         .iter()
