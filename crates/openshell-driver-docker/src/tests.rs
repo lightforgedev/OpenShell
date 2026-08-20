@@ -289,7 +289,7 @@ fn docker_gateway_route_uses_host_gateway_for_docker_desktop() {
         DockerGatewayRoute::HostGateway
     );
     assert_eq!(
-        docker_extra_hosts(&DockerGatewayRoute::HostGateway),
+        docker_extra_hosts(&DockerGatewayRoute::HostGateway, &BTreeMap::new()),
         vec![
             "host.docker.internal:host-gateway".to_string(),
             "host.openshell.internal:host-gateway".to_string()
@@ -315,7 +315,7 @@ fn docker_gateway_route_uses_host_gateway_for_colima() {
         DockerGatewayRoute::HostGateway
     );
     assert_eq!(
-        docker_extra_hosts(&DockerGatewayRoute::HostGateway),
+        docker_extra_hosts(&DockerGatewayRoute::HostGateway, &BTreeMap::new()),
         vec![
             "host.docker.internal:host-gateway".to_string(),
             "host.openshell.internal:host-gateway".to_string()
@@ -409,7 +409,7 @@ fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
         }
     );
     assert_eq!(
-        docker_extra_hosts(&route),
+        docker_extra_hosts(&route, &BTreeMap::new()),
         vec![
             "host.docker.internal:172.18.0.1".to_string(),
             "host.openshell.internal:172.18.0.1".to_string()
@@ -458,7 +458,7 @@ fn docker_gateway_route_prefers_configured_host_gateway_ip() {
         }
     );
     assert_eq!(
-        docker_extra_hosts(&route),
+        docker_extra_hosts(&route, &BTreeMap::new()),
         vec![
             "host.docker.internal:172.20.0.4".to_string(),
             "host.openshell.internal:172.20.0.4".to_string()
@@ -1363,6 +1363,51 @@ fn validate_sandbox_rejects_unknown_driver_config_fields() {
 
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(err.message().contains("unknown field"));
+}
+
+#[test]
+fn validate_sandbox_rejects_reserved_extra_host_override() {
+    let config = runtime_config();
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "extra_hosts": {"host.docker.internal": "10.0.0.1"}
+    })));
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("may not override reserved host"));
+}
+
+#[test]
+fn build_container_create_body_includes_literal_extra_host() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "extra_hosts": {"platform.internal": "10.240.7.9"}
+    })));
+
+    let body = build_container_create_body(&sandbox, &runtime_config()).unwrap();
+    let hosts = body
+        .host_config
+        .as_ref()
+        .and_then(|config| config.extra_hosts.as_ref())
+        .expect("Docker extra hosts should be configured");
+
+    assert!(hosts.contains(&"platform.internal:10.240.7.9".to_string()));
 }
 
 #[test]
