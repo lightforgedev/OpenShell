@@ -50,6 +50,24 @@ pub enum NetworkAction {
     Deny { reason: String },
 }
 
+/// Endpoint identity and metadata captured with one policy generation.
+#[derive(Debug, Clone)]
+pub struct MatchedEndpoint {
+    pub policy_name: String,
+    pub endpoint_index: usize,
+    pub endpoint: regorus::Value,
+}
+
+/// Atomic policy result used to authorize and materialize one egress request.
+#[derive(Debug, Clone)]
+pub struct EgressAuthorization {
+    pub action: NetworkAction,
+    pub endpoint_configs: Vec<regorus::Value>,
+    pub matched_endpoints: Vec<MatchedEndpoint>,
+    pub exact_declared_endpoint_host: bool,
+    pub generation: u64,
+}
+
 /// Input for a network access policy evaluation.
 pub struct NetworkInput {
     pub host: String,
@@ -267,15 +285,6 @@ impl OpaEngine {
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.generation_tx.send_replace(generation);
         generation
-    }
-
-    #[cfg(test)]
-    pub(crate) fn poison_lock_for_test(&self) {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = self.engine.lock().expect("test engine lock");
-            panic!("poison OPA engine lock for compatibility fallback test");
-        }));
-        assert!(self.engine.is_poisoned());
     }
 
     /// Load policy from a `.rego` rules file and data from a YAML file.
@@ -517,6 +526,13 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(NetworkAction, u64)> {
+        let authorization = self.authorize_egress(input)?;
+        Ok((authorization.action, authorization.generation))
+    }
+
+    /// Authorize egress and return all connection metadata from one Rego result
+    /// evaluated against one policy generation.
+    pub fn authorize_egress(&self, input: &NetworkInput) -> Result<EgressAuthorization> {
         #[cfg(test)]
         record_test_opa_query();
 
@@ -534,34 +550,52 @@ impl OpaEngine {
             .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
             .clone();
         if let Some(reason) = fail_closed_reason {
-            return Ok((NetworkAction::Deny { reason }, generation));
+            return Ok(EgressAuthorization {
+                action: NetworkAction::Deny { reason },
+                endpoint_configs: Vec::new(),
+                matched_endpoints: Vec::new(),
+                exact_declared_endpoint_host: false,
+                generation,
+            });
         }
 
         set_regorus_input(&mut engine, input_json)?;
 
-        let action_val = engine
-            .eval_rule("data.openshell.sandbox.network_action".into())
+        let result = engine
+            .eval_rule("data.openshell.sandbox.egress_authorization".into())
             .map_err(|e| miette::miette!("{e}"))?;
-        let action_str = value_to_string(&action_val);
+        let action_str = get_str(&result, "action").unwrap_or_default();
+        let matched_policy = get_str(&result, "matched_policy").filter(|name| !name.is_empty());
+        let endpoint_configs = match get_field(&result, "endpoint_configs") {
+            Some(regorus::Value::Array(values)) => values.to_vec(),
+            _ => Vec::new(),
+        };
+        let matched_endpoints = match get_field(&result, "matched_endpoints") {
+            Some(regorus::Value::Array(values)) => {
+                values.iter().filter_map(parse_matched_endpoint).collect()
+            }
+            _ => Vec::new(),
+        };
+        let exact_declared_endpoint_host =
+            get_bool(&result, "exact_declared_endpoint_host").unwrap_or(false);
 
-        let matched = engine
-            .eval_rule("data.openshell.sandbox.matched_network_policy".into())
-            .map_err(|e| miette::miette!("{e}"))?;
-        let matched_policy = if matched == regorus::Value::Undefined {
-            None
+        let action = if action_str == "allow" {
+            NetworkAction::Allow { matched_policy }
         } else {
-            Some(value_to_string(&matched))
+            NetworkAction::Deny {
+                reason: get_str(&result, "deny_reason")
+                    .filter(|reason| !reason.is_empty())
+                    .unwrap_or_else(|| "network connections not allowed by policy".to_string()),
+            }
         };
 
-        if action_str == "allow" {
-            Ok((NetworkAction::Allow { matched_policy }, generation))
-        } else {
-            let reason_val = engine
-                .eval_rule("data.openshell.sandbox.deny_reason".into())
-                .map_err(|e| miette::miette!("{e}"))?;
-            let reason = value_to_string(&reason_val);
-            Ok((NetworkAction::Deny { reason }, generation))
-        }
+        Ok(EgressAuthorization {
+            action,
+            endpoint_configs,
+            matched_endpoints,
+            exact_declared_endpoint_host,
+            generation,
+        })
     }
 
     /// Reload policy and data from strings (data is YAML).
@@ -1153,6 +1187,21 @@ fn get_field<'a>(val: &'a regorus::Value, key: &str) -> Option<&'a regorus::Valu
         regorus::Value::Object(map) => map.get(&key_val),
         _ => None,
     }
+}
+
+fn parse_matched_endpoint(value: &regorus::Value) -> Option<MatchedEndpoint> {
+    let policy_name = get_str(value, "policy_name")?;
+    let endpoint_index = match get_field(value, "endpoint_index")? {
+        regorus::Value::Number(number) => usize::try_from(number.as_i64()?).ok()?,
+        _ => return None,
+    };
+    let endpoint = get_field(value, "endpoint")?.clone();
+
+    Some(MatchedEndpoint {
+        policy_name,
+        endpoint_index,
+        endpoint,
+    })
 }
 
 fn regorus_value_to_struct(value: &regorus::Value) -> prost_types::Struct {
@@ -1826,6 +1875,11 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     }
                     if !e.signing_region.is_empty() {
                         ep["signing_region"] = e.signing_region.clone().into();
+                    }
+                    if let Some(binding) = &e.credential_binding {
+                        ep["credential_binding"] = serde_json::json!({
+                            "provider": binding.provider.clone(),
+                        });
                     }
                     if !e.persisted_queries.is_empty() {
                         ep["persisted_queries"] = e.persisted_queries.clone().into();
@@ -2692,6 +2746,7 @@ network_policies:
     name: l4_only
     endpoints:
       - { host: l4only.example.com, port: 443 }
+      - { host: explicit-tcp.example.com, port: 443, protocol: tcp }
     binaries:
       - { path: /usr/bin/curl }
 filesystem_policy:
@@ -4476,6 +4531,26 @@ network_policies:
     }
 
     #[test]
+    fn explicit_tcp_authorizes_as_l4_without_endpoint_config() {
+        let engine = l7_engine();
+        let input = NetworkInput {
+            host: "explicit-tcp.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        assert!(matches!(
+            engine.evaluate_network_action(&input).unwrap(),
+            NetworkAction::Allow { .. }
+        ));
+        assert!(engine.query_endpoint_config(&input).unwrap().is_none());
+        assert!(engine.query_exact_declared_endpoint_host(&input).unwrap());
+    }
+
+    #[test]
     fn l7_endpoint_config_preserves_mcp_strict_tool_names_opt_out() {
         let data = r#"
 network_policies:
@@ -5360,6 +5435,18 @@ process:
             }
         );
 
+        let authorization = engine.authorize_egress(&input).unwrap();
+        let mut endpoint_identities = authorization
+            .matched_endpoints
+            .iter()
+            .map(|matched| (matched.policy_name.as_str(), matched.endpoint_index))
+            .collect::<Vec<_>>();
+        endpoint_identities.sort_unstable();
+        assert_eq!(
+            endpoint_identities,
+            [("allow_192_168_1_100_8567", 0), ("test_server", 0),]
+        );
+
         let (configs, generation) = engine
             .query_endpoint_configs_with_generation(&input)
             .unwrap();
@@ -5800,6 +5887,121 @@ process:
             decision.reason
         );
         assert_eq!(decision.matched_policy.as_deref(), Some("internal_api"));
+    }
+
+    #[test]
+    fn egress_authorization_returns_one_generation_consistent_snapshot() {
+        let engine = allowed_ips_engine();
+        let input = NetworkInput {
+            host: "my-service.corp.net".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let authorization = engine.authorize_egress(&input).unwrap();
+
+        assert_eq!(authorization.generation, engine.current_generation());
+        assert_eq!(
+            authorization.action,
+            NetworkAction::Allow {
+                matched_policy: Some("internal_api".to_string())
+            }
+        );
+        assert!(authorization.exact_declared_endpoint_host);
+        assert_eq!(authorization.endpoint_configs.len(), 1);
+        assert_eq!(
+            get_str_array(&authorization.endpoint_configs[0], "allowed_ips"),
+            vec!["10.0.5.0/24"]
+        );
+        assert_eq!(authorization.matched_endpoints.len(), 1);
+        assert_eq!(
+            authorization.matched_endpoints[0].policy_name,
+            "internal_api"
+        );
+        assert_eq!(authorization.matched_endpoints[0].endpoint_index, 0);
+        assert_eq!(
+            get_str(&authorization.matched_endpoints[0].endpoint, "host").as_deref(),
+            Some("my-service.corp.net")
+        );
+    }
+
+    #[test]
+    fn egress_authorization_preserves_explicit_tcp_endpoint_identity() {
+        let engine = OpaEngine::from_strings(
+            TEST_POLICY,
+            r#"
+network_policies:
+  native_tcp:
+    name: native_tcp
+    endpoints:
+      - host: database.example.com
+        port: 5432
+        protocol: tcp
+    binaries:
+      - path: /usr/bin/client
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#,
+        )
+        .expect("explicit TCP policy should load");
+        let input = NetworkInput {
+            host: "database.example.com".into(),
+            port: 5432,
+            binary_path: PathBuf::from("/usr/bin/client"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let authorization = engine.authorize_egress(&input).unwrap();
+
+        assert!(authorization.endpoint_configs.is_empty());
+        assert_eq!(authorization.matched_endpoints.len(), 1);
+        let matched = &authorization.matched_endpoints[0];
+        assert_eq!(matched.policy_name, "native_tcp");
+        assert_eq!(matched.endpoint_index, 0);
+        assert_eq!(
+            get_str(&matched.endpoint, "protocol").as_deref(),
+            Some("tcp")
+        );
+    }
+
+    #[test]
+    fn proto_activation_rejects_explicit_tcp_credential_binding() {
+        let proto = openshell_policy::parse_sandbox_policy(
+            r#"
+version: 1
+network_policies:
+  native_tcp:
+    name: native_tcp
+    endpoints:
+      - host: database.example.com
+        port: 5432
+        protocol: tcp
+        credential_binding:
+          provider: database
+    binaries:
+      - path: /usr/bin/client
+"#,
+        )
+        .expect("policy should parse before semantic validation");
+
+        let error = OpaEngine::from_proto(&proto)
+            .err()
+            .expect("explicit TCP must reject credential binding during activation");
+
+        assert!(error.to_string().contains("credential_binding"));
+        assert!(error.to_string().contains("protocol tcp"));
     }
 
     #[test]
