@@ -36,10 +36,17 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Prepared
 /// Neither operation requires root privileges.
 pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
     if let Some(ruleset) = prepared.landlock {
-        landlock::enforce(ruleset)?;
+        let _ = landlock::enforce(ruleset)?;
     }
     seccomp::apply(&prepared.policy)?;
     Ok(())
+}
+
+pub fn landlock_evidence_env(prepared: &PreparedSandbox) -> Option<[(String, String); 2]> {
+    prepared
+        .landlock
+        .as_ref()
+        .and_then(|ruleset| ruleset.evidence_env())
 }
 
 /// Apply the supervisor seccomp prelude after privileged bootstrap completes.

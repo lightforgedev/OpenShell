@@ -127,6 +127,39 @@ OpenShell applies defense in depth across four policy domains:
 
 Policies are declarative YAML files. Static sections (filesystem, process) are locked at creation; dynamic sections (network, inference) can be hot-reloaded on a running sandbox with `openshell policy set`.
 
+For `landlock.compatibility: hard_requirement`, sandboxed child processes receive
+`OPENSHELL_LANDLOCK_ABI` and `OPENSHELL_LANDLOCK_RULES_APPLIED` after the
+filesystem ruleset is prepared. Best-effort Landlock does not export these
+evidence fields because enforcement may legitimately degrade.
+
+Policies that need child process evidence from `/proc/self/status` should allow
+`/proc` read-only. A narrower `/proc/self` rule can fail under hard Landlock.
+
+Network binary rules may optionally bind a binary grant to the effective UID/GID of the process opening the connection. This lets one shared sandbox run multiple non-root agent users while allowing a tool for one agent and denying the same tool for another. Omit `uid`/`gid` for legacy sandbox-wide binary matching.
+
+```yaml
+network_policies:
+  agent_a_curl:
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+    binaries:
+      - path: /usr/bin/curl
+        uid: 20001
+        gid: 20001
+```
+
+With this policy, `/usr/bin/curl` is allowed for a process running as effective UID/GID `20001:20001` and denied for another agent user in the same sandbox unless a separate matching rule exists.
+
+For supervisor-managed command execution, use `openshell sandbox exec --user <name>` to run one command as a non-root OS user inside the sandbox. The long-lived sandbox policy still controls default process identity, while UID/GID-scoped network rules enforce the effective identity of the process opening the connection.
+
+UID/GID-scoped rules are for multiple agents inside one organization sandbox.
+They are not a tenant boundary for multiple customer organizations sharing one Linux namespace.
+Per-agent separation assumes the sandbox prevents setuid/setgid escalation, does not grant `CAP_SETUID` or `CAP_SETGID` to agent processes, and uses `nosuid` or equivalent filesystem posture for untrusted writable mounts.
+For nested organization sandbox design notes, see [Nested Org Sandbox Feasibility](docs/security/nested-org-sandbox-feasibility.mdx) and the [Nested Org Sandbox Tracker](docs/reference/nested-org-sandbox-tracker.mdx).
+
 ## Providers
 
 Agents need credentials — API keys, tokens, service accounts. OpenShell manages these as **providers**: named credential bundles that are injected into sandboxes at creation. The CLI auto-discovers credentials for recognized agents (Claude, Codex, OpenCode, Copilot) from your shell environment, or you can create providers explicitly with `openshell provider create`. Credentials never leak into the sandbox filesystem; they are injected as environment variables at runtime.

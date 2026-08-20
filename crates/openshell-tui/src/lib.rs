@@ -870,6 +870,7 @@ async fn handle_shell_connect(
     let session = {
         let req = openshell_core::proto::CreateSshSessionRequest {
             sandbox_id: sandbox_id.clone(),
+            org_id: String::new(),
         };
         match tokio::time::timeout(Duration::from_secs(5), app.client.create_ssh_session(req)).await
         {
@@ -1016,6 +1017,7 @@ async fn handle_exec_command(
     let session = {
         let req = openshell_core::proto::CreateSshSessionRequest {
             sandbox_id: sandbox_id.clone(),
+            org_id: String::new(),
         };
         match tokio::time::timeout(Duration::from_secs(5), app.client.create_ssh_session(req)).await
         {
@@ -1453,6 +1455,7 @@ async fn start_port_forwards(
     let session = {
         let req = openshell_core::proto::CreateSshSessionRequest {
             sandbox_id: sandbox_id.to_string(),
+            org_id: String::new(),
         };
         match tokio::time::timeout(Duration::from_secs(10), client.create_ssh_session(req)).await {
             Ok(Ok(resp)) => resp.into_inner(),

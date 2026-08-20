@@ -230,11 +230,11 @@ jobs:
           fi
 
           mise x -- rustup target add "${{ steps.target.outputs.target }}"
-          
+
           cargo_cmd=(cargo build)
           build_target="${{ steps.target.outputs.target }}"
           args=()
-          
+
           if [[ "${{ inputs.component }}" == "gateway" ]]; then
             cargo_cmd=(cargo zigbuild)
             build_target="${{ steps.target.outputs.zig_target }}"

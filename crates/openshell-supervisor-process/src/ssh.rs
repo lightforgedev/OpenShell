@@ -217,6 +217,7 @@ struct ChannelState {
 
 struct SshHandler {
     policy: SandboxPolicy,
+    session_user: Option<String>,
     workdir: Option<String>,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
@@ -239,6 +240,7 @@ impl SshHandler {
     ) -> Self {
         Self {
             policy,
+            session_user: None,
             workdir,
             netns_fd,
             proxy_url,
@@ -248,21 +250,55 @@ impl SshHandler {
             channels: HashMap::new(),
         }
     }
+
+    fn authenticate_user(&mut self, user: &str) -> Result<Auth, anyhow::Error> {
+        if requested_user_resolves_to_root(user)? {
+            return Ok(Auth::reject());
+        }
+        self.session_user = Some(user.to_string());
+        Ok(Auth::Accept)
+    }
+
+    fn policy_for_session_user(&self) -> SandboxPolicy {
+        let Some(user) = self.session_user.as_deref().filter(|user| !user.is_empty()) else {
+            return self.policy.clone();
+        };
+
+        let mut policy = self.policy.clone();
+        policy.process.run_as_user = Some(user.to_string());
+        policy.process.run_as_group = None;
+        policy
+    }
+}
+
+fn requested_user_resolves_to_root(user: &str) -> Result<bool, anyhow::Error> {
+    if user == "root" {
+        return Ok(true);
+    }
+    if user.parse::<u32>().is_ok_and(|uid| uid == 0) {
+        return Ok(true);
+    }
+
+    let Some(record) = nix::unistd::User::from_name(user)? else {
+        return Ok(false);
+    };
+
+    Ok(record.uid.as_raw() == 0 || record.gid.as_raw() == 0)
 }
 
 impl russh::server::Handler for SshHandler {
     type Error = anyhow::Error;
 
-    async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
-        Ok(Auth::Accept)
+    async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
+        self.authenticate_user(user)
     }
 
     async fn auth_publickey(
         &mut self,
-        _user: &str,
+        user: &str,
         _public_key: &russh::keys::PublicKey,
     ) -> Result<Auth, Self::Error> {
-        Ok(Auth::Accept)
+        self.authenticate_user(user)
     }
 
     async fn channel_open_session(
@@ -453,12 +489,13 @@ impl russh::server::Handler for SshHandler {
     ) -> Result<(), Self::Error> {
         if name == "sftp" {
             session.channel_success(channel)?;
+            let policy = self.policy_for_session_user();
             // sftp-server speaks the SFTP binary protocol over stdin/stdout,
             // which is exactly what spawn_pipe_exec wires up.  This enables
             // modern scp (SFTP-based, OpenSSH 9.0+) and SFTP clients to
             // transfer files into and out of the sandbox.
             let input_sender = spawn_pipe_exec(
-                &self.policy,
+                &policy,
                 self.workdir.clone(),
                 Some("/usr/lib/openssh/sftp-server".to_string()),
                 session.handle(),
@@ -545,6 +582,7 @@ impl SshHandler {
         command: Option<String>,
     ) -> anyhow::Result<()> {
         let provider_env = self.provider_credentials.child_env_with_gcp_resolved();
+        let policy = self.policy_for_session_user();
         let state = self
             .channels
             .get_mut(&channel)
@@ -553,7 +591,7 @@ impl SshHandler {
             // PTY was requested — allocate a real PTY (interactive shell or
             // exec that explicitly asked for a terminal).
             let (pty_master, input_sender) = spawn_pty_shell(
-                &self.policy,
+                &policy,
                 self.workdir.clone(),
                 command,
                 &pty,
@@ -572,7 +610,7 @@ impl SshHandler {
             // separate and output has clean LF line endings.  This is the
             // path VSCode Remote-SSH exec commands take.
             let input_sender = spawn_pipe_exec(
-                &self.policy,
+                &policy,
                 self.workdir.clone(),
                 command,
                 handle,
@@ -812,6 +850,12 @@ fn spawn_pty_shell(
     #[cfg(target_os = "linux")]
     let prepared_sandbox = sandbox::linux::prepare(policy, workdir.as_deref())
         .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
+    #[cfg(target_os = "linux")]
+    if let Some(env_vars) = sandbox::linux::landlock_evidence_env(&prepared_sandbox) {
+        for (key, value) in env_vars {
+            cmd.env(key, value);
+        }
+    }
 
     #[cfg(unix)]
     {
@@ -961,6 +1005,12 @@ fn spawn_pipe_exec(
     #[cfg(target_os = "linux")]
     let prepared_sandbox = sandbox::linux::prepare(policy, workdir.as_deref())
         .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
+    #[cfg(target_os = "linux")]
+    if let Some(env_vars) = sandbox::linux::landlock_evidence_env(&prepared_sandbox) {
+        for (key, value) in env_vars {
+            cmd.env(key, value);
+        }
+    }
 
     #[cfg(unix)]
     {
@@ -1274,6 +1324,25 @@ fn is_loopback_host(host: &str) -> bool {
 mod tests {
     use super::*;
     use std::process::Stdio;
+
+    #[test]
+    fn requested_user_resolves_numeric_zero_aliases_to_root() {
+        assert!(requested_user_resolves_to_root("0").unwrap());
+        assert!(requested_user_resolves_to_root("00").unwrap());
+        assert!(requested_user_resolves_to_root("000").unwrap());
+    }
+
+    #[test]
+    fn requested_user_resolves_root_name_to_root_when_present() {
+        if nix::unistd::User::from_name("root").unwrap().is_some() {
+            assert!(requested_user_resolves_to_root("root").unwrap());
+        }
+    }
+
+    #[test]
+    fn requested_user_does_not_treat_unknown_name_as_root() {
+        assert!(!requested_user_resolves_to_root("__openshell_unknown_user__").unwrap());
+    }
 
     /// Verify that dropping the input sender (the operation `channel_eof`
     /// performs) causes the stdin writer loop to exit and close the child's

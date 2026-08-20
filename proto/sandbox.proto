@@ -258,6 +258,10 @@ message NetworkBinary {
   string path = 1;
   // Deprecated: the harness concept has been removed. This field is ignored.
   bool harness = 2 [deprecated = true];
+  // Optional effective UID scope. Zero means any UID.
+  uint32 uid = 3;
+  // Optional effective GID scope. Zero means any GID.
+  uint32 gid = 4;
 }
 
 // Request to get sandbox settings by sandbox ID.

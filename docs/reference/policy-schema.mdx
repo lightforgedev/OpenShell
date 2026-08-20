@@ -471,6 +471,12 @@ Identifies an executable that is permitted to use the associated endpoints.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `path` | string | Yes | Filesystem path to the executable. Supports glob patterns with `*` and `**`. For example, `/sandbox/.vscode-server/**` matches any executable under that directory tree. |
+| `uid` | integer | No | Effective UID required for this binary grant. Omit or set `0` for any UID. |
+| `gid` | integer | No | Effective GID required for this binary grant. Omit or set `0` for any GID. |
+
+UID/GID-scoped binary rules deny when the proxy cannot resolve the socket owner's effective UID/GID. Use them when one sandbox runs multiple OS users and the same binary path needs different network reach per agent.
+
+An unscoped binary entry for the same path applies to every UID/GID. Adding a UID/GID-scoped entry does not narrow or override an existing wildcard grant; remove or scope the unscoped entry first.
 
 ### Full Example
 

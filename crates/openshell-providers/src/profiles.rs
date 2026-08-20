@@ -855,6 +855,7 @@ fn binary_to_proto(binary: &BinaryProfile) -> NetworkBinary {
     NetworkBinary {
         path: binary.path.clone(),
         harness: binary.harness,
+        ..Default::default()
     }
 }
 

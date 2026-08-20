@@ -4541,6 +4541,7 @@ mod tests {
                     binaries: vec![NetworkBinary {
                         path: "/usr/bin/custom".to_string(),
                         harness: true,
+                        ..Default::default()
                     }],
                     inference_capable: false,
                     discovery: None,
@@ -5380,6 +5381,7 @@ mod tests {
                         binaries: vec![NetworkBinary {
                             path: "/usr/bin/custom".to_string(),
                             harness: true,
+                            ..Default::default()
                         }],
                         inference_capable: false,
                         discovery: None,

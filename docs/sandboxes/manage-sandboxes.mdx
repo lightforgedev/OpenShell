@@ -177,6 +177,14 @@ openshell sandbox exec -n my-sandbox --tty -- /bin/bash
 
 OpenShell allocates a TTY automatically when both stdin and stdout are terminals. Force the behavior with `--tty` or disable it with `--no-tty`.
 
+Run a command as a non-root OS user that exists inside the sandbox:
+
+```shell
+openshell sandbox exec -n my-sandbox --user ubuntu -- id
+```
+
+Use `--user` when a shared sandbox has multiple agent OS users and policy binds network grants to UID/GID. Root (`root` or `0`) is rejected.
+
 | Flag           | Purpose                                                  |
 | -------------- | -------------------------------------------------------- |
 | `-n`, `--name` | Sandbox to target.                                       |
@@ -185,6 +193,7 @@ OpenShell allocates a TTY automatically when both stdin and stdout are terminals
 | `--tty`        | Force TTY allocation.                                    |
 | `--no-tty`     | Disable TTY allocation even when attached to a terminal. |
 | `--env`        | Set an environment variable for the command (`KEY=VALUE`, repeatable). |
+| `--user`       | Run the command as a non-root OS user inside the sandbox. |
 
 ## Set Environment Variables
 

@@ -763,6 +763,7 @@ mod ocsf_event_tests {
                 openshell_core::proto::SshRelayTarget::default(),
             )),
             service_id: String::new(),
+            org_id: String::new(),
         }
     }
 
@@ -774,6 +775,7 @@ mod ocsf_event_tests {
                 port,
             })),
             service_id: String::new(),
+            org_id: String::new(),
         }
     }
 

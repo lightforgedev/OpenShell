@@ -182,6 +182,28 @@ pub fn read_ppid(pid: u32) -> Option<u32> {
     None
 }
 
+/// Read effective UID/GID from `/proc/<pid>/status`.
+#[cfg(target_os = "linux")]
+pub fn effective_process_ids(pid: u32) -> Option<(u32, u32)> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let mut uid = None;
+    let mut gid = None;
+
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            uid = rest.split_whitespace().nth(1).and_then(|v| v.parse().ok());
+        } else if let Some(rest) = line.strip_prefix("Gid:") {
+            gid = rest.split_whitespace().nth(1).and_then(|v| v.parse().ok());
+        }
+
+        if uid.is_some() && gid.is_some() {
+            break;
+        }
+    }
+
+    Some((uid?, gid?))
+}
+
 /// Walk the process tree upward from `pid`, collecting the binary path of each ancestor.
 ///
 /// Stops at PID 1 (init), `stop_pid` (the entrypoint process), or after 64 ancestors

@@ -2718,6 +2718,142 @@ pub async fn sandbox_get(
     Ok(())
 }
 
+/// Watch sandbox lifecycle snapshots as newline-delimited JSON.
+pub async fn sandbox_watch(
+    server: &str,
+    name: &str,
+    timeout_seconds: u64,
+    exit_on_deleting: bool,
+    include_events: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+
+    let sandbox = client
+        .get_sandbox(GetSandboxRequest {
+            name: name.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette::miette!("sandbox not found"))?;
+
+    let sandbox_id = sandbox.object_id().to_string();
+    if sandbox_id.is_empty() {
+        return Err(miette::miette!("sandbox missing id"));
+    }
+
+    let mut stream = client
+        .watch_sandbox(WatchSandboxRequest {
+            id: sandbox_id.clone(),
+            follow_status: true,
+            follow_logs: false,
+            follow_events: include_events,
+            log_tail_lines: 0,
+            event_tail: if include_events { 50 } else { 0 },
+            stop_on_terminal: false,
+            log_since_ms: 0,
+            log_sources: Vec::new(),
+            log_min_level: String::new(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    loop {
+        let next = if timeout_seconds == 0 {
+            stream.next().await
+        } else {
+            tokio::time::timeout(Duration::from_secs(timeout_seconds), stream.next())
+                .await
+                .map_err(|_| {
+                    miette::miette!(
+                        "timed out after {timeout_seconds}s waiting for sandbox watch event"
+                    )
+                })?
+        };
+
+        let Some(event) = next else {
+            return Ok(());
+        };
+
+        let event = event.into_diagnostic()?;
+        match event.payload {
+            Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox)) => {
+                print_sandbox_watch_snapshot(&sandbox)?;
+                if exit_on_deleting
+                    && SandboxPhase::try_from(sandbox.phase()) == Ok(SandboxPhase::Deleting)
+                {
+                    return Ok(());
+                }
+            }
+            Some(openshell_core::proto::sandbox_stream_event::Payload::Event(event)) => {
+                print_sandbox_watch_platform_event(&sandbox_id, &event)?;
+            }
+            Some(openshell_core::proto::sandbox_stream_event::Payload::Warning(warning)) => {
+                print_sandbox_watch_warning(&sandbox_id, &warning.message)?;
+            }
+            Some(openshell_core::proto::sandbox_stream_event::Payload::Log(_))
+            | Some(openshell_core::proto::sandbox_stream_event::Payload::DraftPolicyUpdate(_))
+            | None => {}
+        }
+    }
+}
+
+fn print_sandbox_watch_snapshot(sandbox: &Sandbox) -> Result<()> {
+    let meta = sandbox.metadata.as_ref();
+    let payload = serde_json::json!({
+        "type": "sandbox",
+        "observed_at_ms": current_epoch_ms()?,
+        "id": sandbox.object_id(),
+        "name": sandbox.object_name(),
+        "phase": phase_name(sandbox.phase()),
+        "phase_code": sandbox.phase(),
+        "resource_version": meta.map_or(0, |m| m.resource_version),
+        "current_policy_version": sandbox.current_policy_version(),
+    });
+    println!("{}", serde_json::to_string(&payload).into_diagnostic()?);
+    Ok(())
+}
+
+fn print_sandbox_watch_platform_event(sandbox_id: &str, event: &PlatformEvent) -> Result<()> {
+    let payload = serde_json::json!({
+        "type": "platform_event",
+        "observed_at_ms": current_epoch_ms()?,
+        "sandbox_id": sandbox_id,
+        "timestamp_ms": event.timestamp_ms,
+        "source": event.source,
+        "event_type": event.r#type,
+        "reason": event.reason,
+        "message": event.message,
+        "metadata": event.metadata,
+    });
+    println!("{}", serde_json::to_string(&payload).into_diagnostic()?);
+    Ok(())
+}
+
+fn print_sandbox_watch_warning(sandbox_id: &str, message: &str) -> Result<()> {
+    let payload = serde_json::json!({
+        "type": "warning",
+        "observed_at_ms": current_epoch_ms()?,
+        "sandbox_id": sandbox_id,
+        "message": message,
+    });
+    println!("{}", serde_json::to_string(&payload).into_diagnostic()?);
+    Ok(())
+}
+
+fn current_epoch_ms() -> Result<i64> {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .into_diagnostic()?
+            .as_millis(),
+    )
+    .into_diagnostic()
+}
+
 /// Maximum stdin payload size (4 MiB). Prevents the CLI from reading unbounded
 /// data into memory before the server rejects an oversized message.
 const MAX_STDIN_PAYLOAD: usize = 4 * 1024 * 1024;
@@ -2734,6 +2870,7 @@ pub async fn sandbox_exec_grpc(
     timeout_seconds: u32,
     tty_override: Option<bool>,
     environment: &HashMap<String, String>,
+    run_as_user: Option<&str>,
     tls: &TlsOptions,
 ) -> Result<i32> {
     let mut client = grpc_client(server, tls).await?;
@@ -2795,6 +2932,7 @@ pub async fn sandbox_exec_grpc(
             workdir,
             timeout_seconds,
             environment,
+            run_as_user,
         )
         .await;
     }
@@ -2809,6 +2947,7 @@ pub async fn sandbox_exec_grpc(
             timeout_seconds,
             stdin: stdin_payload,
             tty,
+            run_as_user: run_as_user.unwrap_or_default().to_string(),
             ..Default::default()
         })
         .await
@@ -2939,6 +3078,7 @@ async fn create_forward_session_token(
     let response = client
         .create_ssh_session(CreateSshSessionRequest {
             sandbox_id: sandbox_id.to_string(),
+            org_id: String::new(),
         })
         .await
         .map_err(ForwardTcpConnectionError::from_status)?;
@@ -3050,6 +3190,7 @@ async fn forward_one_tcp_connection(
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
             TcpForwardInit {
                 sandbox_id,
+                org_id: String::new(),
                 service_id,
                 target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
                     host: target_host,
@@ -3152,6 +3293,7 @@ async fn sandbox_exec_interactive_grpc(
     workdir: Option<&str>,
     timeout_seconds: u32,
     environment: &HashMap<String, String>,
+    run_as_user: Option<&str>,
 ) -> Result<i32> {
     use openshell_core::proto::{ExecSandboxInput, ExecSandboxWindowResize, exec_sandbox_input};
     use tokio_stream::wrappers::ReceiverStream;
@@ -3173,6 +3315,8 @@ async fn sandbox_exec_interactive_grpc(
                 tty: true,
                 cols: u32::from(cols),
                 rows: u32::from(rows),
+                run_as_user: run_as_user.unwrap_or_default().to_string(),
+                ..Default::default()
             })),
         })
         .await

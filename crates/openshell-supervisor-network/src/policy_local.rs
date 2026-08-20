@@ -1031,6 +1031,8 @@ fn network_rule_from_json(
         .map(|binary| {
             let mut proposal_binary = NetworkBinary {
                 path: binary.path,
+                uid: binary.uid,
+                gid: binary.gid,
                 ..Default::default()
             };
             // The deprecated harness bit is ignored by policy YAML, but OPA
@@ -1295,6 +1297,10 @@ struct NetworkEndpointJson {
 #[derive(Debug, Deserialize)]
 struct NetworkBinaryJson {
     path: String,
+    #[serde(default)]
+    uid: u32,
+    #[serde(default)]
+    gid: u32,
 }
 
 #[derive(Debug, Deserialize)]

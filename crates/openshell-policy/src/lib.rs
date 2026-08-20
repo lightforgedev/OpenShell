@@ -357,6 +357,10 @@ struct L7DenyRuleDef {
 #[serde(deny_unknown_fields)]
 struct NetworkBinaryDef {
     path: String,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    uid: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    gid: u32,
     /// Deprecated: ignored. Kept for backward compat with existing YAML files.
     #[serde(default, skip_serializing)]
     #[allow(dead_code)]
@@ -753,6 +757,8 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                     .into_iter()
                     .map(|b| NetworkBinary {
                         path: b.path,
+                        uid: b.uid,
+                        gid: b.gid,
                         ..Default::default()
                     })
                     .collect(),
@@ -900,6 +906,8 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                     .iter()
                     .map(|b| NetworkBinaryDef {
                         path: b.path.clone(),
+                        uid: b.uid,
+                        gid: b.gid,
                         harness: false,
                     })
                     .collect(),
@@ -1517,6 +1525,30 @@ network_policies:
         assert_eq!(rule.endpoints[0].port, 443);
         assert_eq!(rule.binaries.len(), 1);
         assert_eq!(rule.binaries[0].path, "/usr/bin/curl");
+    }
+
+    #[test]
+    fn parse_and_serialize_uid_scoped_network_binary() {
+        let yaml = r"
+version: 1
+network_policies:
+  agent_a_curl:
+    endpoints:
+      - { host: api.github.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/curl, uid: 20001, gid: 20001 }
+";
+        let policy = parse_sandbox_policy(yaml).expect("should parse");
+        let binary = &policy.network_policies["agent_a_curl"].binaries[0];
+        assert_eq!(binary.path, "/usr/bin/curl");
+        assert_eq!(binary.uid, 20001);
+        assert_eq!(binary.gid, 20001);
+
+        let serialized = serialize_sandbox_policy(&policy).expect("should serialize");
+        let reparsed = parse_sandbox_policy(&serialized).expect("serialized YAML should parse");
+        let reparsed_binary = &reparsed.network_policies["agent_a_curl"].binaries[0];
+        assert_eq!(reparsed_binary.uid, 20001);
+        assert_eq!(reparsed_binary.gid, 20001);
     }
 
     #[test]

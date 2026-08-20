@@ -3464,6 +3464,7 @@ mod tests {
                         binaries: vec![NetworkBinary {
                             path: "/usr/bin/advanced".to_string(),
                             harness: true,
+                            ..Default::default()
                         }],
                         inference_capable: false,
                         discovery: None,

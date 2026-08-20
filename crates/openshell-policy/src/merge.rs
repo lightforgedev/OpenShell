@@ -247,7 +247,7 @@ pub fn policy_covers_rule(policy: &SandboxPolicy, proposed: &NetworkPolicyRule) 
             }) && proposed.binaries.iter().all(|target_binary| {
                 rule.binaries
                     .iter()
-                    .any(|binary| binary.path == target_binary.path)
+                    .any(|binary| binary_scope_matches(binary, target_binary))
             })
         })
     })
@@ -757,15 +757,21 @@ fn expand_access_preset(protocol: &str, access: &str) -> Option<Vec<L7Rule>> {
 }
 
 fn append_unique_binaries(existing: &mut Vec<NetworkBinary>, incoming: &[NetworkBinary]) {
-    let mut seen: HashSet<String> = existing.iter().map(|binary| binary.path.clone()).collect();
+    let mut seen: HashSet<(String, u32, u32)> = existing
+        .iter()
+        .map(|binary| binary_scope_key(binary))
+        .collect();
     for binary in incoming {
-        if let Some(existing_binary) = existing.iter_mut().find(|item| item.path == binary.path) {
+        if let Some(existing_binary) = existing
+            .iter_mut()
+            .find(|item| binary_scope_matches(item, binary))
+        {
             if !is_advisor_proposed_binary(binary) {
                 mark_user_declared_binary(existing_binary);
             }
             continue;
         }
-        if seen.insert(binary.path.clone()) {
+        if seen.insert(binary_scope_key(binary)) {
             existing.push(binary.clone());
         }
     }
@@ -822,7 +828,10 @@ fn dedup_strings(values: &mut Vec<String>) {
 fn dedup_binaries(values: &mut Vec<NetworkBinary>) {
     let mut deduped: Vec<NetworkBinary> = Vec::with_capacity(values.len());
     for binary in std::mem::take(values) {
-        if let Some(existing) = deduped.iter_mut().find(|item| item.path == binary.path) {
+        if let Some(existing) = deduped
+            .iter_mut()
+            .find(|item| binary_scope_matches(item, &binary))
+        {
             if !is_advisor_proposed_binary(&binary) {
                 mark_user_declared_binary(existing);
             }
@@ -831,6 +840,14 @@ fn dedup_binaries(values: &mut Vec<NetworkBinary>) {
         }
     }
     *values = deduped;
+}
+
+fn binary_scope_key(binary: &NetworkBinary) -> (String, u32, u32) {
+    (binary.path.clone(), binary.uid, binary.gid)
+}
+
+fn binary_scope_matches(left: &NetworkBinary, right: &NetworkBinary) -> bool {
+    left.path == right.path && left.uid == right.uid && left.gid == right.gid
 }
 
 fn is_advisor_proposed_binary(binary: &NetworkBinary) -> bool {

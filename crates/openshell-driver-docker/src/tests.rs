@@ -103,7 +103,8 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
         stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
         log_level: "info".to_string(),
-        supervisor_bin: PathBuf::from("/tmp/openshell-sandbox"),
+        supervisor_bin: Some(PathBuf::from("/tmp/openshell-sandbox")),
+        supervisor_image_mount: None,
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
             cert: PathBuf::from("/tmp/tls.crt"),
@@ -288,7 +289,7 @@ fn docker_gateway_route_uses_host_gateway_for_docker_desktop() {
         DockerGatewayRoute::HostGateway
     );
     assert_eq!(
-        docker_extra_hosts(&DockerGatewayRoute::HostGateway),
+        docker_extra_hosts(&DockerGatewayRoute::HostGateway, &BTreeMap::new()),
         vec![
             "host.docker.internal:host-gateway".to_string(),
             "host.openshell.internal:host-gateway".to_string()
@@ -314,7 +315,7 @@ fn docker_gateway_route_uses_host_gateway_for_colima() {
         DockerGatewayRoute::HostGateway
     );
     assert_eq!(
-        docker_extra_hosts(&DockerGatewayRoute::HostGateway),
+        docker_extra_hosts(&DockerGatewayRoute::HostGateway, &BTreeMap::new()),
         vec![
             "host.docker.internal:host-gateway".to_string(),
             "host.openshell.internal:host-gateway".to_string()
@@ -408,7 +409,7 @@ fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
         }
     );
     assert_eq!(
-        docker_extra_hosts(&route),
+        docker_extra_hosts(&route, &BTreeMap::new()),
         vec![
             "host.docker.internal:172.18.0.1".to_string(),
             "host.openshell.internal:172.18.0.1".to_string()
@@ -457,7 +458,7 @@ fn docker_gateway_route_prefers_configured_host_gateway_ip() {
         }
     );
     assert_eq!(
-        docker_extra_hosts(&route),
+        docker_extra_hosts(&route, &BTreeMap::new()),
         vec![
             "host.docker.internal:172.20.0.4".to_string(),
             "host.openshell.internal:172.20.0.4".to_string()
@@ -642,6 +643,103 @@ fn build_binds_uses_docker_tls_directory() {
         targets
             .iter()
             .all(|target| target.starts_with(TLS_MOUNT_DIR) || target == SUPERVISOR_MOUNT_PATH)
+    );
+}
+
+#[test]
+fn supervisor_image_mount_replaces_gateway_local_bind() {
+    let image = concat!(
+        "example.com/openshell/supervisor@sha256:",
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    );
+    let mut config = runtime_config();
+    config.supervisor_bin = None;
+    config.supervisor_image_mount = Some(image.to_string());
+
+    let body = build_container_create_body(&test_sandbox(), &config).unwrap();
+    let host_config = body.host_config.unwrap();
+    let binds = host_config.binds.unwrap();
+    let mounts = host_config.mounts.unwrap();
+
+    assert!(
+        !binds
+            .iter()
+            .any(|bind| bind.contains(SUPERVISOR_MOUNT_PATH))
+    );
+    assert!(mounts.iter().any(|mount| {
+        mount.typ == Some(MountTypeEnum::IMAGE)
+            && mount.source.as_deref() == Some(image)
+            && mount.target.as_deref() == Some(SUPERVISOR_CONTAINER_DIR)
+            && mount.read_only == Some(true)
+    }));
+    assert!(
+        !binds.iter().any(|bind| {
+            bind.contains(TLS_MOUNT_DIR) || bind.contains(SANDBOX_TOKEN_MOUNT_PATH)
+        })
+    );
+}
+
+#[test]
+fn gateway_material_archive_contains_restricted_token_and_tls_files() {
+    let tls = (b"ca".to_vec(), b"cert".to_vec(), b"key".to_vec());
+    let bytes = gateway_material_archive("signed-token", Some(&tls)).unwrap();
+    let mut archive = tar::Archive::new(bytes.as_slice());
+    let entries = archive.entries().unwrap();
+    let files = entries
+        .map(|entry| {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().into_owned();
+            let mode = entry.header().mode().unwrap();
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents).unwrap();
+            (path, (mode, contents))
+        })
+        .collect::<HashMap<_, _>>();
+
+    assert_eq!(
+        files.get("etc/openshell/auth/sandbox.jwt"),
+        Some(&(0o600, "signed-token\n".to_string()))
+    );
+    assert_eq!(
+        files.get("etc/openshell/tls/client/ca.crt"),
+        Some(&(0o644, "ca".to_string()))
+    );
+    assert_eq!(
+        files.get("etc/openshell/tls/client/tls.crt"),
+        Some(&(0o644, "cert".to_string()))
+    );
+    assert_eq!(
+        files.get("etc/openshell/tls/client/tls.key"),
+        Some(&(0o600, "key".to_string()))
+    );
+}
+
+#[test]
+fn supervisor_image_mount_requires_digest_and_exclusive_source() {
+    let mut config = DockerComputeConfig {
+        supervisor_image_mount: Some("example.com/openshell/supervisor:latest".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        validate_supervisor_image_mount(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("must be digest-pinned")
+    );
+
+    config.supervisor_image_mount = Some(
+        concat!(
+            "example.com/openshell/supervisor@sha256:",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        )
+        .to_string(),
+    );
+    config.supervisor_bin = Some(PathBuf::from("/tmp/openshell-sandbox"));
+    assert!(
+        validate_supervisor_image_mount(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("mutually exclusive")
     );
 }
 
@@ -1265,6 +1363,51 @@ fn validate_sandbox_rejects_unknown_driver_config_fields() {
 
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(err.message().contains("unknown field"));
+}
+
+#[test]
+fn validate_sandbox_rejects_reserved_extra_host_override() {
+    let config = runtime_config();
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "extra_hosts": {"host.docker.internal": "10.0.0.1"}
+    })));
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("may not override reserved host"));
+}
+
+#[test]
+fn build_container_create_body_includes_literal_extra_host() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "extra_hosts": {"platform.internal": "10.240.7.9"}
+    })));
+
+    let body = build_container_create_body(&sandbox, &runtime_config()).unwrap();
+    let hosts = body
+        .host_config
+        .as_ref()
+        .and_then(|config| config.extra_hosts.as_ref())
+        .expect("Docker extra hosts should be configured");
+
+    assert!(hosts.contains(&"platform.internal:10.240.7.9".to_string()));
 }
 
 #[test]

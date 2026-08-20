@@ -448,6 +448,13 @@ Driver implementation settings live in the TOML driver tables. See
 `docs/reference/gateway-config.mdx` for worked per-driver examples and RFC
 0003 for the full schema.
 
+Containerized Docker gateways must use the digest-pinned
+`supervisor_image_mount` driver setting. The host Docker daemon mounts the
+supervisor image directly into each sandbox; it cannot bind-mount a supervisor
+binary extracted only inside the gateway container. The same path copies the
+per-sandbox JWT and guest TLS material into the stopped container before start,
+with owner-only modes retained for token and key files.
+
 `database_url` is env-only and rejected when present in the file
 (`OPENSHELL_DB_URL` / `--db-url`).
 
