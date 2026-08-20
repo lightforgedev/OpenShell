@@ -10,6 +10,8 @@ mod relay;
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
+#[cfg(target_os = "linux")]
+use crate::policy_dns::{MappingLookupError, PolicyEndpointId, ResolvedEndpointStore};
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use crate::upstream_proxy::{self, UpstreamProxyConfig};
 use miette::{IntoDiagnostic, Result};
@@ -27,6 +29,8 @@ use openshell_ocsf::{
     HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, Process, SeverityId, StatusId,
     Url as OcsfUrl, ocsf_emit,
 };
+#[cfg(target_os = "linux")]
+use std::mem::size_of;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -436,6 +440,511 @@ impl Drop for ProxyHandle {
     fn drop(&mut self) {
         self.join.abort();
     }
+}
+
+/// RAII handle for transparent TCP accept loops.
+#[cfg(target_os = "linux")]
+pub(crate) struct TransparentTcpHandle {
+    joins: Vec<JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl TransparentTcpHandle {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start(
+        listeners: Vec<TcpListener>,
+        store: Arc<ResolvedEndpointStore>,
+        opa_engine: Arc<OpaEngine>,
+        identity_cache: Arc<BinaryIdentityCache>,
+        entrypoint_pid: Arc<AtomicU32>,
+        agent_proposals: openshell_core::proposals::AgentProposals,
+        denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+        activity_tx: Option<ActivitySender>,
+        upstream_proxy_args: &upstream_proxy::UpstreamProxyArgs,
+        engine_ready: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Self> {
+        let upstream_proxy = Arc::new(
+            UpstreamProxyConfig::from_args(upstream_proxy_args)
+                .map_err(|error| miette::miette!(error))?,
+        );
+        let mut joins = Vec::with_capacity(listeners.len());
+        for listener in listeners {
+            let store = store.clone();
+            let engine = opa_engine.clone();
+            let cache = identity_cache.clone();
+            let pid = entrypoint_pid.clone();
+            let proposals = agent_proposals.clone();
+            let denial_tx = denial_tx.clone();
+            let activity_tx = activity_tx.clone();
+            let upstream_proxy = upstream_proxy.clone();
+            let mut engine_ready = engine_ready.clone();
+            joins.push(tokio::spawn(async move {
+                if tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    engine_ready.wait_for(|ready| *ready),
+                )
+                .await
+                .is_err()
+                {
+                    warn!(
+                        "Engine readiness signal not received within 15s; proceeding with transparent TCP accept loop"
+                    );
+                }
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    set_tcp_nodelay_best_effort(&stream);
+                    let store = store.clone();
+                    let engine = engine.clone();
+                    let cache = cache.clone();
+                    let pid = pid.clone();
+                    let proposals = proposals.clone();
+                    let denial_tx = denial_tx.clone();
+                    let activity_tx = activity_tx.clone();
+                    let upstream_proxy = upstream_proxy.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = handle_transparent_tcp_connection(
+                            stream,
+                            store,
+                            engine,
+                            cache,
+                            pid,
+                            proposals,
+                            denial_tx,
+                            activity_tx,
+                            upstream_proxy,
+                        )
+                        .await
+                        {
+                            ocsf_emit!(
+                                NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                                    .activity(ActivityId::Fail)
+                                    .severity(SeverityId::Low)
+                                    .status(StatusId::Failure)
+                                    .message(format!("Transparent TCP connection error: {error}"))
+                                    .build()
+                            );
+                        }
+                    });
+                }
+            }));
+        }
+        Ok(Self { joins })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TransparentTcpHandle {
+    fn drop(&mut self) {
+        for join in &self.joins {
+            join.abort();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_transparent_tcp_connection(
+    mut client: TcpStream,
+    store: Arc<ResolvedEndpointStore>,
+    opa_engine: Arc<OpaEngine>,
+    identity_cache: Arc<BinaryIdentityCache>,
+    entrypoint_pid: Arc<AtomicU32>,
+    agent_proposals: openshell_core::proposals::AgentProposals,
+    denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+    activity_tx: Option<ActivitySender>,
+    upstream_proxy: Arc<Option<UpstreamProxyConfig>>,
+) -> Result<()> {
+    let workload_addr = client.peer_addr().into_diagnostic()?;
+    let original = original_destination(&client).into_diagnostic()?;
+    let current_generation = opa_engine.current_generation();
+    let mapping = match store.lookup(
+        original.ip(),
+        original.port(),
+        current_generation,
+        std::time::Instant::now(),
+    ) {
+        Ok(mapping) => mapping,
+        Err(error) => {
+            emit_transparent_mapping_denial(workload_addr, original, error);
+            emit_activity(&activity_tx, true, "transparent_tcp_mapping");
+            return Ok(());
+        }
+    };
+    let host = mapping.record.normalized_name.as_str().to_string();
+    let port = original.port();
+    let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, original);
+    let intent = EgressIntent::transparent_tcp(host.clone(), port);
+    let engine = opa_engine.clone();
+    let cache = identity_cache.clone();
+    let pid = entrypoint_pid.clone();
+    let decision = tokio::task::spawn_blocking(move || {
+        authorize_egress_intent(connection, &engine, &cache, &pid, intent)
+    })
+    .await
+    .map_err(|error| miette::miette!("identity resolution task panicked: {error}"))?;
+
+    if let NetworkAction::Deny { reason } = &decision.action {
+        emit_transparent_policy_denial(&decision, workload_addr, &host, port);
+        emit_denial(
+            &denial_tx,
+            &host,
+            port,
+            decision
+                .binary
+                .as_ref()
+                .map_or("-", |path| path.to_str().unwrap_or("-")),
+            &decision,
+            reason,
+            "transparent-tcp",
+        );
+        emit_activity(&activity_tx, true, "transparent_tcp_policy");
+        return Ok(());
+    }
+
+    // Authorization may race a policy reload. Re-pin the exact generation
+    // that produced the decision, then reacquire the DNS mapping against that
+    // generation before correlating endpoint identity or constructing a
+    // connector. This prevents combining an old DNS answer with a newer
+    // policy decision (or vice versa).
+    let Ok(generation_guard) =
+        relay::pin_policy_generation(&opa_engine, decision.policy_generation)
+    else {
+        emit_transparent_mapping_denial(workload_addr, original, MappingLookupError::StalePolicy);
+        emit_activity(&activity_tx, true, "transparent_tcp_mapping");
+        return Ok(());
+    };
+    let mapping = match store.lookup(
+        original.ip(),
+        original.port(),
+        decision.policy_generation,
+        std::time::Instant::now(),
+    ) {
+        Ok(mapping) => mapping,
+        Err(error) => {
+            emit_transparent_mapping_denial(workload_addr, original, error);
+            emit_activity(&activity_tx, true, "transparent_tcp_mapping");
+            return Ok(());
+        }
+    };
+
+    let endpoint_id = decision
+        .endpoint
+        .matched_endpoints
+        .iter()
+        .map(|endpoint| PolicyEndpointId {
+            policy_name: endpoint.policy_name.clone(),
+            endpoint_index: endpoint.endpoint_index,
+        })
+        .find(|candidate| mapping.endpoint_ids().any(|mapped| mapped == candidate));
+    let Some(endpoint_id) = endpoint_id else {
+        let reason = "authorized endpoint did not match DNS correlation";
+        emit_transparent_policy_denial(&decision, workload_addr, &host, port);
+        emit_denial(
+            &denial_tx,
+            &host,
+            port,
+            decision
+                .binary
+                .as_ref()
+                .map_or("-", |path| path.to_str().unwrap_or("-")),
+            &decision,
+            reason,
+            "transparent-tcp",
+        );
+        emit_activity(&activity_tx, true, "transparent_tcp_policy");
+        return Ok(());
+    };
+
+    let connector = mapping.connector_for(&endpoint_id).await.map_err(|error| {
+        miette::miette!("transparent TCP pinned destination is invalid: {error}")
+    })?;
+    let mut ctx = relay::http_context(
+        &decision,
+        None,
+        None,
+        activity_tx.clone(),
+        None,
+        agent_proposals,
+    );
+    let middleware_gate = middleware_uninspectable_gate(&opa_engine, &ctx)?;
+    if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::Deny {
+        crate::l7::middleware::emit_middleware_uninspectable(&ctx, "transparent tcp", true);
+        return Ok(());
+    }
+    if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::BypassWithFinding {
+        crate::l7::middleware::emit_middleware_uninspectable(&ctx, "transparent tcp", false);
+    }
+    let approved_real_ip_candidates = connector.addrs().to_vec();
+    generation_guard.ensure_current()?;
+    let mut upstream =
+        dial_transparent_upstream(&upstream_proxy, &host, port, &approved_real_ip_candidates)
+            .await
+            .into_diagnostic()?;
+    let upstream_socket_peer = upstream.peer_addr().into_diagnostic()?;
+    let (connected_real_destination, dial_mode) = match upstream.connect_target() {
+        Some(upstream_proxy::ConnectTarget::Ip(ip)) => (
+            Some(SocketAddr::new(ip, port)),
+            "upstream_proxy_validated_ip",
+        ),
+        Some(upstream_proxy::ConnectTarget::Hostname) => {
+            // Transparent TCP authorization is correlated to the resolver's
+            // validated address set. A hostname-mode CONNECT would make the
+            // corporate proxy resolve again and break that binding. Treat a
+            // future invariant regression as an audited denial, not a panic.
+            emit_transparent_policy_denial(&decision, workload_addr, &host, port);
+            emit_denial(
+                &denial_tx,
+                &host,
+                port,
+                decision
+                    .binary
+                    .as_ref()
+                    .map_or("-", |path| path.to_str().unwrap_or("-")),
+                &decision,
+                "upstream proxy did not preserve the validated IP target",
+                "transparent-tcp",
+            );
+            emit_activity(&activity_tx, true, "transparent_tcp_destination");
+            return Ok(());
+        }
+        None => (Some(upstream_socket_peer), "direct"),
+    };
+    generation_guard.ensure_current()?;
+    ctx.request_default_port = None;
+    let policy_name = match &decision.action {
+        NetworkAction::Allow { matched_policy } => matched_policy.as_deref().unwrap_or("-"),
+        NetworkAction::Deny { .. } => "-",
+    };
+    let binary = decision
+        .binary
+        .as_ref()
+        .map_or_else(|| "-".to_string(), |path| path.display().to_string());
+    let pid = decision
+        .binary_pid
+        .map_or_else(|| "-".to_string(), |pid| pid.to_string());
+    ocsf_emit!(build_transparent_tcp_allow_ocsf_event(
+        TransparentTcpAllowAudit {
+            workload: workload_addr,
+            synthetic_destination: original,
+            normalized_domain: &host,
+            approved_real_ip_candidates: &approved_real_ip_candidates,
+            connected_real_destination,
+            upstream_socket_peer,
+            dial_mode,
+            mapping_id: mapping.record.mapping_id,
+            mapping_generation: mapping.record.mapping_generation,
+            mapping_policy_generation: mapping.record.policy_generation,
+            authorization_policy_generation: decision.policy_generation,
+            binary: &binary,
+            pid: &pid,
+            policy_name,
+        }
+    ));
+    emit_activity(&activity_tx, false, "transparent_tcp");
+    relay::relay_tcp(&mut client, &mut upstream, &generation_guard, &ctx).await
+}
+
+#[cfg(any(target_os = "linux", test))]
+struct TransparentTcpAllowAudit<'a> {
+    workload: SocketAddr,
+    synthetic_destination: SocketAddr,
+    normalized_domain: &'a str,
+    approved_real_ip_candidates: &'a [SocketAddr],
+    connected_real_destination: Option<SocketAddr>,
+    upstream_socket_peer: SocketAddr,
+    dial_mode: &'a str,
+    mapping_id: uuid::Uuid,
+    mapping_generation: u64,
+    mapping_policy_generation: u64,
+    authorization_policy_generation: u64,
+    binary: &'a str,
+    pid: &'a str,
+    policy_name: &'a str,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn build_transparent_tcp_allow_ocsf_event(
+    audit: TransparentTcpAllowAudit<'_>,
+) -> openshell_ocsf::OcsfEvent {
+    let logical_destination = format!(
+        "{}:{}",
+        audit.normalized_domain,
+        audit.synthetic_destination.port()
+    );
+    let mapping_id = audit.mapping_id.to_string();
+    let actual_target = audit
+        .connected_real_destination
+        .map_or_else(|| "proxy-resolved".to_string(), |target| target.to_string());
+    let message = format!(
+        "Transparent TCP mapping_id={mapping_id} synthetic={} real={actual_target}",
+        audit.synthetic_destination,
+    );
+    let approved_real_ip_candidates = audit
+        .approved_real_ip_candidates
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let mut builder = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Allowed)
+        .disposition(DispositionId::Allowed)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .dst_endpoint(Endpoint::from_domain(
+            audit.normalized_domain,
+            audit.synthetic_destination.port(),
+        ))
+        .src_endpoint_addr(audit.workload.ip(), audit.workload.port())
+        .actor_process(Process::from_bypass(audit.binary, audit.pid, ""))
+        .firewall_rule(audit.policy_name, "opa")
+        .unmapped("matched_policy", audit.policy_name)
+        .unmapped("normalized_domain", audit.normalized_domain)
+        .unmapped("logical_destination", logical_destination)
+        .unmapped(
+            "synthetic_destination",
+            audit.synthetic_destination.to_string(),
+        )
+        .unmapped(
+            "approved_real_ip_candidates",
+            serde_json::json!(approved_real_ip_candidates),
+        )
+        .unmapped(
+            "upstream_socket_peer",
+            audit.upstream_socket_peer.to_string(),
+        )
+        .unmapped("dial_mode", audit.dial_mode)
+        .unmapped("mapping_id", mapping_id)
+        .unmapped("mapping_generation", audit.mapping_generation)
+        .unmapped("policy_generation", audit.mapping_policy_generation)
+        .unmapped("mapping_policy_generation", audit.mapping_policy_generation)
+        .unmapped(
+            "authorization_policy_generation",
+            audit.authorization_policy_generation,
+        )
+        .message(message)
+        .status_detail("transparent_tcp_allowed");
+    if let Some(destination) = audit.connected_real_destination {
+        builder = builder.unmapped("connected_real_destination", destination.to_string());
+    }
+    builder.build()
+}
+
+#[cfg(target_os = "linux")]
+fn original_destination(stream: &TcpStream) -> std::io::Result<SocketAddr> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    if stream.local_addr()?.is_ipv4() {
+        #[allow(unsafe_code)]
+        unsafe {
+            let mut address: libc::sockaddr_in = std::mem::zeroed();
+            let mut length = libc::socklen_t::try_from(size_of::<libc::sockaddr_in>())
+                .expect("sockaddr_in size fits socklen_t");
+            if libc::getsockopt(
+                fd,
+                libc::SOL_IP,
+                80, // SO_ORIGINAL_DST
+                std::ptr::addr_of_mut!(address).cast(),
+                std::ptr::addr_of_mut!(length),
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            return Ok(SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::from(
+                    address.sin_addr.s_addr.to_ne_bytes(),
+                )),
+                u16::from_be(address.sin_port),
+            ));
+        }
+    }
+    #[allow(unsafe_code)]
+    unsafe {
+        let mut address: libc::sockaddr_in6 = std::mem::zeroed();
+        let mut length = libc::socklen_t::try_from(size_of::<libc::sockaddr_in6>())
+            .expect("sockaddr_in6 size fits socklen_t");
+        if libc::getsockopt(
+            fd,
+            libc::SOL_IPV6,
+            80, // IP6T_SO_ORIGINAL_DST
+            std::ptr::addr_of_mut!(address).cast(),
+            std::ptr::addr_of_mut!(length),
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(SocketAddr::new(
+            IpAddr::V6(std::net::Ipv6Addr::from(address.sin6_addr.s6_addr)),
+            u16::from_be(address.sin6_port),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn emit_transparent_mapping_denial(
+    workload: SocketAddr,
+    original: SocketAddr,
+    error: MappingLookupError,
+) {
+    let detail = match error {
+        MappingLookupError::Missing => "transparent_tcp_mapping_missing",
+        MappingLookupError::Expired => "transparent_tcp_mapping_expired",
+        MappingLookupError::StalePolicy => "transparent_tcp_mapping_stale_policy",
+        MappingLookupError::PortMismatch => "transparent_tcp_port_mismatch",
+        MappingLookupError::EndpointMismatch
+        | MappingLookupError::InvalidMapping
+        | MappingLookupError::LockPoisoned => "transparent_tcp_destination_denied",
+    };
+    ocsf_emit!(
+        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Medium)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_ip(original.ip(), original.port()))
+            .src_endpoint_addr(workload.ip(), workload.port())
+            .message(format!("Transparent TCP denied: {error}"))
+            .status_detail(detail)
+            .build()
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn emit_transparent_policy_denial(
+    decision: &EgressDecision,
+    workload: SocketAddr,
+    host: &str,
+    port: u16,
+) {
+    let status_detail = if matches!(decision.action, NetworkAction::Deny { .. }) {
+        "transparent_tcp_identity_denied"
+    } else {
+        "transparent_tcp_destination_denied"
+    };
+    let binary = decision
+        .binary
+        .as_ref()
+        .map_or_else(|| "-".to_string(), |path| path.display().to_string());
+    let pid = decision
+        .binary_pid
+        .map_or_else(|| "-".to_string(), |pid| pid.to_string());
+    ocsf_emit!(
+        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Medium)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain(host, port))
+            .src_endpoint_addr(workload.ip(), workload.port())
+            .actor_process(Process::from_bypass(&binary, &pid, "-"))
+            .firewall_rule("-", "opa")
+            .message(format!("Transparent TCP denied {host}:{port}"))
+            .status_detail(status_detail)
+            .build()
+    );
 }
 
 fn emit_activity(tx: &Option<ActivitySender>, denied: bool, deny_group: &'static str) {
@@ -3131,7 +3640,7 @@ fn is_cloud_metadata_ip(ip: IpAddr) -> bool {
 /// entry exists, the entry cannot be parsed, or the mapped IP is a cloud
 /// metadata address.
 #[cfg(any(target_os = "linux", test))]
-fn detect_trusted_host_gateway() -> Option<IpAddr> {
+pub(crate) fn detect_trusted_host_gateway() -> Option<IpAddr> {
     let contents = std::fs::read_to_string("/etc/hosts").ok()?;
     let ips = parse_hosts_file_for_host(&contents, "host.openshell.internal");
 
@@ -3179,7 +3688,7 @@ fn detect_trusted_host_gateway() -> Option<IpAddr> {
 }
 
 #[cfg(not(any(target_os = "linux", test)))]
-fn detect_trusted_host_gateway() -> Option<IpAddr> {
+pub(crate) fn detect_trusted_host_gateway() -> Option<IpAddr> {
     None
 }
 
@@ -3495,6 +4004,36 @@ async fn dial_upstream(
                     // fallback the direct path's `TcpStream::connect` does.
                     upstream_proxy::connect_via_validated(endpoint, host_lc, port, addrs).await
                 }
+            }
+            upstream_proxy::ProxyDecision::Direct(direct_addrs) => {
+                Ok(upstream_proxy::PrefixedStream::without_prefix(
+                    connect_tcp_nodelay_best_effort(&direct_addrs[..]).await?,
+                ))
+            }
+        };
+    }
+    Ok(upstream_proxy::PrefixedStream::without_prefix(
+        connect_tcp_nodelay_best_effort(addrs).await?,
+    ))
+}
+
+/// Dial a policy-DNS-correlated transparent TCP destination.
+///
+/// Unlike explicit proxy traffic, transparent TCP must never honor the
+/// operator hostname-CONNECT compatibility mode: the corporate proxy must
+/// receive one of the resolver-approved addresses so it cannot perform a
+/// second, policy-bypassing DNS resolution.
+#[cfg(target_os = "linux")]
+async fn dial_transparent_upstream(
+    upstream_proxy: &Option<UpstreamProxyConfig>,
+    host_lc: &str,
+    port: u16,
+    addrs: &[SocketAddr],
+) -> std::io::Result<upstream_proxy::PrefixedStream> {
+    if let Some(cfg) = upstream_proxy.as_ref() {
+        return match cfg.decision(host_lc, port, addrs) {
+            upstream_proxy::ProxyDecision::Proxy(endpoint) => {
+                upstream_proxy::connect_via_validated(endpoint, host_lc, port, addrs).await
             }
             upstream_proxy::ProxyDecision::Direct(direct_addrs) => {
                 Ok(upstream_proxy::PrefixedStream::without_prefix(
@@ -6413,6 +6952,138 @@ network_policies:
             json["status_detail"],
             FORWARD_ENCODED_SLASH_REJECTION_DETAIL
         );
+    }
+
+    #[test]
+    fn transparent_tcp_allow_ocsf_exposes_correlated_dns_and_dial_chain() {
+        let mapping_id = uuid::Uuid::new_v4();
+        let event = build_transparent_tcp_allow_ocsf_event(TransparentTcpAllowAudit {
+            workload: "127.0.0.1:45123".parse().unwrap(),
+            synthetic_destination: "198.18.0.7:6379".parse().unwrap(),
+            normalized_domain: "redis.openshell.demo",
+            approved_real_ip_candidates: &[
+                "172.18.0.4:6379".parse().unwrap(),
+                "172.18.0.5:6379".parse().unwrap(),
+            ],
+            connected_real_destination: Some("172.18.0.5:6379".parse().unwrap()),
+            upstream_socket_peer: "172.18.0.5:6379".parse().unwrap(),
+            dial_mode: "direct",
+            mapping_id,
+            mapping_generation: 4,
+            mapping_policy_generation: 7,
+            authorization_policy_generation: 7,
+            binary: "/sandbox/.venv/bin/python3",
+            pid: "42",
+            policy_name: "redis",
+        });
+        let json = event.to_json().unwrap();
+
+        assert_eq!(json["actor"]["process"]["pid"], 42);
+        assert_eq!(
+            json["actor"]["process"]["name"],
+            "/sandbox/.venv/bin/python3"
+        );
+        assert!(json["actor"]["process"].get("parent_process").is_none());
+        assert_eq!(json["dst_endpoint"]["domain"], "redis.openshell.demo");
+        assert_eq!(json["firewall_rule"]["name"], "redis");
+        assert_eq!(json["unmapped"]["synthetic_destination"], "198.18.0.7:6379");
+        assert_eq!(
+            json["unmapped"]["connected_real_destination"],
+            "172.18.0.5:6379"
+        );
+        assert_eq!(
+            json["unmapped"]["approved_real_ip_candidates"],
+            serde_json::json!(["172.18.0.4:6379", "172.18.0.5:6379"])
+        );
+        assert_eq!(json["unmapped"]["mapping_id"], mapping_id.to_string());
+        assert_eq!(json["unmapped"]["mapping_generation"], 4);
+        assert_eq!(json["unmapped"]["policy_generation"], 7);
+        assert_eq!(json["unmapped"]["mapping_policy_generation"], 7);
+        assert_eq!(json["unmapped"]["matched_policy"], "redis");
+        assert_eq!(json["unmapped"]["dial_mode"], "direct");
+
+        let shorthand = event.format_shorthand();
+        assert!(shorthand.contains("/sandbox/.venv/bin/python3(42)"));
+        assert!(shorthand.contains("redis.openshell.demo:6379"));
+        assert!(shorthand.contains("synthetic=198.18.0.7:6379"));
+        assert!(shorthand.contains("real=172.18.0.5:6379"));
+        assert!(shorthand.contains(&format!("mapping_id={mapping_id}")));
+    }
+
+    #[test]
+    fn transparent_tcp_proxy_audit_reports_validated_connect_target() {
+        let event = build_transparent_tcp_allow_ocsf_event(TransparentTcpAllowAudit {
+            workload: "127.0.0.1:45123".parse().unwrap(),
+            synthetic_destination: "198.18.0.7:6379".parse().unwrap(),
+            normalized_domain: "redis.openshell.demo",
+            approved_real_ip_candidates: &["172.18.0.4:6379".parse().unwrap()],
+            connected_real_destination: Some("172.18.0.4:6379".parse().unwrap()),
+            upstream_socket_peer: "192.0.2.20:3128".parse().unwrap(),
+            dial_mode: "upstream_proxy_validated_ip",
+            mapping_id: uuid::Uuid::new_v4(),
+            mapping_generation: 4,
+            mapping_policy_generation: 7,
+            authorization_policy_generation: 7,
+            binary: "/usr/bin/redis-cli",
+            pid: "43",
+            policy_name: "redis",
+        });
+        let json = event.to_json().unwrap();
+
+        assert_eq!(
+            json["unmapped"]["connected_real_destination"],
+            "172.18.0.4:6379"
+        );
+        assert_eq!(json["unmapped"]["upstream_socket_peer"], "192.0.2.20:3128");
+        assert_eq!(json["unmapped"]["dial_mode"], "upstream_proxy_validated_ip");
+        assert!(event.format_shorthand().contains("real=172.18.0.4:6379"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn transparent_tcp_ignores_proxy_hostname_mode_and_connects_to_validated_ip() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            request_tx.send(request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let config = UpstreamProxyConfig::from_args(&upstream_proxy::UpstreamProxyArgs {
+            https_proxy: Some(format!("http://{proxy_addr}")),
+            proxy_connect_by_hostname: true,
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+        let approved = "203.0.113.27:6379".parse().unwrap();
+
+        let stream =
+            dial_transparent_upstream(&Some(config), "redis.openshell.demo", 6379, &[approved])
+                .await
+                .unwrap();
+        let request = String::from_utf8(request_rx.await.unwrap()).unwrap();
+
+        assert!(request.starts_with("CONNECT 203.0.113.27:6379 HTTP/1.1\r\n"));
+        assert!(!request.contains("CONNECT redis.openshell.demo:6379"));
+        assert!(matches!(
+            stream.connect_target(),
+            Some(upstream_proxy::ConnectTarget::Ip(ip)) if ip == approved.ip()
+        ));
+        proxy.await.unwrap();
     }
 
     #[test]

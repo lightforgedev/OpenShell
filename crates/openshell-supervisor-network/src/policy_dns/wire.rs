@@ -24,6 +24,14 @@ pub(crate) async fn handle_udp_query<R: TrustedResolver>(
     service: &PolicyDnsService<R>,
     wire: &[u8],
 ) -> Result<Vec<u8>, WireError> {
+    handle_udp_query_with_ipv6(service, wire, true).await
+}
+
+pub(crate) async fn handle_udp_query_with_ipv6<R: TrustedResolver>(
+    service: &PolicyDnsService<R>,
+    wire: &[u8],
+    ipv6_egress: bool,
+) -> Result<Vec<u8>, WireError> {
     let fallback_id = wire
         .get(..2)
         .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
@@ -55,6 +63,9 @@ pub(crate) async fn handle_udp_query<R: TrustedResolver>(
     };
 
     let raw_name = query.name.to_ascii();
+    if family == AddressFamily::Ipv6 && !ipv6_egress {
+        return encode_message(response_with_code(&request, ResponseCode::NoError));
+    }
     match service
         .answer_query(&raw_name, family, Instant::now())
         .await
@@ -79,6 +90,9 @@ pub(crate) async fn handle_udp_query<R: TrustedResolver>(
         Err(PolicyDnsError::Resolver(ResolveError::NxDomain)) => {
             encode_message(response_with_code(&request, ResponseCode::NXDomain))
         }
+        Err(PolicyDnsError::Resolver(ResolveError::NoData)) => {
+            encode_message(response_with_code(&request, ResponseCode::NoError))
+        }
         Err(PolicyDnsError::InvalidName) => {
             encode_message(response_with_code(&request, ResponseCode::FormErr))
         }
@@ -97,6 +111,14 @@ pub(crate) async fn handle_tcp_query<R: TrustedResolver>(
     service: &PolicyDnsService<R>,
     frame: &[u8],
 ) -> Result<Vec<u8>, WireError> {
+    handle_tcp_query_with_ipv6(service, frame, true).await
+}
+
+pub(crate) async fn handle_tcp_query_with_ipv6<R: TrustedResolver>(
+    service: &PolicyDnsService<R>,
+    frame: &[u8],
+    ipv6_egress: bool,
+) -> Result<Vec<u8>, WireError> {
     let declared = frame
         .get(..2)
         .map(|bytes| usize::from(u16::from_be_bytes([bytes[0], bytes[1]])))
@@ -104,7 +126,7 @@ pub(crate) async fn handle_tcp_query<R: TrustedResolver>(
     if declared > MAX_DNS_MESSAGE_BYTES || frame.len() != declared + 2 {
         return Err(WireError::InvalidTcpFrame);
     }
-    let response = handle_udp_query(service, &frame[2..]).await?;
+    let response = handle_udp_query_with_ipv6(service, &frame[2..], ipv6_egress).await?;
     let length = u16::try_from(response.len()).map_err(|_| WireError::Encode)?;
     let mut framed = Vec::with_capacity(response.len() + 2);
     framed.extend_from_slice(&length.to_be_bytes());
@@ -162,6 +184,18 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct NoDataResolver;
+
+    impl TrustedResolver for NoDataResolver {
+        async fn resolve(
+            &self,
+            _name: &NormalizedName,
+            _family: AddressFamily,
+        ) -> Result<TrustedAnswer, ResolveError> {
+            Err(ResolveError::NoData)
+        }
+    }
+
     impl TrustedResolver for FakeResolver {
         async fn resolve(
             &self,
@@ -179,7 +213,7 @@ mod tests {
         }
     }
 
-    fn service() -> PolicyDnsService<FakeResolver> {
+    fn service_with_resolver<R: TrustedResolver>(resolver: R) -> PolicyDnsService<R> {
         let yaml = r"
 network_policies:
   database:
@@ -200,14 +234,18 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         .unwrap();
         PolicyDnsService::new(
             policy,
-            FakeResolver {
-                calls: AtomicUsize::new(0),
-            },
+            resolver,
             Arc::new(ResolvedEndpointStore::new(
                 StoreConfig::new(pools, 8).unwrap(),
             )),
             None,
         )
+    }
+
+    fn service() -> PolicyDnsService<FakeResolver> {
+        service_with_resolver(FakeResolver {
+            calls: AtomicUsize::new(0),
+        })
     }
 
     fn request(name: &str, record_type: RecordType) -> Vec<u8> {
@@ -260,6 +298,30 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             Message::from_vec(&wire).unwrap().metadata.response_code,
             ResponseCode::Refused
         );
+        assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn eligible_family_without_records_returns_empty_success() {
+        let service = service_with_resolver(NoDataResolver);
+        let wire = handle_udp_query(&service, &request("db.example.", RecordType::AAAA))
+            .await
+            .unwrap();
+        let response = Message::from_vec(&wire).unwrap();
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(response.answers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_without_ipv6_egress_suppresses_aaaa_without_resolving() {
+        let service = service();
+        let wire =
+            handle_udp_query_with_ipv6(&service, &request("db.example.", RecordType::AAAA), false)
+                .await
+                .unwrap();
+        let response = Message::from_vec(&wire).unwrap();
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(response.answers.is_empty());
         assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
     }
 
