@@ -243,6 +243,14 @@ enable_bind_mounts = false
 sandbox_pids_limit = 2048
 ```
 
+Trusted control-plane callers may also set
+`template.driver_config.docker.extra_hosts` for a sandbox. Each value must be a
+literal IP address and each name must be a valid non-reserved hostname. The
+Docker driver rejects overrides for `host.docker.internal` and
+`host.openshell.internal`, and never resolves names supplied in this field.
+Use it only to pin a hostname already authorized by the sandbox network policy;
+it is not a general DNS override.
+
 ### Podman
 
 Sandboxes run as Podman containers on a user-mode bridge network. The supervisor image is mounted read-only via Podman's `type=image` mount; guest mTLS material is supplied as host paths.

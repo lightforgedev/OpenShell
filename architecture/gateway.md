@@ -472,6 +472,12 @@ Driver-specific values that are not part of the inheritance allowlist
 (e.g. Podman `socket_path`, VM `vcpus`) only come from the driver's own
 table.
 
+Sandbox templates may carry a driver-owned configuration map. For Docker,
+`extra_hosts` is a bounded hostname-to-literal-IP pin: the driver rejects
+reserved callback aliases, invalid names, and non-literal destinations before
+container creation. It is intended for a hostname already admitted by the
+sandbox network policy, never as a caller-controlled DNS or host-routing path.
+
 ### Package-managed gateway registry
 
 The CLI reads its active-gateway and per-gateway metadata from
