@@ -4822,7 +4822,6 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
     }
 
     let mut client = grpc_client(server, tls).await?;
-
     let oidc_profile = if from_oidc_token {
         let existing = client
             .get_provider(GetProviderRequest {

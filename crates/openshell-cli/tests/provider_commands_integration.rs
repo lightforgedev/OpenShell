@@ -32,6 +32,7 @@ use openshell_core::proto::{
 use openshell_core::{ObjectId, ObjectName};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
@@ -45,6 +46,8 @@ struct ProviderState {
     profiles: Arc<Mutex<HashMap<String, ProviderProfile>>>,
     refresh_statuses: Arc<Mutex<HashMap<(String, String), ProviderCredentialRefreshStatus>>>,
     refresh_requests: Arc<Mutex<Vec<ProviderRefreshRequestLog>>>,
+    provider_update_requests: Arc<Mutex<Vec<Provider>>>,
+    deny_provider_reads: Arc<AtomicBool>,
     delete_provider_requests: Arc<Mutex<Vec<String>>>,
     fail_configure_refresh_message: Arc<Mutex<Option<String>>>,
     fail_rotate_refresh_message: Arc<Mutex<Option<String>>>,
@@ -432,6 +435,9 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<GetProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
+        if self.state.deny_provider_reads.load(Ordering::SeqCst) {
+            return Err(Status::permission_denied("scope 'provider:read' required"));
+        }
         let name = request.into_inner().name;
         let providers = self.state.providers.lock().await;
         let provider = providers
@@ -611,6 +617,11 @@ impl OpenShell for TestOpenShell {
             .into_inner()
             .provider
             .ok_or_else(|| Status::invalid_argument("provider is required"))?;
+        self.state
+            .provider_update_requests
+            .lock()
+            .await
+            .push(provider.clone());
 
         let mut providers = self.state.providers.lock().await;
         let existing = providers
@@ -1198,6 +1209,10 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
     .await
     .expect("provider list");
 
+    // A credential-only update must remain available to callers that have
+    // provider:write but not provider:read.
+    ts.state.deny_provider_reads.store(true, Ordering::SeqCst);
+
     run::provider_update(run::ProviderUpdateOptions {
         server: &ts.endpoint,
         name: "my-claude",
@@ -1211,6 +1226,12 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
     })
     .await
     .expect("provider update");
+
+    let requests = ts.state.provider_update_requests.lock().await;
+    let request = requests.last().expect("provider update request");
+    assert!(request.r#type.is_empty());
+    assert!(request.profile_workspace.is_empty());
+    drop(requests);
 
     run::provider_delete(&ts.endpoint, &["my-claude".to_string()], "default", &ts.tls)
         .await
