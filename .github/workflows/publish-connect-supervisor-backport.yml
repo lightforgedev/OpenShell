@@ -1,0 +1,29 @@
+name: Publish Connect Supervisor Backport
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Source branch or commit to build
+        required: true
+        type: string
+      image_tag:
+        description: Supervisor image tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish-supervisor:
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: supervisor
+      image-registry: ghcr.io/lightforgedev/openshell
+      runner_kind: github-hosted
+      ci_image: ghcr.io/lightforgedev/openshell/ci:56958dbb064b64c088cebe50d40252e36d2788fb
+      checkout-ref: ${{ inputs.source_ref }}
+      image-tag: ${{ inputs.image_tag }}
+    secrets: inherit
