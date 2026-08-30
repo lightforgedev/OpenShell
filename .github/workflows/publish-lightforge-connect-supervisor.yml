@@ -1,0 +1,85 @@
+name: Publish Lightforge Connect Supervisor
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  LIGHTFORGE_CI_IMAGE: ghcr.io/lightforgedev/openshell/ci
+
+jobs:
+  build-ci:
+    name: Build fork CI image (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: ./.github/actions/setup-buildx
+
+      - name: Build and publish fork CI image
+        env:
+          MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform "${{ matrix.platform }}" \
+            --build-arg CI_BASE_IMAGE=ubuntu:noble \
+            --secret id=MISE_GITHUB_TOKEN,env=MISE_GITHUB_TOKEN \
+            --cache-from "type=gha,scope=lightforge-ci-${{ matrix.arch }}" \
+            --cache-to "type=gha,mode=max,scope=lightforge-ci-${{ matrix.arch }}" \
+            --push \
+            -t "${LIGHTFORGE_CI_IMAGE}:${GITHUB_SHA}-${{ matrix.arch }}" \
+            -f deploy/docker/Dockerfile.ci \
+            .
+
+  merge-ci:
+    name: Merge fork CI image manifest
+    needs: build-ci
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: ./.github/actions/setup-buildx
+
+      - name: Publish fork CI image manifest
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --prefer-index=false \
+            -t "${LIGHTFORGE_CI_IMAGE}:${GITHUB_SHA}" \
+            "${LIGHTFORGE_CI_IMAGE}:${GITHUB_SHA}-amd64" \
+            "${LIGHTFORGE_CI_IMAGE}:${GITHUB_SHA}-arm64"
+
+  publish-supervisor:
+    name: Publish fork supervisor
+    needs: merge-ci
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: supervisor
+      image-registry: ghcr.io/lightforgedev/openshell
+      runner_kind: github-hosted
+      ci_image: ghcr.io/lightforgedev/openshell/ci:${{ github.sha }}
+    secrets: inherit

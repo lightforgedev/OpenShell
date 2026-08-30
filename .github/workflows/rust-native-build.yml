@@ -56,6 +56,11 @@ on:
         required: false
         type: string
         default: "native"
+      ci_image:
+        description: "CI image providing the pinned build toolchain."
+        required: false
+        type: string
+        default: "ghcr.io/nvidia/openshell/ci:latest"
 permissions:
   contents: read
   packages: read
@@ -86,7 +91,7 @@ jobs:
       # writers hit 409 Conflict.
       SCCACHE_GHA_VERSION: ${{ inputs.component }}-${{ inputs.arch }}
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ${{ inputs.ci_image }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
