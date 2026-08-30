@@ -52,7 +52,7 @@ on:
         required: false
         type: string
         default: "ghcr.io/nvidia/openshell"
-      runner-kind:
+      runner_kind:
         description: "Native self-hosted runners, or the GitHub-hosted fallback."
         required: false
         type: string
@@ -94,7 +94,7 @@ on:
         required: false
         type: boolean
         default: true
-      runner-kind:
+      runner_kind:
         description: "Runner pool for this dispatch"
         required: true
         type: choice
@@ -175,11 +175,11 @@ jobs:
           arches=()
           count=0
 
-          runner_kind="${{ inputs.runner-kind }}"
+          runner_kind="${{ inputs.runner_kind }}"
           case "$runner_kind" in
             native|github-hosted) ;;
             *)
-              echo "unsupported runner-kind: $runner_kind" >&2
+              echo "unsupported runner_kind: $runner_kind" >&2
               exit 1
               ;;
           esac
