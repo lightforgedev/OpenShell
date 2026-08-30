@@ -94,6 +94,32 @@ pub fn probe_availability() -> LandlockAvailability {
 pub struct PreparedRuleset {
     ruleset: landlock::RulesetCreated,
     compatibility: LandlockCompatibility,
+    evidence: LandlockEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LandlockEvidence {
+    pub abi: i32,
+    pub rules_applied: usize,
+}
+
+impl PreparedRuleset {
+    pub fn evidence_env(&self) -> Option<[(String, String); 2]> {
+        if !matches!(self.compatibility, LandlockCompatibility::HardRequirement) {
+            return None;
+        }
+
+        Some([
+            (
+                openshell_core::sandbox_env::LANDLOCK_ABI.to_string(),
+                self.evidence.abi.to_string(),
+            ),
+            (
+                openshell_core::sandbox_env::LANDLOCK_RULES_APPLIED.to_string(),
+                self.evidence.rules_applied.to_string(),
+            ),
+        ])
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,8 +178,9 @@ fn prepare_with_path_open_mode(
     // Probe first: kernels without Landlock (e.g. gVisor's sentry returns
     // ENOSYS) would otherwise log misleading "Applying"+"Built" events.
     let availability = probe_availability();
-    if !matches!(availability, LandlockAvailability::Available { .. }) {
-        match compatibility {
+    let landlock_abi = match availability {
+        LandlockAvailability::Available { abi } => abi,
+        _ => match compatibility {
             LandlockCompatibility::BestEffort => {
                 openshell_ocsf::ocsf_emit!(
                     openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
@@ -183,8 +210,8 @@ fn prepare_with_path_open_mode(
                     "Landlock unavailable in hard_requirement mode: {availability}"
                 ));
             }
-        }
-    }
+        },
+    };
 
     let total_paths = read_only.len() + read_write.len();
     let abi = ABI::V2;
@@ -260,6 +287,10 @@ fn prepare_with_path_open_mode(
         Ok(PreparedRuleset {
             ruleset,
             compatibility: compatibility.clone(),
+            evidence: LandlockEvidence {
+                abi: landlock_abi,
+                rules_applied,
+            },
         })
     })();
 

@@ -842,6 +842,14 @@ impl ProcessHandle {
         #[cfg(target_os = "linux")]
         let prepared_sandbox = prepare_child_sandbox(policy, workspace.root(), enforcement_mode)
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
+        #[cfg(target_os = "linux")]
+        if let Some(prepared) = prepared_sandbox.as_ref()
+            && let Some(env_vars) = sandbox::linux::landlock_evidence_env(prepared)
+        {
+            for (key, value) in env_vars {
+                cmd.env(key, value);
+            }
+        }
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
         // proper terminal control for shells and interactive programs.

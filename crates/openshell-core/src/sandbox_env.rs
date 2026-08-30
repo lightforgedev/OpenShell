@@ -114,6 +114,12 @@ impl MainProcessConfig {
 /// Deployment-controlled telemetry toggle propagated to the sandbox supervisor.
 pub const TELEMETRY_ENABLED: &str = "OPENSHELL_TELEMETRY_ENABLED";
 
+/// Landlock ABI observed while preparing a hard-requirement child sandbox.
+pub const LANDLOCK_ABI: &str = "OPENSHELL_LANDLOCK_ABI";
+
+/// Number of Landlock path rules prepared for the child process.
+pub const LANDLOCK_RULES_APPLIED: &str = "OPENSHELL_LANDLOCK_RULES_APPLIED";
+
 /// Supervisor pod/runtime topology. Kubernetes sidecar mode sets this to
 /// `"sidecar"`; the default combined supervisor path omits it.
 pub const SUPERVISOR_TOPOLOGY: &str = "OPENSHELL_SUPERVISOR_TOPOLOGY";

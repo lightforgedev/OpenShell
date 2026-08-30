@@ -1118,6 +1118,14 @@ fn spawn_pty_shell(
     let prepared_sandbox =
         crate::process::prepare_child_sandbox(policy, workspace.root(), enforcement_mode)
             .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
+    #[cfg(target_os = "linux")]
+    if let Some(prepared) = prepared_sandbox.as_ref()
+        && let Some(env_vars) = sandbox::linux::landlock_evidence_env(prepared)
+    {
+        for (key, value) in env_vars {
+            cmd.env(key, value);
+        }
+    }
 
     #[cfg(unix)]
     {
@@ -1277,6 +1285,14 @@ fn spawn_pipe_exec(
     let prepared_sandbox =
         crate::process::prepare_child_sandbox(policy, workspace.root(), enforcement_mode)
             .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
+    #[cfg(target_os = "linux")]
+    if let Some(prepared) = prepared_sandbox.as_ref()
+        && let Some(env_vars) = sandbox::linux::landlock_evidence_env(prepared)
+    {
+        for (key, value) in env_vars {
+            cmd.env(key, value);
+        }
+    }
 
     #[cfg(unix)]
     {

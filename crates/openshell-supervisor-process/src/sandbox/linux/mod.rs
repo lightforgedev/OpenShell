@@ -57,6 +57,13 @@ pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
     Ok(())
 }
 
+pub fn landlock_evidence_env(prepared: &PreparedSandbox) -> Option<[(String, String); 2]> {
+    prepared
+        .landlock
+        .as_ref()
+        .and_then(|ruleset| ruleset.evidence_env())
+}
+
 /// Apply the supervisor seccomp prelude after privileged bootstrap completes.
 pub fn apply_supervisor_prelude() -> Result<()> {
     seccomp::apply_supervisor_prelude()
