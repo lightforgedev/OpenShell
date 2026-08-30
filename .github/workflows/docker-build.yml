@@ -52,6 +52,11 @@ on:
         required: false
         type: string
         default: "ghcr.io/nvidia/openshell"
+      runner-kind:
+        description: "Native self-hosted runners, or the GitHub-hosted fallback."
+        required: false
+        type: string
+        default: "native"
   workflow_dispatch:
     inputs:
       component:
@@ -89,6 +94,12 @@ on:
         required: false
         type: boolean
         default: true
+      runner-kind:
+        description: "Runner pool for this dispatch"
+        required: true
+        type: choice
+        options: [github-hosted, native]
+        default: github-hosted
 
 env:
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -164,15 +175,32 @@ jobs:
           arches=()
           count=0
 
+          runner_kind="${{ inputs.runner-kind }}"
+          case "$runner_kind" in
+            native|github-hosted) ;;
+            *)
+              echo "unsupported runner-kind: $runner_kind" >&2
+              exit 1
+              ;;
+          esac
+
           for platform in "${platforms[@]}"; do
             case "$platform" in
               linux/amd64)
                 arch=amd64
-                runner=linux-amd64-cpu8
+                if [[ "$runner_kind" == github-hosted ]]; then
+                  runner=ubuntu-24.04
+                else
+                  runner=linux-amd64-cpu8
+                fi
                 ;;
               linux/arm64)
                 arch=arm64
-                runner=linux-arm64-cpu8
+                if [[ "$runner_kind" == github-hosted ]]; then
+                  runner=ubuntu-24.04-arm
+                else
+                  runner=linux-arm64-cpu8
+                fi
                 ;;
               *)
                 echo "unsupported platform: $platform" >&2
