@@ -47,6 +47,21 @@ on:
         required: false
         type: boolean
         default: true
+      image-registry:
+        description: "Fully qualified registry namespace for component images."
+        required: false
+        type: string
+        default: "ghcr.io/nvidia/openshell"
+      runner_kind:
+        description: "Native self-hosted runners, or the GitHub-hosted fallback."
+        required: false
+        type: string
+        default: "native"
+      ci_image:
+        description: "CI image providing the pinned build toolchain."
+        required: false
+        type: string
+        default: "ghcr.io/nvidia/openshell/ci:latest"
 
 env:
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -73,6 +88,7 @@ jobs:
       image_tag_base: ${{ steps.resolve.outputs.image_tag_base }}
       features: ${{ steps.resolve.outputs.features }}
       has_image: ${{ steps.resolve.outputs.has_image }}
+      manifest_runner: ${{ steps.resolve.outputs.manifest_runner }}
     steps:
       - name: Resolve component and platform matrix
         id: resolve
@@ -96,7 +112,7 @@ jobs:
             cli)
               binary_component=cli
               binary_name=openshell
-              features=""
+              features="bundled-z3"
               has_image=false
               ;;
             *)
@@ -122,15 +138,38 @@ jobs:
           arches=()
           count=0
 
+          runner_kind="${{ inputs.runner_kind }}"
+          case "$runner_kind" in
+            native|github-hosted) ;;
+            *)
+              echo "unsupported runner_kind: $runner_kind" >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ "$runner_kind" == github-hosted ]]; then
+            echo "manifest_runner=ubuntu-24.04" >> "$GITHUB_OUTPUT"
+          else
+            echo "manifest_runner=linux-amd64-cpu8" >> "$GITHUB_OUTPUT"
+          fi
+
           for platform in "${platforms[@]}"; do
             case "$platform" in
               linux/amd64)
                 arch=amd64
-                runner=linux-amd64-cpu8
+                if [[ "$runner_kind" == github-hosted ]]; then
+                  runner=ubuntu-24.04
+                else
+                  runner=linux-amd64-cpu8
+                fi
                 ;;
               linux/arm64)
                 arch=arm64
-                runner=linux-arm64-cpu8
+                if [[ "$runner_kind" == github-hosted ]]; then
+                  runner=ubuntu-24.04-arm
+                else
+                  runner=linux-arm64-cpu8
+                fi
                 ;;
               *)
                 echo "unsupported platform: $platform" >&2
@@ -154,7 +193,7 @@ jobs:
             echo "arches=${arches[*]}"
             echo "binary_component=$binary_component"
             echo "binary_name=$binary_name"
-            echo "artifact_prefix=rust-binary-${component}"
+            echo "artifact_prefix=rust-binary-${component}-${binary_component}"
             echo "image_tag_base=$image_tag_base"
             echo "features=$features"
             echo "has_image=$has_image"
@@ -178,6 +217,8 @@ jobs:
       checkout-ref: ${{ inputs['checkout-ref'] }}
       features: ${{ needs.resolve.outputs.features }}
       artifact-name: ${{ needs.resolve.outputs.artifact_prefix }}-linux-${{ matrix.arch }}
+      runner_kind: ${{ inputs.runner_kind }}
+      ci_image: ${{ inputs.ci_image }}
     secrets: inherit
 
   build:
@@ -190,7 +231,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ${{ inputs.ci_image }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -202,11 +243,11 @@ jobs:
         - /etc/buildkit:/etc/buildkit:ro
     env:
       IMAGE_TAG: ${{ format('{0}-{1}', needs.resolve.outputs.image_tag_base, matrix.arch) }}
-      IMAGE_REGISTRY: ghcr.io/nvidia/openshell
+      IMAGE_REGISTRY: ${{ inputs['image-registry'] }}
       DOCKER_PUSH: ${{ inputs.push && '1' || '0' }}
       DOCKER_PLATFORM: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
           fetch-depth: 0
@@ -224,7 +265,7 @@ jobs:
       - name: Set up buildx (local driver)
         uses: ./.github/actions/setup-buildx
         with:
-          buildkitd-config: /etc/buildkit/buildkitd.toml
+          buildkitd-config: ${{ (matrix.runner == 'linux-amd64-cpu8' || matrix.runner == 'linux-arm64-cpu8') && '/etc/buildkit/buildkitd.toml' || '' }}
 
       - name: Download Rust binary artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -278,10 +319,10 @@ jobs:
     name: Merge ${{ inputs.component }} manifest
     needs: [resolve, build]
     if: ${{ inputs.push && inputs['publish-manifest'] && needs.resolve.outputs.has_image == 'true' }}
-    runs-on: linux-amd64-cpu8
+    runs-on: ${{ needs.resolve.outputs.manifest_runner }}
     timeout-minutes: 10
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ${{ inputs.ci_image }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -294,7 +335,7 @@ jobs:
       - name: Create multi-arch manifest
         run: |
           set -euo pipefail
-          image="ghcr.io/nvidia/openshell/${{ inputs.component }}"
+          image="${{ inputs['image-registry'] }}/${{ inputs.component }}"
           refs=()
           for arch in ${{ needs.resolve.outputs.arches }}; do
             refs+=("${image}:${{ needs.resolve.outputs.image_tag_base }}-${arch}")

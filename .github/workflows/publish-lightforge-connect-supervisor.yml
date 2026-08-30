@@ -1,0 +1,19 @@
+name: Publish Lightforge Connect Supervisor
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish-supervisor:
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: supervisor
+      image-registry: ghcr.io/lightforgedev/openshell
+      runner_kind: github-hosted
+      ci_image: ghcr.io/lightforgedev/openshell/ci:56958dbb064b64c088cebe50d40252e36d2788fb
+      image-tag: v0.0.113-landlock-evidence
+    secrets: inherit
