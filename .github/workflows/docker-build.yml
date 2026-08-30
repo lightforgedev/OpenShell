@@ -212,6 +212,7 @@ jobs:
       checkout-ref: ${{ inputs['checkout-ref'] }}
       features: ${{ needs.resolve.outputs.features }}
       artifact-name: ${{ needs.resolve.outputs.artifact_prefix }}-linux-${{ matrix.arch }}
+      runner_kind: ${{ inputs.runner_kind }}
     secrets: inherit
 
   build:

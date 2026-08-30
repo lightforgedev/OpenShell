@@ -51,6 +51,11 @@ on:
         required: false
         type: string
         default: ""
+      runner_kind:
+        description: "Native self-hosted runners, or the GitHub-hosted fallback."
+        required: false
+        type: string
+        default: "native"
 permissions:
   contents: read
   packages: read
@@ -70,7 +75,7 @@ defaults:
 jobs:
   rust-native-build:
     name: ${{ inputs.component }} (${{ inputs.arch }})
-    runs-on: ${{ inputs.arch == 'arm64' && 'linux-arm64-cpu8' || 'linux-amd64-cpu8' }}
+    runs-on: ${{ inputs.runner_kind == 'github-hosted' && (inputs.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04') || (inputs.arch == 'arm64' && 'linux-arm64-cpu8' || 'linux-amd64-cpu8') }}
     timeout-minutes: 60
     env:
       COMPONENT: ${{ inputs.component }}
