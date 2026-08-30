@@ -85,17 +85,3 @@ jobs:
       runner_kind: github-hosted
       ci_image: ghcr.io/lightforgedev/openshell/ci:${{ github.sha }}
     secrets: inherit
-
-  publish-supervisor-access:
-    name: Make fork supervisor anonymously pullable
-    needs: publish-supervisor
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Set public container visibility
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          gh api --method PATCH \
-            /orgs/lightforgedev/packages/container/openshell%2Fsupervisor \
-            -f visibility=public >/dev/null
