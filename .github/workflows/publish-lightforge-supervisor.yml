@@ -1,0 +1,23 @@
+name: Publish Lightforge Supervisor
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Optional image tag base; defaults to the selected commit SHA"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: supervisor
+      image-registry: ghcr.io/lightforgedev/openshell
+      image-tag: ${{ inputs.image_tag }}
+      runner_kind: github-hosted
