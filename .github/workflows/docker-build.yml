@@ -64,7 +64,7 @@ on:
         required: true
         type: choice
         options: [gateway, supervisor]
-      image-registry:
+      dispatch_image_registry:
         description: "Fully qualified registry namespace"
         required: true
         type: string
@@ -94,7 +94,7 @@ on:
         required: false
         type: boolean
         default: true
-      runner_kind:
+      dispatch_runner_kind:
         description: "Runner pool for this dispatch"
         required: true
         type: choice
@@ -175,7 +175,7 @@ jobs:
           arches=()
           count=0
 
-          runner_kind="${{ inputs.runner_kind }}"
+          runner_kind="${{ github.event.inputs.dispatch_runner_kind || inputs.runner_kind }}"
           case "$runner_kind" in
             native|github-hosted) ;;
             *)
@@ -272,7 +272,7 @@ jobs:
         - /etc/buildkit:/etc/buildkit:ro
     env:
       IMAGE_TAG: ${{ format('{0}-{1}', needs.resolve.outputs.image_tag_base, matrix.arch) }}
-      IMAGE_REGISTRY: ${{ inputs.image-registry }}
+      IMAGE_REGISTRY: ${{ github.event.inputs.dispatch_image_registry || inputs['image-registry'] }}
       DOCKER_PUSH: ${{ inputs.push && '1' || '0' }}
       DOCKER_PLATFORM: ${{ matrix.platform }}
     steps:
@@ -364,7 +364,7 @@ jobs:
       - name: Create multi-arch manifest
         run: |
           set -euo pipefail
-          image="${{ inputs.image-registry }}/${{ inputs.component }}"
+          image="${{ github.event.inputs.dispatch_image_registry || inputs['image-registry'] }}/${{ inputs.component }}"
           refs=()
           for arch in ${{ needs.resolve.outputs.arches }}; do
             refs+=("${image}:${{ needs.resolve.outputs.image_tag_base }}-${arch}")
