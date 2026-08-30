@@ -47,6 +47,48 @@ on:
         required: false
         type: boolean
         default: true
+      image-registry:
+        description: "Fully qualified registry namespace for component images."
+        required: false
+        type: string
+        default: "ghcr.io/nvidia/openshell"
+  workflow_dispatch:
+    inputs:
+      component:
+        description: "Component to build and publish"
+        required: true
+        type: choice
+        options: [gateway, supervisor]
+      image-registry:
+        description: "Fully qualified registry namespace"
+        required: true
+        type: string
+        default: "ghcr.io/lightforgedev/openshell"
+      image-tag:
+        description: "Optional image tag base; defaults to the commit SHA"
+        required: false
+        type: string
+        default: ""
+      platform:
+        description: "Target platforms"
+        required: false
+        type: string
+        default: "linux/amd64,linux/arm64"
+      timeout-minutes:
+        description: "Per-architecture build timeout"
+        required: false
+        type: number
+        default: 20
+      push:
+        description: "Push component images and the multi-architecture manifest"
+        required: false
+        type: boolean
+        default: true
+      publish-manifest:
+        description: "Publish the multi-architecture image manifest"
+        required: false
+        type: boolean
+        default: true
 
 env:
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -202,7 +244,7 @@ jobs:
         - /etc/buildkit:/etc/buildkit:ro
     env:
       IMAGE_TAG: ${{ format('{0}-{1}', needs.resolve.outputs.image_tag_base, matrix.arch) }}
-      IMAGE_REGISTRY: ghcr.io/nvidia/openshell
+      IMAGE_REGISTRY: ${{ inputs.image-registry }}
       DOCKER_PUSH: ${{ inputs.push && '1' || '0' }}
       DOCKER_PLATFORM: ${{ matrix.platform }}
     steps:
@@ -294,7 +336,7 @@ jobs:
       - name: Create multi-arch manifest
         run: |
           set -euo pipefail
-          image="ghcr.io/nvidia/openshell/${{ inputs.component }}"
+          image="${{ inputs.image-registry }}/${{ inputs.component }}"
           refs=()
           for arch in ${{ needs.resolve.outputs.arches }}; do
             refs+=("${image}:${{ needs.resolve.outputs.image_tag_base }}-${arch}")
