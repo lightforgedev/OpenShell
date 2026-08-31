@@ -17,6 +17,7 @@ use libc;
 use miette::{IntoDiagnostic, Result};
 use nix::pty::{Winsize, openpty};
 use nix::unistd::setsid;
+use openshell_core::VERSION;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::policy::SandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
@@ -26,6 +27,7 @@ use openshell_ocsf::{
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, ChannelOpenHandle, Handle, Session};
 use russh::{ChannelId, ChannelOpenFailure, Sig};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -35,6 +37,8 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use tokio::net::UnixListener;
 use tracing::warn;
+
+const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
 
 /// Perform SSH server initialization: generate a host key, build the config,
 /// and bind the Unix socket listener. Extracted so that startup errors can be
@@ -54,7 +58,9 @@ fn ssh_server_init(
     let mut rng = rand::rng();
     let host_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).into_diagnostic()?;
 
+    // TODO: while building the SSH config, refactor the server_id to be "SSH-2.0-OpenShell_<version>" from `openshell_core::VERSION`
     let mut config = russh::server::Config {
+        server_id: russh::SshId::Standard(Cow::Owned(format!("SSH-2.0-OpenShell_{VERSION}"))),
         auth_rejection_time: Duration::from_secs(1),
         ..Default::default()
     };
@@ -381,11 +387,15 @@ async fn handle_connection(
 /// sender.  This allows `window_change_request` to resize the correct PTY when
 /// multiple channels are open simultaneously (e.g. parallel shells, shell +
 /// sftp, etc.).
+// Several independent per-channel boolean flags (login-shell opt-out and the
+// main-attachment state bits) legitimately live side by side here.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 struct ChannelState {
     input_sender: Option<InputSender>,
     pty_master: Option<std::fs::File>,
     pty_request: Option<PtyRequest>,
+    no_login_shell: bool,
     main_input_owner: Option<u64>,
     main_attached: bool,
     main_read_only: bool,
@@ -840,6 +850,7 @@ impl russh::server::Handler for SshHandler {
                 &self.policy,
                 &self.workspace,
                 Some("/usr/lib/openssh/sftp-server".to_string()),
+                false,
                 session.handle(),
                 channel,
                 self.netns_fd,
@@ -877,8 +888,17 @@ impl russh::server::Handler for SshHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         // Accept the env request so the client knows we handled it, but we
-        // don't actually propagate the variables — the sandbox environment is
-        // controlled via policy.  We must reply so VSCode doesn't stall.
+        // don't actually propagate arbitrary variables — the sandbox
+        // environment is controlled via policy. We must reply so VSCode
+        // doesn't stall. Two exceptions carry supervisor signals the SSH
+        // protocol has no native field for:
+        // - OPENSHELL_NO_LOGIN_SHELL: gateway login-shell opt-out.
+        // - OPENSHELL_MAIN_READ_ONLY: read-only main attachment.
+        if variable_name == NO_LOGIN_SHELL_ENV.0
+            && let Some(state) = self.channels.get_mut(&channel)
+        {
+            state.no_login_shell = variable_value == NO_LOGIN_SHELL_ENV.1;
+        }
         if variable_name == "OPENSHELL_MAIN_READ_ONLY"
             && variable_value == "1"
             && let Some(state) = self.channels.get_mut(&channel)
@@ -1050,6 +1070,7 @@ impl SshHandler {
             .channels
             .get_mut(&channel)
             .ok_or_else(|| anyhow::anyhow!("start_shell on unknown channel {channel:?}"))?;
+        let no_login_shell = state.no_login_shell;
         if let Some(pty) = state.pty_request.take() {
             // PTY was requested — allocate a real PTY (interactive shell or
             // exec that explicitly asked for a terminal).
@@ -1057,6 +1078,7 @@ impl SshHandler {
                 &self.policy,
                 &self.workspace,
                 command,
+                no_login_shell,
                 &pty,
                 handle,
                 channel,
@@ -1078,6 +1100,7 @@ impl SshHandler {
                 &self.policy,
                 &self.workspace,
                 command,
+                no_login_shell,
                 handle,
                 channel,
                 self.netns_fd,
@@ -1215,11 +1238,16 @@ fn apply_child_env(
     }
 }
 
+const fn login_shell_flag(no_login_shell: bool) -> &'static str {
+    if no_login_shell { "-c" } else { "-lc" }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_pty_shell(
     policy: &SandboxPolicy,
     workspace: &ResolvedWorkspace,
     command: Option<String>,
+    no_login_shell: bool,
     pty: &PtyRequest,
     handle: Handle,
     channel: ChannelId,
@@ -1256,7 +1284,7 @@ fn spawn_pty_shell(
         },
         |command| {
             let mut c = Command::new("/bin/bash");
-            c.arg("-lc").arg(command);
+            c.arg(login_shell_flag(no_login_shell)).arg(command);
             c
         },
     );
@@ -1396,6 +1424,7 @@ fn spawn_pipe_exec(
     policy: &SandboxPolicy,
     workspace: &ResolvedWorkspace,
     command: Option<String>,
+    no_login_shell: bool,
     handle: Handle,
     channel: ChannelId,
     netns_fd: Option<RawFd>,
@@ -1418,10 +1447,10 @@ fn spawn_pipe_exec(
         },
         |command| {
             let mut c = Command::new("/bin/bash");
-            // Use login shell (-l) so that .profile/.bashrc are sourced and
-            // tool-specific env vars (VIRTUAL_ENV, UV_PYTHON_INSTALL_DIR, etc.)
-            // are available without hardcoding them here.
-            c.arg("-lc").arg(command);
+            // Login shell (-l) sources .profile/.bashrc so tool env vars
+            // (VIRTUAL_ENV, etc.) are available. Callers that need a predictable
+            // environment opt out via OPENSHELL_NO_LOGIN_SHELL → plain -c.
+            c.arg(login_shell_flag(no_login_shell)).arg(command);
             c
         },
     );
@@ -1898,6 +1927,38 @@ mod tests {
             output.status
         );
         assert_eq!(output.stdout, b"hello");
+    }
+
+    /// Command execution selects a login shell by default and a non-login shell
+    /// under `--no-login-shell`, so user startup files are sourced only in the
+    /// default case.
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_flag_controls_profile_sourcing() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(".bash_profile"), "echo LOGIN_MARKER\n").unwrap();
+
+        let run = |flag: &str| -> String {
+            let out = Command::new("bash")
+                .arg(flag)
+                .arg("true")
+                .env("HOME", home.path())
+                .env_remove("BASH_ENV") // isolate: -c still reads BASH_ENV if set
+                .output()
+                .expect("spawn bash");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        assert_eq!(login_shell_flag(true), "-c");
+        assert_eq!(login_shell_flag(false), "-lc");
+        assert!(
+            run("-lc").contains("LOGIN_MARKER"),
+            "login shell must source .bash_profile"
+        );
+        assert!(
+            !run("-c").contains("LOGIN_MARKER"),
+            "non-login shell must not source it"
+        );
     }
 
     /// Verify that the stdin writer delivers all buffered data before exiting
