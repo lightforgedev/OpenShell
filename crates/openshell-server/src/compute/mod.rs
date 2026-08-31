@@ -34,17 +34,18 @@ use openshell_core::ComputeDriverKind;
 #[cfg(target_os = "windows")]
 use openshell_core::proto::SandboxPolicy;
 use openshell_core::proto::compute::v1::{
-    CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
-    DriverCondition, DriverPlatformEvent, DriverResourceRequirements, DriverSandbox,
-    DriverSandboxSpec, DriverSandboxStatus, DriverSandboxTemplate, EnsureWorkspaceRequest,
-    EnsureWorkspaceResponse, GatewayListenerRequirement as ProtoGatewayListenerRequirement,
-    GetCapabilitiesRequest, GetGatewayListenerRequirementsRequest,
-    GetGatewayListenerRequirementsResponse, GetSandboxRequest,
-    GpuResourceRequirements as DriverGpuResourceRequirements, ListSandboxesRequest,
-    ResourceRequirements as DriverSandboxResourceRequirements, StartSandboxRequest,
-    StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
-    gateway_listener_requirement::Selector, watch_sandboxes_event,
+    AuthenticateSandboxRequest, CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest,
+    DeleteWorkspaceResponse, DriverCondition, DriverPlatformEvent, DriverResourceRequirements,
+    DriverSandbox, DriverSandboxSpec, DriverSandboxStatus, DriverSandboxTemplate,
+    EnsureWorkspaceRequest, EnsureWorkspaceResponse,
+    GatewayListenerRequirement as ProtoGatewayListenerRequirement, GetCapabilitiesRequest,
+    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
+    GetSandboxRequest, GpuResourceRequirements as DriverGpuResourceRequirements,
+    ListSandboxesRequest, ResourceRequirements as DriverSandboxResourceRequirements,
+    StartSandboxRequest, StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent,
+    WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
+    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
+    watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
@@ -284,6 +285,8 @@ pub struct ComputeDriverInfoSnapshot {
     pub driver_version: String,
     /// Whether the driver asks the gateway to reconcile compute across restarts.
     pub gateway_manages_lifecycle: bool,
+    /// Whether the driver authenticates driver-native sandbox credentials.
+    pub supports_sandbox_authentication: bool,
 }
 
 /// Interval between store-vs-backend reconciliation sweeps.
@@ -455,6 +458,17 @@ impl ComputeDriver for RemoteComputeDriver {
     {
         let mut client = self.client();
         client.get_capabilities(request).await
+    }
+
+    async fn authenticate_sandbox(
+        &self,
+        request: Request<AuthenticateSandboxRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>,
+        Status,
+    > {
+        let mut client = self.client();
+        client.authenticate_sandbox(request).await
     }
 
     async fn get_gateway_listener_requirements(
@@ -629,6 +643,7 @@ impl ComputeRuntime {
             driver_name: capabilities.driver_name,
             driver_version: capabilities.driver_version,
             gateway_manages_lifecycle: capabilities.gateway_manages_lifecycle,
+            supports_sandbox_authentication: capabilities.supports_sandbox_authentication,
         };
         let default_image = capabilities.default_image;
         let gateway_listener_requirements = match driver
@@ -877,6 +892,33 @@ impl ComputeRuntime {
     #[must_use]
     pub fn driver_kind(&self) -> Option<ComputeDriverKind> {
         self.driver_info.name.parse().ok()
+    }
+
+    #[must_use]
+    pub fn selected_driver_name(&self) -> &str {
+        &self.driver_info.name
+    }
+
+    #[must_use]
+    pub fn supports_sandbox_authentication(&self) -> bool {
+        self.driver_info.supports_sandbox_authentication
+    }
+
+    pub(crate) async fn authenticate_sandbox(&self, credential: &str) -> Result<String, Status> {
+        if !self.supports_sandbox_authentication() {
+            return Err(Status::unimplemented(
+                "selected compute driver does not authenticate sandbox credentials",
+            ));
+        }
+        let request = AuthenticateSandboxRequest {
+            credential: credential.to_string(),
+        };
+        self.driver
+            .call("driver.authenticate_sandbox", None, |driver| async move {
+                driver.authenticate_sandbox(Request::new(request)).await
+            })
+            .await
+            .map(|response| response.into_inner().sandbox_id)
     }
 
     #[must_use]
@@ -4347,9 +4389,10 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
 }
 
 #[cfg(test)]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct NoopTestDriver {
     workspace_delete_failures: std::sync::atomic::AtomicUsize,
+    sandbox_authentication: Option<Result<String, (Code, String)>>,
 }
 
 #[cfg(test)]
@@ -4357,6 +4400,31 @@ impl NoopTestDriver {
     pub fn failing_workspace_deletes(count: usize) -> Self {
         Self {
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(count),
+            sandbox_authentication: None,
+        }
+    }
+
+    pub fn authenticating_sandbox(sandbox_id: impl Into<String>) -> Self {
+        Self {
+            workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
+            sandbox_authentication: Some(Ok(sandbox_id.into())),
+        }
+    }
+
+    pub fn failing_sandbox_authentication(code: Code, message: impl Into<String>) -> Self {
+        Self {
+            workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
+            sandbox_authentication: Some(Err((code, message.into()))),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for NoopTestDriver {
+    fn default() -> Self {
+        Self {
+            workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
+            sandbox_authentication: None,
         }
     }
 }
@@ -4364,6 +4432,26 @@ impl NoopTestDriver {
 #[cfg(test)]
 #[tonic::async_trait]
 impl ComputeDriver for NoopTestDriver {
+    async fn authenticate_sandbox(
+        &self,
+        _request: Request<AuthenticateSandboxRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>,
+        Status,
+    > {
+        match &self.sandbox_authentication {
+            Some(Ok(sandbox_id)) => Ok(tonic::Response::new(
+                openshell_core::proto::compute::v1::AuthenticateSandboxResponse {
+                    sandbox_id: sandbox_id.clone(),
+                },
+            )),
+            Some(Err((code, message))) => Err(Status::new(*code, message.clone())),
+            None => Err(Status::unimplemented(
+                "test driver does not authenticate sandbox credentials",
+            )),
+        }
+    }
+
     type WatchSandboxesStream = DriverWatchStream;
 
     async fn get_capabilities(
@@ -4377,6 +4465,7 @@ impl ComputeDriver for NoopTestDriver {
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
                 gateway_manages_lifecycle: false,
+                supports_sandbox_authentication: self.sandbox_authentication.is_some(),
             },
         ))
     }
@@ -4511,6 +4600,7 @@ pub async fn new_test_runtime_with_driver(
     driver_name: &str,
     driver: Arc<NoopTestDriver>,
 ) -> ComputeRuntime {
+    let supports_sandbox_authentication = driver.sandbox_authentication.is_some();
     ComputeRuntime {
         driver: TracedDriver::new(driver, "test".to_string()),
         driver_info: ComputeDriverInfoSnapshot {
@@ -4518,6 +4608,7 @@ pub async fn new_test_runtime_with_driver(
             driver_name: driver_name.to_string(),
             driver_version: "test".to_string(),
             gateway_manages_lifecycle: false,
+            supports_sandbox_authentication,
         },
         driver_process: None,
         default_image: "openshell/sandbox:test".to_string(),
@@ -4672,6 +4763,18 @@ mod tests {
 
     #[tonic::async_trait]
     impl ComputeDriver for TestDriver {
+        async fn authenticate_sandbox(
+            &self,
+            _request: Request<AuthenticateSandboxRequest>,
+        ) -> Result<
+            tonic::Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>,
+            Status,
+        > {
+            Err(Status::unimplemented(
+                "test driver does not authenticate sandbox credentials",
+            ))
+        }
+
         type WatchSandboxesStream = DriverWatchStream;
 
         async fn get_capabilities(
@@ -4683,6 +4786,7 @@ mod tests {
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
                 gateway_manages_lifecycle: false,
+                supports_sandbox_authentication: false,
             }))
         }
 
@@ -4990,6 +5094,18 @@ mod tests {
 
     #[tonic::async_trait]
     impl ComputeDriver for ControlledDriver {
+        async fn authenticate_sandbox(
+            &self,
+            _request: Request<AuthenticateSandboxRequest>,
+        ) -> Result<
+            tonic::Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>,
+            Status,
+        > {
+            Err(Status::unimplemented(
+                "test driver does not authenticate sandbox credentials",
+            ))
+        }
+
         type WatchSandboxesStream = DriverWatchStream;
 
         async fn get_capabilities(
@@ -5001,6 +5117,7 @@ mod tests {
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
                 gateway_manages_lifecycle: false,
+                supports_sandbox_authentication: false,
             }))
         }
 
@@ -5204,6 +5321,7 @@ mod tests {
                 driver_name: driver_name.to_string(),
                 driver_version: "test".to_string(),
                 gateway_manages_lifecycle: false,
+                supports_sandbox_authentication: false,
             },
             driver_process: None,
             default_image: "openshell/sandbox:test".to_string(),
@@ -6197,6 +6315,18 @@ mod tests {
 
         #[tonic::async_trait]
         impl ComputeDriver for FailingDriver {
+            async fn authenticate_sandbox(
+                &self,
+                _request: Request<AuthenticateSandboxRequest>,
+            ) -> Result<
+                tonic::Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>,
+                Status,
+            > {
+                Err(Status::unimplemented(
+                    "test driver does not authenticate sandbox credentials",
+                ))
+            }
+
             type WatchSandboxesStream = DriverWatchStream;
 
             async fn create_sandbox(
