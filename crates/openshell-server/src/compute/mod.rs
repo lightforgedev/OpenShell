@@ -20,8 +20,8 @@ pub use vm::VmComputeConfig;
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
 use crate::otel_tracing::TraceContextInterceptor;
 use crate::persistence::{
-    DRAFT_CHUNK_OBJECT_TYPE, ObjectId, ObjectName, ObjectRecord, ObjectType, POLICY_OBJECT_TYPE,
-    Store, WriteCondition,
+    DRAFT_CHUNK_OBJECT_TYPE, ObjectCursor, ObjectId, ObjectName, ObjectRecord, ObjectType,
+    POLICY_OBJECT_TYPE, Store, WriteCondition,
 };
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
@@ -70,7 +70,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, watch};
@@ -3305,21 +3305,60 @@ impl ComputeRuntime {
         sandbox_id: &str,
         workspace: &str,
     ) -> Result<(), String> {
-        let records = self
-            .store
-            .list(SshSession::object_type(), workspace, 1000, 0)
-            .await
-            .map_err(|e| format!("list SSH sessions: {e}"))?;
+        let started = Instant::now();
+        let mut cursor = None;
+        let mut scanned = 0_usize;
+        let mut decode_failures = 0_usize;
+        let mut session_ids = Vec::new();
 
-        for record in records {
-            if let Ok(session) = SshSession::decode(record.payload.as_slice())
-                && session.sandbox_id == sandbox_id
-            {
-                self.store
-                    .delete(SshSession::object_type(), session.object_id())
-                    .await
-                    .map_err(|e| format!("delete SSH session {}: {e}", session.object_id()))?;
+        loop {
+            let records = self
+                .store
+                .list_after(
+                    SshSession::object_type(),
+                    workspace,
+                    cursor.as_ref(),
+                    LIFECYCLE_SWEEP_PAGE_SIZE,
+                )
+                .await
+                .map_err(|e| format!("list SSH sessions: {e}"))?;
+            let page_len = records.len();
+            scanned += page_len;
+
+            cursor = records.last().map(ObjectCursor::from);
+            for record in records {
+                match SshSession::decode(record.payload.as_slice()) {
+                    Ok(session) if session.sandbox_id == sandbox_id => {
+                        session_ids.push(session.object_id().to_string());
+                    }
+                    Ok(_) => {}
+                    Err(_) => decode_failures += 1,
+                }
             }
+
+            if page_len < LIFECYCLE_SWEEP_PAGE_SIZE as usize {
+                break;
+            }
+        }
+
+        let matched = session_ids.len();
+        let deleted = self
+            .store
+            .delete_many(SshSession::object_type(), &session_ids)
+            .await
+            .map_err(|e| format!("delete sandbox SSH sessions: {e}"))?;
+
+        if matched > 0 || decode_failures > 0 {
+            debug!(
+                sandbox_id,
+                workspace,
+                scanned,
+                matched,
+                deleted,
+                decode_failures,
+                elapsed_ms = started.elapsed().as_millis(),
+                "Sandbox SSH session cleanup complete"
+            );
         }
 
         Ok(())
@@ -7801,6 +7840,43 @@ mod tests {
         .await
         .expect("detached delete worker did not finish cleanup");
         assert_eq!(driver.delete_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn sandbox_ssh_session_cleanup_batches_across_list_pages() {
+        let runtime = test_runtime(ControlledDriver::new()).await;
+        for idx in 0..(LIFECYCLE_SWEEP_PAGE_SIZE + 5) {
+            let session = ssh_session_record(&format!("owned-{idx:04}"), "sb-owned");
+            runtime.store.put_message(&session).await.unwrap();
+        }
+        for idx in 0..7 {
+            let session = ssh_session_record(&format!("unrelated-{idx:04}"), "sb-unrelated");
+            runtime.store.put_message(&session).await.unwrap();
+        }
+
+        runtime
+            .cleanup_sandbox_ssh_sessions("sb-owned", "default")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .store
+                .count_in_workspace(SshSession::object_type(), "default")
+                .await
+                .unwrap(),
+            7
+        );
+        for idx in 0..7 {
+            assert!(
+                runtime
+                    .store
+                    .get_message::<SshSession>(&format!("unrelated-{idx:04}"))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 
     #[tokio::test]
