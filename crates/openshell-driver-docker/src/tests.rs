@@ -43,6 +43,7 @@ fn test_sandbox() -> DriverSandbox {
                 environment: HashMap::from([("TEMPLATE_ENV".to_string(), "template".to_string())]),
                 ..Default::default()
             }),
+            policy: None,
             resource_requirements: None,
             sandbox_token: String::new(),
             command: Vec::new(),

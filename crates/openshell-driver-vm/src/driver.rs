@@ -525,6 +525,7 @@ impl VmDriver {
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
+            driver_reports_runtime_readiness: false,
         }
     }
 
@@ -3663,7 +3664,7 @@ async fn connect_local_container_engine() -> Option<Docker> {
         return Some(docker);
     }
 
-    let podman_socket = openshell_core::config::detect_podman_socket()?;
+    let podman_socket = detect_podman_socket()?;
     if let Ok(docker) =
         Docker::connect_with_unix(podman_socket.to_str()?, 120, bollard::API_DEFAULT_VERSION)
         && docker.ping().await.is_ok()
@@ -3676,6 +3677,10 @@ async fn connect_local_container_engine() -> Option<Docker> {
     }
 
     None
+}
+
+fn detect_podman_socket() -> Option<PathBuf> {
+    openshell_driver_podman::driver::detect_socket()
 }
 
 fn is_openshell_local_build_image_ref(image_ref: &str) -> bool {
