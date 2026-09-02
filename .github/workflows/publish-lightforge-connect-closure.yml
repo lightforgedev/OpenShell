@@ -1,0 +1,305 @@
+name: Publish Lightforge Connect OpenShell closure
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: lightforge-connect-openshell-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  attestations: write
+  contents: read
+  id-token: write
+  packages: write
+
+env:
+  LIGHTFORGE_CI_IMAGE: ghcr.io/lightforgedev/openshell/ci
+  LIGHTFORGE_IMAGE_REGISTRY: ghcr.io/lightforgedev/openshell
+
+jobs:
+  plan:
+    name: Resolve immutable builder base
+    runs-on: ubuntu-24.04
+    outputs:
+      ci_base_image: ${{ steps.base.outputs.image }}
+      ci_base_digest: ${{ steps.base.outputs.digest }}
+    steps:
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+
+      - id: base
+        name: Resolve CI base image digest
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect ubuntu:noble --format '{{json .}}' | jq -er '.manifest.digest')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'image=ubuntu@%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+  build-ci:
+    name: Build source-bound CI image (${{ matrix.arch }})
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: ./.github/actions/setup-buildx
+
+      - name: Build and publish source-bound CI image
+        env:
+          MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform "${{ matrix.platform }}" \
+            --build-arg CI_BASE_IMAGE="${{ needs.plan.outputs.ci_base_image }}" \
+            --secret id=MISE_GITHUB_TOKEN,env=MISE_GITHUB_TOKEN \
+            --cache-from "type=gha,scope=lightforge-connect-ci-${{ matrix.arch }}" \
+            --cache-to "type=gha,mode=max,scope=lightforge-connect-ci-${{ matrix.arch }}" \
+            --push \
+            -t "${LIGHTFORGE_CI_IMAGE}:${GITHUB_SHA}-${{ matrix.arch }}" \
+            -f deploy/docker/Dockerfile.ci \
+            .
+
+  merge-ci:
+    name: Publish source-bound CI manifest
+    needs: build-ci
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+
+      - name: Publish source-bound CI manifest
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --prefer-index=false \
+            -t "${LIGHTFORGE_CI_IMAGE}:${GITHUB_SHA}" \
+            "${LIGHTFORGE_CI_IMAGE}:${GITHUB_SHA}-amd64" \
+            "${LIGHTFORGE_CI_IMAGE}:${GITHUB_SHA}-arm64"
+
+  build-agent-cli:
+    name: Build Linux agent CLI
+    needs: merge-ci
+    uses: ./.github/workflows/rust-native-build.yml
+    with:
+      component: cli
+      arch: arm64
+      features: bundled-z3
+      artifact-name: connect-agent-openshell-cli-linux-arm64
+      checkout-ref: ${{ github.sha }}
+      runner_kind: github-hosted
+      ci_image: ghcr.io/lightforgedev/openshell/ci:${{ github.sha }}
+    secrets: inherit
+
+  build-supervisor-binary:
+    name: Build Linux supervisor binary
+    needs: merge-ci
+    uses: ./.github/workflows/rust-native-build.yml
+    with:
+      component: sandbox
+      arch: arm64
+      artifact-name: connect-openshell-supervisor-linux-arm64
+      checkout-ref: ${{ github.sha }}
+      runner_kind: github-hosted
+      ci_image: ghcr.io/lightforgedev/openshell/ci:${{ github.sha }}
+    secrets: inherit
+
+  build-host-cli:
+    name: Build Darwin host CLI
+    needs: merge-ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-buildx
+
+      - name: Build Darwin arm64 CLI
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --file deploy/docker/Dockerfile.cli-macos \
+            --build-arg CARGO_TARGET_CACHE_SCOPE="connect-${GITHUB_SHA}" \
+            --target binary \
+            --output type=local,dest=out/ \
+            .
+          file out/openshell | grep -q 'Mach-O.*arm64'
+
+      - name: Upload Darwin host CLI
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: connect-host-openshell-cli-darwin-arm64
+          path: out/openshell
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-gateway:
+    name: Publish Gateway image
+    needs: merge-ci
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: gateway
+      platform: linux/arm64
+      image-registry: ghcr.io/lightforgedev/openshell
+      image-tag: ${{ github.sha }}
+      checkout-ref: ${{ github.sha }}
+      runner_kind: github-hosted
+      ci_image: ghcr.io/lightforgedev/openshell/ci:${{ github.sha }}
+    secrets: inherit
+
+  publish-supervisor:
+    name: Publish Supervisor image
+    needs: merge-ci
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: supervisor
+      platform: linux/arm64
+      image-registry: ghcr.io/lightforgedev/openshell
+      image-tag: ${{ github.sha }}
+      checkout-ref: ${{ github.sha }}
+      runner_kind: github-hosted
+      ci_image: ghcr.io/lightforgedev/openshell/ci:${{ github.sha }}
+    secrets: inherit
+
+  receipt:
+    name: Verify and attest Connect closure receipt
+    needs:
+      - plan
+      - build-agent-cli
+      - build-supervisor-binary
+      - build-host-cli
+      - publish-gateway
+      - publish-supervisor
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download Linux agent CLI
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: connect-agent-openshell-cli-linux-arm64
+          path: downloads/agent-cli
+
+      - name: Download Linux supervisor binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: connect-openshell-supervisor-linux-arm64
+          path: downloads/supervisor
+
+      - name: Download Darwin host CLI
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: connect-host-openshell-cli-darwin-arm64
+          path: downloads/host-cli
+
+      - name: Verify artifacts and bind image digests
+        run: |
+          set -euo pipefail
+          install -D -m 0755 downloads/agent-cli/prebuilt-binaries/arm64/openshell artifacts/agent-openshell-cli
+          install -D -m 0755 downloads/supervisor/prebuilt-binaries/arm64/openshell-sandbox artifacts/openshell-supervisor
+          install -D -m 0755 downloads/host-cli/openshell artifacts/host-openshell-cli
+          file artifacts/agent-openshell-cli | grep -Eq 'ELF 64-bit.*ARM aarch64'
+          file artifacts/openshell-supervisor | grep -Eq 'ELF 64-bit.*ARM aarch64'
+          file artifacts/host-openshell-cli | grep -q 'Mach-O.*arm64'
+          resolve_digest() {
+            docker buildx imagetools inspect "$1" --format '{{json .}}' | jq -er '.manifest.digest'
+          }
+          ci_digest="$(resolve_digest "${LIGHTFORGE_CI_IMAGE}:${GITHUB_SHA}")"
+          gateway_digest="$(resolve_digest "${LIGHTFORGE_IMAGE_REGISTRY}/gateway:${GITHUB_SHA}")"
+          supervisor_digest="$(resolve_digest "${LIGHTFORGE_IMAGE_REGISTRY}/supervisor:${GITHUB_SHA}")"
+          python3 - "$GITHUB_SHA" "${{ needs.plan.outputs.ci_base_digest }}" "$ci_digest" "$gateway_digest" "$supervisor_digest" <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          source_sha, ci_base_digest, ci_digest, gateway_digest, supervisor_digest = sys.argv[1:]
+          if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
+              raise SystemExit("source revision is invalid")
+          if any(not re.fullmatch(r"sha256:[0-9a-f]{64}", value) for value in (ci_base_digest, ci_digest, gateway_digest, supervisor_digest)):
+              raise SystemExit("resolved image digest is invalid")
+          artifact_specs = (
+              ("agent-openshell-cli", "linux-arm64"),
+              ("host-openshell-cli", "darwin-arm64"),
+              ("openshell-supervisor", "linux-arm64"),
+          )
+          artifacts = []
+          inventory = hashlib.sha256()
+          for name, target in artifact_specs:
+              data = (Path("artifacts") / name).read_bytes()
+              digest = hashlib.sha256(data).hexdigest()
+              artifacts.append({"name": name, "target": target, "sha256": digest, "size": len(data)})
+              encoded = name.encode()
+              inventory.update(len(encoded).to_bytes(4, "big"))
+              inventory.update(encoded)
+              inventory.update(bytes.fromhex(digest))
+          inventory_sha256 = "sha256:" + inventory.hexdigest()
+          receipt = {
+              "schema": 1,
+              "component": "openshell-connect-closure",
+              "source_sha": source_sha,
+              "source_lock_sha256": None,
+              "artifact_inventory_sha256": inventory_sha256,
+              "artifacts": artifacts,
+              "images": {
+                  "ci_base": {"ref": "ubuntu", "digest": ci_base_digest},
+                  "ci": {"ref": "ghcr.io/lightforgedev/openshell/ci", "digest": ci_digest},
+                  "gateway": {"ref": "ghcr.io/lightforgedev/openshell/gateway", "digest": gateway_digest},
+                  "supervisor": {"ref": "ghcr.io/lightforgedev/openshell/supervisor", "digest": supervisor_digest},
+              },
+          }
+          Path("artifacts/openshell-connect-closure-receipt.json").write_text(
+              json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Attest closure payload
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: |
+            artifacts/agent-openshell-cli
+            artifacts/host-openshell-cli
+            artifacts/openshell-supervisor
+            artifacts/openshell-connect-closure-receipt.json
+
+      - name: Upload source-bound closure payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: connect-openshell-closure-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
