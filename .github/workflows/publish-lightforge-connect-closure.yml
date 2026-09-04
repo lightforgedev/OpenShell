@@ -226,8 +226,10 @@ jobs:
       - name: Verify artifacts and bind image digests
         run: |
           set -euo pipefail
-          install -D -m 0755 downloads/agent-cli/prebuilt-binaries/arm64/openshell artifacts/agent-openshell-cli
-          install -D -m 0755 downloads/supervisor/prebuilt-binaries/arm64/openshell-sandbox artifacts/openshell-supervisor
+          # actions/download-artifact materializes the uploaded file directly
+          # beneath the requested path; it does not retain the staging tree.
+          install -D -m 0755 downloads/agent-cli/openshell artifacts/agent-openshell-cli
+          install -D -m 0755 downloads/supervisor/openshell-sandbox artifacts/openshell-supervisor
           install -D -m 0755 downloads/host-cli/openshell artifacts/host-openshell-cli
           file artifacts/agent-openshell-cli | grep -Eq 'ELF 64-bit.*ARM aarch64'
           file artifacts/openshell-supervisor | grep -Eq 'ELF 64-bit.*ARM aarch64'
