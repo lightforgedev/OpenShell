@@ -26,6 +26,10 @@ jobs:
       ci_base_image: ${{ steps.base.outputs.image }}
       ci_base_digest: ${{ steps.base.outputs.digest }}
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
       - uses: ./.github/actions/setup-buildx
 
       - id: base
