@@ -514,6 +514,9 @@ Published docs live in `docs/`, and Fern site configuration lives in `fern/`. Se
 
 ## Validation Expectations
 
+Rust CI rejects stale or modified Cargo lockfiles and runs Clippy for the
+workspace, E2E crate, and standalone examples.
+
 - Run `mise run pre-commit` before committing.
 - Run `mise run test` after code changes.
 - Run `mise run e2e` for sandbox, policy, driver, or deployment changes when the
