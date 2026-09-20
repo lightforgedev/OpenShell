@@ -22,8 +22,27 @@ inputs:
 runs:
   using: composite
   steps:
+    # docker/setup-buildx-action boots a docker-container builder by pulling
+    # this image. Hosted runner egress can reset that first Docker Hub request;
+    # retry the bounded pre-pull so every caller gets the same cached image or
+    # fails before its build begins.
+    - name: Pre-pull BuildKit with bounded retry
+      shell: bash
+      run: |
+        set -euo pipefail
+        for attempt in 1 2 3; do
+          if docker pull moby/buildkit:buildx-stable-1; then
+            exit 0
+          fi
+          if [ "$attempt" -lt 3 ]; then
+            sleep $((attempt * 5))
+          fi
+        done
+        printf '%s\n' 'BuildKit pre-pull failed after 3 attempts' >&2
+        exit 1
+
     - name: Set up Docker Buildx (local)
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
       with:
         name: ${{ inputs.name }}
         driver: docker-container

@@ -6,7 +6,8 @@
 # CI runner image with all development tools pre-installed
 # Rebuild triggered automatically when mise.toml, mise.lock, tasks, or this file changes
 
-FROM nvcr.io/nvidia/base/ubuntu:noble-20251013
+ARG CI_BASE_IMAGE=nvcr.io/nvidia/base/ubuntu:noble-20251013
+FROM ${CI_BASE_IMAGE}
 
 ARG DOCKER_VERSION=29.5.1
 ARG BUILDX_VERSION=v0.34.0
