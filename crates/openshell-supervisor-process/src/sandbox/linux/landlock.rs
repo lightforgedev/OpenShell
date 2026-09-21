@@ -151,9 +151,8 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
     // Probe first: kernels without Landlock (e.g. gVisor's sentry returns
     // ENOSYS) would otherwise log misleading "Applying"+"Built" events.
     let availability = probe_availability();
-    let landlock_abi = match availability {
-        LandlockAvailability::Available { abi } => abi,
-        _ => match compatibility {
+    let LandlockAvailability::Available { abi: landlock_abi } = availability else {
+        match compatibility {
             LandlockCompatibility::BestEffort => {
                 openshell_ocsf::ocsf_emit!(
                     openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
@@ -183,7 +182,7 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
                     "Landlock unavailable in hard_requirement mode: {availability}"
                 ));
             }
-        },
+        }
     };
 
     let total_paths = read_only.len() + read_write.len();
