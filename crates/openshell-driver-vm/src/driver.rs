@@ -12,9 +12,9 @@ use crate::lifecycle::{
 };
 use crate::rootfs::{
     clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
-    extract_host_supervisor, extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root,
-    recover_rootfs_image, remove_rootfs_image_file, sandbox_guest_init_path,
-    sandbox_guest_runtime_identity, sandbox_guest_user_ids_from_image,
+    ext4_image_has_directory, extract_host_supervisor, extract_rootfs_archive_to,
+    prepare_sandbox_rootfs_from_image_root, recover_rootfs_image, remove_rootfs_image_file,
+    sandbox_guest_init_path, sandbox_guest_runtime_identity, sandbox_guest_user_ids_from_image,
     sandbox_guest_user_ids_from_overlay_image, set_rootfs_image_file_mode,
     validate_host_supervisor, write_rootfs_image_file,
 };
@@ -202,6 +202,10 @@ const PREPARED_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-prepared-rootfs-ext4-
 const IMAGE_IDENTITY_FILE: &str = "image-identity";
 const IMAGE_REFERENCE_FILE: &str = "image-reference";
 const IMAGE_PREP_INIT_MODE: &str = "image-prep";
+const IMAGE_PREP_CONSOLE_LOG: &str = "image-prep-console.log";
+/// Directory the guest image-prep init writes at the root of the prepared disk
+/// once preparation succeeds (`image_root` in `openshell-vm-sandbox-init.sh`).
+const PREPARED_IMAGE_ROOTFS_DIR: &str = "/image-rootfs";
 static IMAGE_CACHE_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 static OWNER_STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -3586,6 +3590,33 @@ impl VmDriver {
             return Err(err);
         }
 
+        // The prep VM exits successfully even when guest init fails, so check
+        // the disk itself. Caching a disk without the rootfs would break every
+        // later sandbox that uses this image.
+        let prepared_image_for_check = prepared_image.clone();
+        let has_rootfs = tokio::task::spawn_blocking(move || {
+            ext4_image_has_directory(&prepared_image_for_check, PREPARED_IMAGE_ROOTFS_DIR)
+        })
+        .await
+        .map_err(|err| Status::internal(format!("prepared image validation panicked: {err}")))?;
+        if !matches!(has_rootfs, Ok(true)) {
+            let mut message = format!(
+                "image-prep for \"{image_ref}\" did not produce {PREPARED_IMAGE_ROOTFS_DIR}"
+            );
+            if let Err(err) = &has_rootfs {
+                write!(message, ": {err}").expect("writing to String cannot fail");
+            }
+            if let Some(console) = read_vm_console_tail(
+                &staging_dir.join(IMAGE_PREP_CONSOLE_LOG),
+                VM_CONSOLE_DIAGNOSTIC_BYTES,
+            ) {
+                write!(message, "; guest console tail:\n{console}")
+                    .expect("writing to String cannot fail");
+            }
+            let _ = tokio::fs::remove_dir_all(staging_dir).await;
+            return Err(Status::failed_precondition(message));
+        }
+
         if tokio::fs::metadata(&image_path).await.is_ok() {
             let _ = tokio::fs::remove_dir_all(staging_dir).await;
             return Ok(());
@@ -3604,7 +3635,7 @@ impl VmDriver {
         prep_disk: &Path,
         run_dir: &Path,
     ) -> Result<(), Status> {
-        let console_output = run_dir.join("image-prep-console.log");
+        let console_output = run_dir.join(IMAGE_PREP_CONSOLE_LOG);
         let mut command = Command::new(&self.launcher_bin);
         command.kill_on_drop(true);
         command.stdin(Stdio::null());
@@ -6622,9 +6653,12 @@ fn prepared_image_disk_size_bytes(
             .map_err(|err| format!("stat {}: {err}", rootfs_archive.display()))?
             .len(),
     };
+    // The payload and the unpacked rootfs coexist until the guest deletes the
+    // payload, and compressed layers commonly expand 2.5-3x. The disk file is
+    // sparse, so extra headroom costs no host disk space.
     let requested = payload_size
-        .saturating_mul(3)
-        .saturating_add(512 * 1024 * 1024);
+        .saturating_mul(4)
+        .saturating_add(1024 * 1024 * 1024);
     Ok(minimum_size_bytes.max(requested))
 }
 
