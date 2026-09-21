@@ -46,7 +46,7 @@ pub fn landlock_evidence_env(prepared: &PreparedSandbox) -> Option<[(String, Str
     prepared
         .landlock
         .as_ref()
-        .and_then(|ruleset| ruleset.evidence_env())
+        .and_then(landlock::PreparedRuleset::evidence_env)
 }
 
 /// Apply the supervisor seccomp prelude after privileged bootstrap completes.
