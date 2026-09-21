@@ -757,10 +757,7 @@ fn expand_access_preset(protocol: &str, access: &str) -> Option<Vec<L7Rule>> {
 }
 
 fn append_unique_binaries(existing: &mut Vec<NetworkBinary>, incoming: &[NetworkBinary]) {
-    let mut seen: HashSet<(String, u32, u32)> = existing
-        .iter()
-        .map(|binary| binary_scope_key(binary))
-        .collect();
+    let mut seen: HashSet<(String, u32, u32)> = existing.iter().map(binary_scope_key).collect();
     for binary in incoming {
         if let Some(existing_binary) = existing
             .iter_mut()
