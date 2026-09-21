@@ -10,7 +10,7 @@ position: 2
 
 Nested organization sandboxes are feasible only if each organization receives its own kernel-backed boundary inside the outer runtime.
 Separating customer organizations with Linux users alone is not an acceptable tenant boundary.
-This document is a design posture, not a runtime guard; OpenShell does not implement nested organization sandbox mode yet.
+This document is a design posture, not a runtime guard; OpenShell has org identity plumbing on existing control paths, but does not implement nested organization sandbox mode yet.
 
 ## Decision
 
@@ -20,6 +20,15 @@ This document is a design posture, not a runtime guard; OpenShell does not imple
 | Multiple org containers on one host or VM | Preferred pooled topology. | The container runtime owns per-org namespaces, cgroups, filesystems, and lifecycle. |
 | Multiple org users in one shared namespace | Reject as design posture. | Shared loopback, `/proc`, IPC, filesystem, credentials, and cgroup state make tenant isolation fragile. Runtime enforcement requires the org identity and nested-boundary work below. |
 | Multiple org sandboxes in one outer container | Possible spike only. | Requires OpenShell to create a nested per-org sandbox boundary before launching any org process. |
+
+## Implementation Status
+
+| Scope | Status |
+|---|---|
+| Org identity API foundation | Implemented: optional `org_id` on exec, SSH session, TCP forward, persisted SSH session, and `RelayOpen`; invalid values reject; SSH forward tokens are bound to `sandbox_id + org_id`. |
+| Legacy behavior | Preserved: empty `org_id` selects the existing sandbox-level runtime. |
+| Runtime isolation | Not implemented: no per-org netns, mount/root, PID/proc, IPC/keyring, cgroup, proxy/OPA/cache, credential, or lifecycle boundary exists yet. |
+| Trust source | Not implemented: `org_id` is currently a validated request/control field, not yet gateway-minted immutable identity. |
 
 ## Requirement Gate
 
@@ -48,7 +57,7 @@ This document is a design posture, not a runtime guard; OpenShell does not imple
 
 | Area | Current code assumption | Nested-org requirement |
 |---|---|---|
-| Public and internal APIs | `Sandbox`, `ExecSandboxRequest`, `CreateSshSessionRequest`, `TcpForwardInit`, `RelayOpen`, and `SupervisorHello` route by `sandbox_id`; `run_as_user` is the only per-exec identity. | Add nested org lifecycle and route exec/SSH/TCP relay by `sandbox_id + org_id`. `run_as_user` remains an agent/user selector, not tenant identity. |
+| Public and internal APIs | `ExecSandboxRequest`, `CreateSshSessionRequest`, `TcpForwardInit`, persisted `SshSession`, and `RelayOpen` carry optional `org_id`; `Sandbox` lifecycle and `SupervisorHello` remain sandbox-scoped. | Add nested org lifecycle and route supervisor runtime selection by `sandbox_id + org_id`. `run_as_user` remains an agent/user selector, not tenant identity. |
 | Auth scope | Sandbox JWT principals are scoped to one sandbox. | Bind org operations to a gateway-minted immutable org identity; nested mode rejects label-derived or in-sandbox-derived org identity. |
 | Driver boundary | Docker/Podman/VM drivers create one container/VM per sandbox. | A single outer container must recreate those boundaries inside `openshell-sandbox`; otherwise use separate org containers. |
 | Netns | `NetworkNamespace::create()` creates one netns with fixed `10.200.0.1/24` and `10.200.0.2/24`. | Add allocator for per-org namespace names, veth names, CIDRs, proxy bind addresses, nft rules, and cleanup. |

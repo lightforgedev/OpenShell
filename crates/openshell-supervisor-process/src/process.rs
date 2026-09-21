@@ -805,6 +805,22 @@ impl Drop for ProcessHandle {
 /// Non-numeric, non-"sandbox" values are rejected.
 #[cfg(unix)]
 pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
+    if policy
+        .process
+        .run_as_user
+        .as_deref()
+        .is_none_or(str::is_empty)
+        && policy
+            .process
+            .run_as_group
+            .as_deref()
+            .is_some_and(|group| !group.is_empty())
+    {
+        return Err(miette::miette!(
+            "run_as_group requires an explicit non-root run_as_user"
+        ));
+    }
+
     let identity = policy.process.run_as_user.as_deref().unwrap_or("sandbox");
 
     // Numeric UID — no passwd entry required; kernel resolves directly.
@@ -822,51 +838,32 @@ pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
         return Ok(());
     }
 
-    // "sandbox" name — must exist in /etc/passwd.
-    if identity == "sandbox" {
-        match User::from_name("sandbox") {
-            Ok(Some(_)) => {
-                openshell_ocsf::ocsf_emit!(
-                    openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                        .severity(openshell_ocsf::SeverityId::Informational)
-                        .status(openshell_ocsf::StatusId::Success)
-                        .state(openshell_ocsf::StateId::Enabled, "validated")
-                        .message("Validated 'sandbox' user exists in image")
-                        .build()
-                );
-            }
-            Ok(None) => {
-                return Err(miette::miette!(
-                    "sandbox user 'sandbox' not found in image; \
-                     all sandbox images must include a 'sandbox' user and group"
-                ));
-            }
-            Err(e) => {
-                return Err(miette::miette!("failed to look up 'sandbox' user: {e}"));
-            }
+    if identity != "sandbox" {
+        return Err(miette::miette!(
+            "unrecognized sandbox identity '{identity}'; \
+             expected 'sandbox' or a numeric UID in range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}]"
+        ));
+    }
+
+    match User::from_name("sandbox") {
+        Ok(Some(_)) => {
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                    .severity(openshell_ocsf::SeverityId::Informational)
+                    .status(openshell_ocsf::StatusId::Success)
+                    .state(openshell_ocsf::StateId::Enabled, "validated")
+                    .message("Validated 'sandbox' user exists in image")
+                    .build()
+            );
         }
-    } else if !identity.is_empty() {
-        // Non-numeric, non-sandbox string — attempt passwd lookup.
-        // This catches cases where someone accidentally put "root" or similar.
-        match User::from_name(identity) {
-            Ok(Some(_)) => {
-                tracing::warn!(
-                    identity,
-                    "non-sandbox user accepted via passwd entry; \
-                     consider using a numeric UID for UID-injected images"
-                );
-            }
-            Ok(None) => {
-                return Err(miette::miette!(
-                    "unrecognized sandbox identity '{identity}'; \
-                     expected 'sandbox' or a numeric UID in range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}]"
-                ));
-            }
-            Err(e) => {
-                return Err(miette::miette!(
-                    "failed to look up identity '{identity}': {e}"
-                ));
-            }
+        Ok(None) => {
+            return Err(miette::miette!(
+                "sandbox user 'sandbox' not found in image; \
+                 all sandbox images must include a 'sandbox' user and group"
+            ));
+        }
+        Err(e) => {
+            return Err(miette::miette!("failed to look up 'sandbox' user: {e}"));
         }
     }
 
@@ -1449,6 +1446,32 @@ mod tests {
             landlock: LandlockPolicy::default(),
             process,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_sandbox_user_rejects_privileged_identities() {
+        for identity in ["root", "0"] {
+            let policy = policy_with_process(ProcessPolicy {
+                run_as_user: Some(identity.to_string()),
+                run_as_group: Some("sandbox".to_string()),
+            });
+
+            let error = validate_sandbox_user(&policy).unwrap_err().to_string();
+            assert!(error.contains("unrecognized sandbox identity"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_sandbox_user_rejects_group_without_user() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: None,
+            run_as_group: Some("sandbox".to_string()),
+        });
+
+        let error = validate_sandbox_user(&policy).unwrap_err().to_string();
+        assert!(error.contains("run_as_group requires an explicit non-root run_as_user"));
     }
 
     /// Unknown names may yield `Ok(None)` (`… not found …`) or `Err` when NSS fails first

@@ -2949,8 +2949,10 @@ pub async fn sandbox_exec_grpc(
             timeout_seconds,
             stdin: stdin_payload,
             tty,
+            cols: 0,
+            rows: 0,
             run_as_user: run_as_user.unwrap_or_default().to_string(),
-            ..Default::default()
+            org_id: String::new(),
         })
         .await
         .into_diagnostic()?
@@ -3080,6 +3082,7 @@ async fn create_forward_session_token(
     let response = client
         .create_ssh_session(CreateSshSessionRequest {
             sandbox_id: sandbox_id.to_string(),
+            org_id: String::new(),
         })
         .await
         .map_err(ForwardTcpConnectionError::from_status)?;
@@ -3191,6 +3194,7 @@ async fn forward_one_tcp_connection(
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
             TcpForwardInit {
                 sandbox_id,
+                org_id: String::new(),
                 service_id,
                 target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
                     host: target_host,
@@ -3316,6 +3320,7 @@ async fn sandbox_exec_interactive_grpc(
                 cols: u32::from(cols),
                 rows: u32::from(rows),
                 run_as_user: run_as_user.unwrap_or_default().to_string(),
+                org_id: String::new(),
             })),
         })
         .await

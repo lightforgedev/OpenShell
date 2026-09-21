@@ -33,6 +33,8 @@ pub(super) const MAX_EXEC_ARG_LEN: usize = 32 * 1024; // 32 KiB
 pub(super) const MAX_EXEC_WORKDIR_LEN: usize = 4096;
 /// Maximum length of a requested OS user name/UID.
 pub(super) const MAX_EXEC_RUN_AS_USER_LEN: usize = 128;
+/// Maximum length of a nested organization runtime id.
+pub(super) const MAX_ORG_ID_LEN: usize = 128;
 
 /// Validate fields of an `ExecSandboxRequest` for control characters and size
 /// limits before constructing a shell command string.
@@ -86,6 +88,28 @@ pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(
         if req.run_as_user == "root" || req.run_as_user.parse::<u32>().is_ok_and(|uid| uid == 0) {
             return Err(Status::invalid_argument("run_as_user must not be root"));
         }
+    }
+    validate_optional_org_id(&req.org_id)?;
+    Ok(())
+}
+
+pub(super) fn validate_optional_org_id(org_id: &str) -> Result<(), Status> {
+    if org_id.is_empty() {
+        return Ok(());
+    }
+    if org_id.len() > MAX_ORG_ID_LEN {
+        return Err(Status::invalid_argument(format!(
+            "org_id exceeds {MAX_ORG_ID_LEN} byte limit"
+        )));
+    }
+    reject_control_chars(org_id, "org_id")?;
+    if !org_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return Err(Status::invalid_argument(
+            "org_id must contain only ASCII letters, digits, '_', '-', or '.'",
+        ));
     }
     Ok(())
 }
@@ -1102,6 +1126,30 @@ mod tests {
         let err = validate_exec_request_fields(&req).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("root"));
+    }
+
+    #[test]
+    fn validate_exec_request_allows_org_id() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "id".to_string(),
+            command: vec!["id".to_string()],
+            org_id: "org.alpha-1".to_string(),
+            ..Default::default()
+        };
+        assert!(validate_exec_request_fields(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_exec_request_rejects_invalid_org_id() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "id".to_string(),
+            command: vec!["id".to_string()],
+            org_id: "org/alpha".to_string(),
+            ..Default::default()
+        };
+        let err = validate_exec_request_fields(&req).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("org_id"));
     }
 
     #[test]

@@ -2406,6 +2406,7 @@ mod tests {
             token: format!("token-{id}"),
             revoked: false,
             expires_at_ms: 0,
+            org_id: String::new(),
         }
     }
 

@@ -91,6 +91,7 @@ mod tests {
             token: id.to_string(),
             expires_at_ms,
             revoked,
+            org_id: String::new(),
         }
     }
 
