@@ -51,7 +51,7 @@ use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
 use openshell_core::{Config, Error, Result as CoreResult};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -294,12 +294,6 @@ struct DockerSandboxDriverConfig {
     )]
     cdi_devices: Option<Vec<String>>,
     mounts: Vec<DockerDriverMountConfig>,
-    /// Optional literal host-to-IP entries written into the sandbox
-    /// container's `/etc/hosts`. Host gateway aliases and DNS names are
-    /// deliberately rejected: a caller may pin a policy-approved endpoint,
-    /// but may not obtain a Docker host route or defer the destination to
-    /// Docker DNS.
-    extra_hosts: BTreeMap<String, IpAddr>,
 }
 
 struct ValidatedDockerSandbox<'a> {
@@ -415,7 +409,10 @@ impl DockerComputeDriver {
         );
         let daemon_arch = normalize_docker_arch(version.arch.as_deref().unwrap_or_default());
         let supervisor_image_mount = validate_supervisor_image_mount(&docker_config)?;
-        let supervisor_bin = if supervisor_image_mount.is_some() {
+        let supervisor_bin = if let Some(image) = supervisor_image_mount.as_deref() {
+            // Fail once at gateway startup if the pinned image does not carry
+            // the expected Linux supervisor binary.
+            let _ = extract_supervisor_bin_from_image(&docker, image).await?;
             None
         } else {
             Some(resolve_supervisor_bin(&docker, &docker_config, &daemon_arch).await?)
@@ -503,7 +500,6 @@ impl DockerComputeDriver {
         let driver_config =
             DockerSandboxDriverConfig::from_template(template).map_err(Status::invalid_argument)?;
         validate_docker_driver_mounts(&driver_config.mounts, config.enable_bind_mounts)?;
-        validate_docker_extra_hosts(&driver_config.extra_hosts)?;
         let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
         Self::validate_gpu_request(gpu_requirements, config.supports_gpu, &driver_config)?;
         Ok(ValidatedDockerSandbox {
@@ -2166,17 +2162,17 @@ fn gateway_material_archive(
         &mut archive,
         "etc/openshell/auth/sandbox.jwt",
         format!("{token}\n").as_bytes(),
-        0o600,
+        0o400,
     )?;
     if let Some((ca, cert, key)) = tls {
-        append_gateway_material(&mut archive, "etc/openshell/tls/client/ca.crt", ca, 0o644)?;
+        append_gateway_material(&mut archive, "etc/openshell/tls/client/ca.crt", ca, 0o444)?;
         append_gateway_material(
             &mut archive,
             "etc/openshell/tls/client/tls.crt",
             cert,
-            0o644,
+            0o444,
         )?;
-        append_gateway_material(&mut archive, "etc/openshell/tls/client/tls.key", key, 0o600)?;
+        append_gateway_material(&mut archive, "etc/openshell/tls/client/tls.key", key, 0o400)?;
     }
     archive
         .into_inner()
@@ -2540,10 +2536,7 @@ fn build_container_create_body_with_gpu_devices(
             // and conflicts with them in this case.
             security_opt: Some(vec!["apparmor=unconfined".to_string()]),
             network_mode: Some(config.network_name.clone()),
-            extra_hosts: Some(docker_extra_hosts(
-                &config.gateway_route,
-                &driver_config.extra_hosts,
-            )),
+            extra_hosts: Some(docker_extra_hosts(&config.gateway_route)),
             ..Default::default()
         }),
         networking_config: Some(NetworkingConfig {
@@ -2708,11 +2701,8 @@ fn uses_host_gateway_alias(info: &SystemInfo) -> bool {
     })
 }
 
-fn docker_extra_hosts(
-    route: &DockerGatewayRoute,
-    configured_hosts: &BTreeMap<String, IpAddr>,
-) -> Vec<String> {
-    let mut hosts = match route {
+fn docker_extra_hosts(route: &DockerGatewayRoute) -> Vec<String> {
+    match route {
         DockerGatewayRoute::Bridge { host_alias_ip, .. } => vec![
             format!("{HOST_DOCKER_INTERNAL}:{host_alias_ip}"),
             format!("{HOST_OPENSHELL_INTERNAL}:{host_alias_ip}"),
@@ -2721,43 +2711,7 @@ fn docker_extra_hosts(
             format!("{HOST_DOCKER_INTERNAL}:host-gateway"),
             format!("{HOST_OPENSHELL_INTERNAL}:host-gateway"),
         ],
-    };
-
-    hosts.extend(
-        configured_hosts
-            .iter()
-            .map(|(host, address)| format!("{host}:{address}")),
-    );
-    hosts
-}
-
-fn validate_docker_extra_hosts(hosts: &BTreeMap<String, IpAddr>) -> Result<(), Status> {
-    for host in hosts.keys() {
-        if host == HOST_DOCKER_INTERNAL || host == HOST_OPENSHELL_INTERNAL {
-            return Err(Status::invalid_argument(format!(
-                "docker driver_config.extra_hosts may not override reserved host '{host}'"
-            )));
-        }
-
-        let valid = !host.is_empty()
-            && host.len() <= 253
-            && host.split('.').all(|label| {
-                !label.is_empty()
-                    && label.len() <= 63
-                    && !label.starts_with('-')
-                    && !label.ends_with('-')
-                    && label.bytes().all(|byte| {
-                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
-                    })
-            });
-        if !valid {
-            return Err(Status::invalid_argument(format!(
-                "docker driver_config.extra_hosts contains invalid hostname '{host}'"
-            )));
-        }
     }
-
-    Ok(())
 }
 
 async fn ensure_bridge_network(docker: &Docker, network_name: &str) -> CoreResult<IpAddr> {

@@ -451,9 +451,11 @@ Driver implementation settings live in the TOML driver tables. See
 Containerized Docker gateways must use the digest-pinned
 `supervisor_image_mount` driver setting. The host Docker daemon mounts the
 supervisor image directly into each sandbox; it cannot bind-mount a supervisor
-binary extracted only inside the gateway container. The same path copies the
-per-sandbox JWT and guest TLS material into the stopped container before start,
-with owner-only modes retained for token and key files.
+binary extracted only inside the gateway container. Gateway startup probes the
+pinned image for the expected Linux supervisor binary. The same path copies the
+per-sandbox JWT and guest TLS material into the stopped container before start.
+The trusted root supervisor owns these files; token and key are root-read-only,
+while certificates are read-only.
 
 `database_url` is env-only and rejected when present in the file
 (`OPENSHELL_DB_URL` / `--db-url`).
