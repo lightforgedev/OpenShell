@@ -805,6 +805,22 @@ impl Drop for ProcessHandle {
 /// Non-numeric, non-"sandbox" values are rejected.
 #[cfg(unix)]
 pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
+    if policy
+        .process
+        .run_as_user
+        .as_deref()
+        .is_none_or(str::is_empty)
+        && policy
+            .process
+            .run_as_group
+            .as_deref()
+            .is_some_and(|group| !group.is_empty())
+    {
+        return Err(miette::miette!(
+            "run_as_group requires an explicit non-root run_as_user"
+        ));
+    }
+
     let identity = policy.process.run_as_user.as_deref().unwrap_or("sandbox");
 
     // Numeric UID — no passwd entry required; kernel resolves directly.
@@ -1444,6 +1460,18 @@ mod tests {
             let error = validate_sandbox_user(&policy).unwrap_err().to_string();
             assert!(error.contains("unrecognized sandbox identity"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_sandbox_user_rejects_group_without_user() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: None,
+            run_as_group: Some("sandbox".to_string()),
+        });
+
+        let error = validate_sandbox_user(&policy).unwrap_err().to_string();
+        assert!(error.contains("run_as_group requires an explicit non-root run_as_user"));
     }
 
     /// Unknown names may yield `Ok(None)` (`… not found …`) or `Err` when NSS fails first
