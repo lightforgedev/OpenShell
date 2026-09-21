@@ -850,6 +850,12 @@ fn spawn_pty_shell(
     #[cfg(target_os = "linux")]
     let prepared_sandbox = sandbox::linux::prepare(policy, workdir.as_deref())
         .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
+    #[cfg(target_os = "linux")]
+    if let Some(env_vars) = sandbox::linux::landlock_evidence_env(&prepared_sandbox) {
+        for (key, value) in env_vars {
+            cmd.env(key, value);
+        }
+    }
 
     #[cfg(unix)]
     {
@@ -999,6 +1005,12 @@ fn spawn_pipe_exec(
     #[cfg(target_os = "linux")]
     let prepared_sandbox = sandbox::linux::prepare(policy, workdir.as_deref())
         .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
+    #[cfg(target_os = "linux")]
+    if let Some(env_vars) = sandbox::linux::landlock_evidence_env(&prepared_sandbox) {
+        for (key, value) in env_vars {
+            cmd.env(key, value);
+        }
+    }
 
     #[cfg(unix)]
     {
