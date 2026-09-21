@@ -225,6 +225,14 @@ pub(crate) async fn run_server(
 
     let store = Arc::new(Store::connect(database_url).await?);
 
+    if let Some(file) = config_file.as_ref()
+        && !file.openshell.settings.is_empty()
+    {
+        grpc::policy::seed_global_settings_from_config(store.as_ref(), &file.openshell.settings)
+            .await
+            .map_err(|status| Error::config(status.message().to_string()))?;
+    }
+
     let oidc_cache = if let Some(ref oidc) = config.oidc {
         // Validate RBAC configuration before starting.
         let policy = auth::authz::AuthzPolicy {

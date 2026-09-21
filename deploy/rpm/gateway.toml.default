@@ -10,9 +10,12 @@
 # Configuration precedence (highest to lowest):
 #   CLI flag  >  OPENSHELL_* env var  >  TOML file  >  built-in default
 #
-# To override settings without editing this file, set OPENSHELL_* variables
-# in ~/.config/openshell/gateway.env or run:
+# Process settings with an OPENSHELL_* mapping can be overridden in
+# ~/.config/openshell/gateway.env or through:
 #   systemctl --user edit openshell-gateway
+# Runtime keys under [openshell.settings] have no environment mapping. Edit
+# ~/.config/openshell/gateway.toml for a durable override; runtime CLI changes
+# to a key still present below are overwritten at the next gateway start.
 
 [openshell]
 version = 1
@@ -28,3 +31,8 @@ bind_address = "0.0.0.0:17670"
 # in order: Kubernetes, Podman, Docker. Pinning prevents unexpected driver
 # selection if Docker is also installed on the host.
 compute_drivers = ["podman"]
+
+[openshell.settings]
+# Keep user-service/container logs focused on warnings and findings. JSONL
+# audit export remains controlled separately by ocsf_json_enabled.
+ocsf_shorthand_min_severity = "medium"

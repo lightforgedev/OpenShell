@@ -5,11 +5,11 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
-use openshell_ocsf::{OcsfJsonlLayer, OcsfShorthandLayer};
+use openshell_ocsf::{OcsfJsonlLayer, OcsfShorthandLayer, SeverityId, severity_rank};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
@@ -270,6 +270,7 @@ fn main() -> Result<()> {
         // `ocsf_json_enabled` setting changes. The JSONL layer checks it
         // on each event and short-circuits when false.
         let ocsf_enabled = Arc::new(AtomicBool::new(false));
+        let ocsf_min_severity = Arc::new(AtomicU8::new(severity_rank(SeverityId::Informational)));
 
         // Keep guards alive for the entire process. When a guard is dropped the
         // non-blocking writer flushes remaining logs.
@@ -300,11 +301,13 @@ fn main() -> Result<()> {
                 .with(
                     OcsfShorthandLayer::new(std::io::stderr())
                         .with_non_ocsf(true)
+                        .with_min_ocsf_severity_rank(ocsf_min_severity.clone())
                         .with_filter(console_filter),
                 )
                 .with(
                     OcsfShorthandLayer::new(file_writer)
                         .with_non_ocsf(true)
+                        .with_min_ocsf_severity_rank(ocsf_min_severity.clone())
                         .with_filter(file_filter),
                 )
                 .with(jsonl_layer.with_filter(LevelFilter::INFO))
@@ -316,6 +319,7 @@ fn main() -> Result<()> {
                 .with(
                     OcsfShorthandLayer::new(std::io::stderr())
                         .with_non_ocsf(true)
+                        .with_min_ocsf_severity_rank(ocsf_min_severity.clone())
                         .with_filter(console_filter),
                 )
                 .with(push_layer)
@@ -355,6 +359,7 @@ fn main() -> Result<()> {
             args.health_port,
             args.inference_routes,
             ocsf_enabled,
+            ocsf_min_severity,
             args.mode.network,
             args.mode.process,
         )
