@@ -2794,8 +2794,10 @@ pub async fn sandbox_watch(
             Some(openshell_core::proto::sandbox_stream_event::Payload::Warning(warning)) => {
                 print_sandbox_watch_warning(&sandbox_id, &warning.message)?;
             }
-            Some(openshell_core::proto::sandbox_stream_event::Payload::Log(_))
-            | Some(openshell_core::proto::sandbox_stream_event::Payload::DraftPolicyUpdate(_))
+            Some(
+                openshell_core::proto::sandbox_stream_event::Payload::Log(_)
+                | openshell_core::proto::sandbox_stream_event::Payload::DraftPolicyUpdate(_),
+            )
             | None => {}
         }
     }
@@ -3314,7 +3316,6 @@ async fn sandbox_exec_interactive_grpc(
                 cols: u32::from(cols),
                 rows: u32::from(rows),
                 run_as_user: run_as_user.unwrap_or_default().to_string(),
-                ..Default::default()
             })),
         })
         .await
