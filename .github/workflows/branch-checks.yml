@@ -40,7 +40,7 @@ jobs:
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/lightforgedev/openshell/ci:00797d6468b25b939185af7f53d1952145368f4f
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -64,7 +64,7 @@ jobs:
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/lightforgedev/openshell/ci:00797d6468b25b939185af7f53d1952145368f4f
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -90,7 +90,7 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
       SCCACHE_GHA_VERSION: branch-checks-rust-${{ matrix.runner }}
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/lightforgedev/openshell/ci:00797d6468b25b939185af7f53d1952145368f4f
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -147,7 +147,7 @@ jobs:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/lightforgedev/openshell/ci:00797d6468b25b939185af7f53d1952145368f4f
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -178,7 +178,7 @@ jobs:
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/lightforgedev/openshell/ci:00797d6468b25b939185af7f53d1952145368f4f
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
