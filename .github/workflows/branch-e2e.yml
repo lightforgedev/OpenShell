@@ -82,7 +82,7 @@ jobs:
 
   build-cli:
     needs: [pr_metadata]
-    if: needs.pr_metadata.outputs.should_run == 'true'
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_any_e2e == 'true'
     permissions:
       contents: read
       packages: write
