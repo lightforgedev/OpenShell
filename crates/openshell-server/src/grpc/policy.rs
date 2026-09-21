@@ -3713,7 +3713,7 @@ fn upsert_setting_value(
     }
 }
 
-pub(crate) async fn seed_global_settings_from_config(
+pub async fn seed_global_settings_from_config(
     store: &Store,
     configured: &BTreeMap<String, toml::Value>,
 ) -> Result<(), Status> {
