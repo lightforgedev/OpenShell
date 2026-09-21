@@ -455,7 +455,8 @@ binary extracted only inside the gateway container. Gateway startup probes the
 pinned image for the expected Linux supervisor binary. The same path copies the
 per-sandbox JWT and guest TLS material into the stopped container before start.
 The trusted root supervisor owns these files; token and key are root-read-only,
-while certificates are read-only.
+while certificates are read-only. Workload identity validation rejects UID 0
+and named users other than `sandbox` before a child process starts.
 
 `database_url` is env-only and rejected when present in the file
 (`OPENSHELL_DB_URL` / `--db-url`).

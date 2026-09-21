@@ -85,7 +85,8 @@ daemon cannot see. `supervisor_image_mount` is mutually exclusive with
 for the expected Linux supervisor binary. In this mode the gateway also uploads
 the sandbox JWT and configured guest TLS files into the stopped container
 before start; the trusted root supervisor owns them with read-only file modes,
-and gateway-local files are never exposed as invalid host bind paths.
+and workload identity validation rejects UID 0 before child startup.
+Gateway-local files are never exposed as invalid host bind paths.
 
 Binary resolution order when `supervisor_image_mount` is absent:
 
