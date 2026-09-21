@@ -2949,8 +2949,10 @@ pub async fn sandbox_exec_grpc(
             timeout_seconds,
             stdin: stdin_payload,
             tty,
+            cols: 0,
+            rows: 0,
             run_as_user: run_as_user.unwrap_or_default().to_string(),
-            ..Default::default()
+            org_id: String::new(),
         })
         .await
         .into_diagnostic()?
@@ -3318,6 +3320,7 @@ async fn sandbox_exec_interactive_grpc(
                 cols: u32::from(cols),
                 rows: u32::from(rows),
                 run_as_user: run_as_user.unwrap_or_default().to_string(),
+                org_id: String::new(),
             })),
         })
         .await
