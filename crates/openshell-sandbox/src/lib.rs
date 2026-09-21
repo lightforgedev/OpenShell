@@ -2089,6 +2089,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn registered_ocsf_shorthand_severities_all_have_runtime_ranks() {
+        for value in openshell_core::settings::OCSF_SHORTHAND_MIN_SEVERITY_VALUES {
+            assert!(
+                ocsf_shorthand_severity_rank((*value).to_string()).is_some(),
+                "registered severity '{value}' has no runtime rank"
+            );
+        }
+    }
+
     // ---- Policy disk discovery tests ----
 
     #[test]

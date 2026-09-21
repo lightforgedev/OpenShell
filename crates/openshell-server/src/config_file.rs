@@ -55,7 +55,7 @@ pub struct OpenShellRoot {
     #[serde(default)]
     pub gateway: GatewayFileSection,
 
-    /// Gateway-global runtime settings seeded on gateway startup.
+    /// Gateway-global runtime settings applied on every gateway startup.
     ///
     /// Values use the same registered settings model as `openshell settings
     /// set --global`. Unknown keys or wrong value types are rejected at

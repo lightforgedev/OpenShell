@@ -10,9 +10,12 @@
 # Configuration precedence (highest to lowest):
 #   CLI flag  >  OPENSHELL_* env var  >  TOML file  >  built-in default
 #
-# To override settings without editing this file, set OPENSHELL_* variables
-# in ~/.config/openshell/gateway.env or run:
+# Process settings with an OPENSHELL_* mapping can be overridden in
+# ~/.config/openshell/gateway.env or through:
 #   systemctl --user edit openshell-gateway
+# Runtime keys under [openshell.settings] have no environment mapping. Edit
+# ~/.config/openshell/gateway.toml for a durable override; runtime CLI changes
+# to a key still present below are overwritten at the next gateway start.
 
 [openshell]
 version = 1
