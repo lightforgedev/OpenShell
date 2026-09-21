@@ -151,7 +151,7 @@ Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth
 
 `image_pull_policy` is intentionally not a shared gateway key. Kubernetes and Docker use `Always`, `IfNotPresent`, or `Never`. Podman uses `always`, `missing`, `never`, or `newer`. Set it inside the relevant driver table.
 
-`[openshell.settings]` accepts registered runtime setting keys and seeds them as global settings at gateway startup. Unknown keys and wrong TOML value types are rejected during startup. These settings use the same validation and precedence as `openshell settings set --global`: gateway-global values override sandbox-scoped values.
+`[openshell.settings]` accepts registered runtime setting keys and applies them as global settings at every gateway startup. TOML is authoritative on restart: it overwrites runtime `openshell settings set --global` changes to the same keys. Unknown keys and wrong TOML value types are rejected during startup. These settings use the same validation and precedence as `openshell settings set --global`: gateway-global values override sandbox-scoped values.
 
 ## Driver References
 

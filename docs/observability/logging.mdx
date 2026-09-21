@@ -48,12 +48,15 @@ The shorthand OCSF layer emits every OCSF event when `ocsf_shorthand_min_severit
 openshell settings set --global --key ocsf_shorthand_min_severity --value medium
 ```
 
-Allowed values are `informational`, `low`, `medium`, `high`, `critical`, and `fatal`. The setting can be global or per-sandbox and takes effect on the next settings poll cycle; no sandbox restart is required. Gateway TOML can seed the global default:
+Allowed values are `informational`, `low`, `medium`, `high`, `critical`, and `fatal`. The setting can be global or per-sandbox and takes effect on the next settings poll cycle; no sandbox restart is required. Gateway TOML can set the global value:
 
 ```toml
 [openshell.settings]
 ocsf_shorthand_min_severity = "medium"
 ```
+
+The TOML value is reapplied at every gateway startup and overwrites runtime
+`openshell settings set --global` changes to the same key.
 
 With `medium`, routine successful OCSF events such as `HTTP:POST [INFO]` are suppressed from shorthand logs, while denials and findings remain visible.
 
