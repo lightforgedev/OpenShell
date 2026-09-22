@@ -3627,6 +3627,7 @@ mod tests {
         for host in ["127.0.0.1", "::1", "localhost"] {
             let init = TcpForwardInit {
                 sandbox: "sbx".to_string(),
+                org_id: String::new(),
                 workspace: String::new(),
                 service_id: String::new(),
                 target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
@@ -3643,6 +3644,7 @@ mod tests {
     fn tcp_forward_init_allows_ssh_target() {
         let init = TcpForwardInit {
             sandbox: "sbx".to_string(),
+            org_id: String::new(),
             workspace: String::new(),
             target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget::default())),
             ..Default::default()
@@ -3657,6 +3659,7 @@ mod tests {
     fn tcp_forward_init_rejects_non_loopback_targets() {
         let init = TcpForwardInit {
             sandbox: "sbx".to_string(),
+            org_id: String::new(),
             workspace: String::new(),
             service_id: String::new(),
             target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
@@ -3677,6 +3680,7 @@ mod tests {
     fn tcp_forward_init_rejects_invalid_port() {
         let init = TcpForwardInit {
             sandbox: "sbx".to_string(),
+            org_id: String::new(),
             workspace: String::new(),
             service_id: String::new(),
             target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
@@ -6680,6 +6684,7 @@ mod tests {
                 &state1,
                 authed_request(CreateSshSessionRequest {
                     sandbox: "work".to_string(),
+                    org_id: String::new(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
@@ -6694,6 +6699,7 @@ mod tests {
                 &state2,
                 authed_request(CreateSshSessionRequest {
                     sandbox: "work".to_string(),
+                    org_id: String::new(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
@@ -6750,6 +6756,7 @@ mod tests {
             &state,
             authed_request(CreateSshSessionRequest {
                 sandbox: "work".to_string(),
+                org_id: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -6784,6 +6791,7 @@ mod tests {
             &state,
             authed_request(CreateSshSessionRequest {
                 sandbox: "work".to_string(),
+                org_id: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -7641,6 +7649,7 @@ mod tests {
             &state,
             non_member_request(CreateSshSessionRequest {
                 sandbox: "cross-ws".to_string(),
+                org_id: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "other-workspace".to_string(),
                 )),
@@ -7668,6 +7677,7 @@ mod tests {
             &state,
             authed_request(CreateSshSessionRequest {
                 sandbox: "ws-test".to_string(),
+                org_id: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),

@@ -962,6 +962,7 @@ mod tests {
                 deletion_time: None,
             }),
             sandbox_id: "sbx-1".to_string(),
+            org_id: String::new(),
             token: "ssh-1".to_string(),
             revoked: false,
             expiration_time: None,

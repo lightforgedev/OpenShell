@@ -8006,6 +8006,7 @@ mod tests {
                 deletion_time: None,
             }),
             sandbox_id: sandbox_id.to_string(),
+            org_id: String::new(),
             token: format!("token-{id}"),
             revoked: false,
             expiration_time: None,
