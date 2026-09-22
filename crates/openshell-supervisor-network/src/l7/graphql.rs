@@ -824,7 +824,6 @@ network_policies:
             binary_path: "/usr/bin/python3".to_string(),
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
-            process_ids: None,
             secret_resolver: None,
             ..Default::default()
         };

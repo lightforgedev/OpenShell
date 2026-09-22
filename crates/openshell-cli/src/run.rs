@@ -1901,6 +1901,7 @@ pub async fn sandbox_exec_grpc(
     let mut stream = client
         .exec_sandbox(ExecSandboxRequest {
             sandbox: name.to_string(),
+            org_id: String::new(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
@@ -2063,6 +2064,7 @@ async fn create_forward_session_token(
     let response = client
         .create_ssh_session(CreateSshSessionRequest {
             sandbox: sandbox_name.to_string(),
+            org_id: String::new(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
@@ -2183,6 +2185,7 @@ async fn forward_one_tcp_connection(
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
             TcpForwardInit {
                 sandbox: sandbox_name,
+                org_id: String::new(),
                 workspace: workspace.clone(),
                 service_id,
                 target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
@@ -2304,6 +2307,7 @@ async fn sandbox_exec_interactive_grpc(
         .send(ExecSandboxInput {
             payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
                 sandbox: sandbox.object_name().to_string(),
+                org_id: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     (sandbox.object_workspace()).to_string(),
                 )),

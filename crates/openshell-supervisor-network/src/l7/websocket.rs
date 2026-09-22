@@ -2992,7 +2992,6 @@ network_policies:
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
             cmdline_paths: vec![],
-            process_ids: None,
             secret_resolver: None,
             ..Default::default()
         };

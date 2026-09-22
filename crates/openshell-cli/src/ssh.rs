@@ -111,6 +111,7 @@ async fn ssh_session_config(
         match client
             .create_ssh_session(CreateSshSessionRequest {
                 sandbox: name.to_string(),
+                org_id: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     (workspace).to_string(),
                 )),
@@ -1511,6 +1512,7 @@ pub async fn sandbox_ssh_proxy(
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
             TcpForwardInit {
                 sandbox: sandbox_name.to_string(),
+                org_id: String::new(),
                 workspace: (workspace).to_string(),
                 service_id: format!("ssh-proxy:{sandbox_name}"),
                 target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget {})),
