@@ -2405,6 +2405,25 @@ mod tests {
     // ---- Exec validation ----
 
     #[test]
+    fn optional_org_id_accepts_legacy_and_scoped_values() {
+        assert!(validate_optional_org_id("").is_ok());
+        assert!(validate_optional_org_id("lightforge.prod_1").is_ok());
+    }
+
+    #[test]
+    fn optional_org_id_rejects_unsafe_or_oversized_values() {
+        for org_id in ["org/name", "org name", "org\nname", "org\x00name"] {
+            let error = validate_optional_org_id(org_id).expect_err("unsafe org_id rejected");
+            assert_eq!(error.code(), Code::InvalidArgument, "{org_id:?}: {error}");
+        }
+
+        let oversized = "a".repeat(MAX_ORG_ID_LEN + 1);
+        let error = validate_optional_org_id(&oversized).expect_err("oversized org_id rejected");
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("byte limit"));
+    }
+
+    #[test]
     fn reject_control_chars_allows_normal_values() {
         assert!(reject_control_chars("hello world", "test").is_ok());
         assert!(reject_control_chars("$(cmd)", "test").is_ok());
