@@ -860,6 +860,12 @@ pub fn validate_ssh_session_response(
         MAX_SANDBOX_ID_LEN,
         is_sandbox_id_byte,
     )?;
+    validate_optional_field(
+        "org_id",
+        &resp.org_id,
+        MAX_SANDBOX_ID_LEN,
+        is_sandbox_id_byte,
+    )?;
     validate_field("token", &resp.token, MAX_TOKEN_LEN, is_token_byte)?;
     validate_field(
         "gateway_host",
@@ -909,6 +915,18 @@ fn validate_field(
         return Err(SshSessionResponseError::InvalidChars { field: name });
     }
     Ok(())
+}
+
+fn validate_optional_field(
+    name: &'static str,
+    value: &str,
+    max_len: usize,
+    byte_ok: fn(u8) -> bool,
+) -> std::result::Result<(), SshSessionResponseError> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    validate_field(name, value, max_len, byte_ok)
 }
 
 /// Build notes string for a sandbox based on active forwards.
@@ -1064,6 +1082,7 @@ mod tests {
     fn valid_session_response() -> crate::proto::CreateSshSessionResponse {
         crate::proto::CreateSshSessionResponse {
             sandbox_id: "sb-1234".to_string(),
+            org_id: String::new(),
             token: "abcDEF-123_456.789".to_string(),
             gateway_scheme: "https".to_string(),
             gateway_host: "gateway.example.com".to_string(),
@@ -1112,6 +1131,18 @@ mod tests {
             assert!(
                 validate_ssh_session_response(&r).is_err(),
                 "expected reject for sandbox_id={bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_ssh_session_response_rejects_shell_metachars_in_org_id() {
+        for bad in ["org/a", "org a", "org$(id)", "org\nalpha"] {
+            let mut r = valid_session_response();
+            r.org_id = bad.to_string();
+            assert!(
+                validate_ssh_session_response(&r).is_err(),
+                "expected reject for org_id={bad:?}"
             );
         }
     }

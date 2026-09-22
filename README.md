@@ -127,6 +127,14 @@ OpenShell applies defense in depth across four policy domains:
 
 Policies are declarative YAML files. Static sections (filesystem, process) are locked at creation; dynamic sections (network, inference) can be hot-reloaded on a running sandbox with `openshell policy set`.
 
+For `landlock.compatibility: hard_requirement`, sandboxed child processes receive
+`OPENSHELL_LANDLOCK_ABI` and `OPENSHELL_LANDLOCK_RULES_APPLIED` after the
+filesystem ruleset is prepared. Best-effort Landlock does not export these
+evidence fields because enforcement may legitimately degrade.
+
+Policies that need child process evidence from `/proc/self/status` should allow
+`/proc` read-only. A narrower `/proc/self` rule can fail under hard Landlock.
+
 Network binary rules may optionally bind a binary grant to the effective UID/GID of the process opening the connection. This lets one shared sandbox run multiple non-root agent users while allowing a tool for one agent and denying the same tool for another. Omit `uid`/`gid` for legacy sandbox-wide binary matching.
 
 ```yaml

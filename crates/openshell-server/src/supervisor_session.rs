@@ -244,8 +244,25 @@ impl SupervisorSessionRegistry {
         ),
         Status,
     > {
+        self.open_relay_for_org(sandbox_id, "", session_wait_timeout)
+            .await
+    }
+
+    pub async fn open_relay_for_org(
+        &self,
+        sandbox_id: &str,
+        org_id: &str,
+        session_wait_timeout: Duration,
+    ) -> Result<
+        (
+            String,
+            oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
+        ),
+        Status,
+    > {
         self.open_relay_with_target(
             sandbox_id,
+            org_id,
             relay_open::Target::Ssh(SshRelayTarget {}),
             String::new(),
             session_wait_timeout,
@@ -256,6 +273,7 @@ impl SupervisorSessionRegistry {
     pub async fn open_relay_with_target(
         &self,
         sandbox_id: &str,
+        org_id: &str,
         target: relay_open::Target,
         service_id: String,
         session_wait_timeout: Duration,
@@ -275,6 +293,7 @@ impl SupervisorSessionRegistry {
             channel_id: channel_id.clone(),
             target: Some(target),
             service_id,
+            org_id: org_id.to_string(),
         };
 
         // Register the pending relay before sending RelayOpen to avoid a race.
@@ -858,6 +877,7 @@ mod tests {
                 channel_id: "ch-test".to_string(),
                 target: Some(relay_open::Target::Ssh(SshRelayTarget {})),
                 service_id: String::new(),
+                org_id: String::new(),
             },
             created_at,
         }
