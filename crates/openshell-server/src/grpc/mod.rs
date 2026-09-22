@@ -10,6 +10,8 @@ mod sandbox;
 mod service;
 mod validation;
 
+pub(crate) use validation::validate_optional_org_id;
+
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,
     ApproveDraftChunkResponse, AttachSandboxProviderRequest, AttachSandboxProviderResponse,

@@ -2193,18 +2193,22 @@ mod tests {
 
     #[test]
     fn tcp_forward_init_rejects_invalid_org_id() {
-        let init = TcpForwardInit {
-            sandbox_id: "sbx".to_string(),
-            org_id: "org/alpha".to_string(),
-            target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget::default())),
-            ..Default::default()
-        };
-        assert_eq!(
-            validate_tcp_forward_init(&init)
-                .expect_err("invalid org id rejected")
-                .message(),
-            "org_id must contain only ASCII letters, digits, '_', '-', or '.'"
-        );
+        for org_id in ["org/alpha", "..", "-org"] {
+            let init = TcpForwardInit {
+                sandbox_id: "sbx".to_string(),
+                org_id: org_id.to_string(),
+                target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget::default())),
+                ..Default::default()
+            };
+            let err = validate_tcp_forward_init(&init)
+                .err()
+                .unwrap_or_else(|| panic!("invalid org_id {org_id:?} should be rejected"));
+            assert!(
+                err.message().contains("org_id"),
+                "expected org_id error for {org_id:?}, got {}",
+                err.message()
+            );
+        }
     }
 
     #[test]

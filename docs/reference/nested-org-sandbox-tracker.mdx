@@ -25,6 +25,7 @@ Rows marked `done` are local spike evidence only unless they link to CI artifact
 | done | Org identity API/relay foundation | Optional `org_id` is validated on exec/SSH/TCP forward requests, propagated to `RelayOpen`, persisted on SSH sessions, returned in create-session responses, and enforced on SSH forward-token validation. Empty `org_id` preserves legacy sandbox-level behavior. |
 | done | Relay OCSF org attribution | Relay open/closed/failed events clone the base sandbox context with `RelayOpen.org_id` and emit it as `unmapped.org_id`; empty `org_id` keeps legacy event shape. |
 | done | Binary identity cache scope API | `BinaryIdentityCache` supports explicit org/root cache scope so the same binary path can be isolated across future nested org roots; current proxy callers still use the legacy sandbox scope. |
+| done | Relay org-id boundary validation | `SupervisorSessionRegistry::open_relay_with_target` rejects invalid org ids before pending relay insertion or `RelayOpen` emission, protecting future internal callers. Validation rejects slash/space/control bytes, overlength ids, `.`/`..`, and ids starting with `-` or `.`. |
 | pending | Org identity contract | Define gateway-minted immutable `org_id`; never trust labels, client input, or in-sandbox state as the org source. Propagate it through nested lifecycle, policy input, cache keys, denial/activity aggregation, and audit persistence. |
 | pending | Nested org API/relay routing | Add org target to nested lifecycle and supervisor runtime selection. Existing `run_as_user` remains per-agent only. |
 | pending | Nested org runtime manager | Add an outer-supervisor manager that owns per-org runtime contexts and crash cleanup. Context includes org netns, proxy, OPA, identity cache, policy-local state, provider state, mount/root, PID/proc boundary, IPC/keyring mode, cgroup, and sockets. |
@@ -42,12 +43,25 @@ Rows marked `done` are local spike evidence only unless they link to CI artifact
 | pending | Linux adversarial evidence harness | Prove two orgs in one outer container cannot cross network, filesystem, proc, IPC, keyring, cgroup, secret, policy, or audit boundaries. Include active `/proc` scrape, abstract-socket enumeration, signal attempts, credential replay, and resource-pressure attempts. |
 | pending | Fly feasibility proof | Verify whether Fly exposes enough namespace/cgroup capabilities for nested mode. |
 
+## Edge-Case Validation Matrix
+
+| Area | Covered cases | Remaining cases |
+|---|---|---|
+| Org id syntax | Empty id preserves legacy behavior; valid ids include `org.alpha-1`, `org_alpha_1`, and `org1`; invalid ids include slash, space, null, newline, carriage return, overlength values, `.`/`..`, leading `.`, and leading `-`. | Gateway-minted immutable org identity is still missing; request-supplied org id is carrier-only. |
+| Exec org id boundary | `ExecSandboxRequest.org_id` uses the shared validator and rejects all invalid syntax before command transport. | Route exec to an `OrgRuntimeContext` after nested lifecycle exists. |
+| TCP forward org id boundary | `TcpForwardInit.org_id` uses the shared validator; slash, `..`, and leading `-` are boundary-tested. | Live forward smoke must prove token replay fails across two active org runtimes. |
+| Relay open org id boundary | Registry rejects invalid org ids before pending relay insertion and before `RelayOpen` emission. | Live relay smoke must prove two orgs cannot claim or observe each other's relay channels. |
+| SSH session org id binding | Create-session response and persisted SSH session carry org id; forward-token validation requires matching `sandbox_id + org_id`. | Add a negative live SSH/TCP replay test once nested org runtime exists. |
+| Binary identity cache | Same path in different `org_id + root_id` scopes does not collide; legacy unscoped API remains available. | Wire live proxy identity resolution to org/root scope; prove same `/usr/bin/curl` in two org roots cannot share TOFU state. |
+| UID/GID policy | Same binary can be allowed for one UID/GID and denied for another; missing process identity denies scoped policy; unscoped legacy policy keeps any-UID behavior. | Live curl-through-proxy test with two OS users in one sandbox remains pending. |
+| Nested org runtime | Design gaps are listed below for netns, mount/root, PID/proc, IPC/keyring, cgroup, secrets, lifecycle, and audit. | Full adversarial Linux harness remains pending before customer multi-org-in-one-outer-container claims. |
+
 ## Code Constraints Found 2026-07-06
 
 | File/area | Constraint | Work item |
 |---|---|---|
 | `proto/openshell.proto` | Exec, SSH, TCP forward, and relay messages now carry optional `org_id`; sandbox lifecycle and supervisor hello remain sandbox-scoped. | Add nested lifecycle contract and gateway-minted org identity. |
-| `openshell-server/src/supervisor_session.rs` | `RelayOpen` carries `org_id`, but there is still one supervisor session and pending relay pool per sandbox. | Route relay claim to an org runtime context once nested runtime manager exists. |
+| `openshell-server/src/supervisor_session.rs` | `RelayOpen` carries validated `org_id`, but there is still one supervisor session and pending relay pool per sandbox. | Route relay claim to an org runtime context once nested runtime manager exists. |
 | `openshell-supervisor-process/src/netns/mod.rs` | One fixed-CIDR netns per sandbox. | Add per-org CIDR/IP allocator and cleanup. |
 | `openshell-supervisor-process/src/process.rs` | One netns fd and hardcoded proxy URL `10.200.0.1`; mount namespace only hides supervisor identity socket. | Add org launch context with org proxy URL, mount/root, cgroup, and provider env. |
 | `openshell-supervisor-network/src/run.rs` | One proxy, OPA, policy-local context, provider state, binary cache, and entrypoint PID. | Instantiate these per org. |
@@ -100,3 +114,12 @@ Revisit nested org mode only after the tracker items above have Linux evidence.
 | Implemented | `BinaryIdentityScope` and scoped cache keys for `BinaryIdentityCache`; legacy `verify_or_cache(path)` still maps to the default sandbox scope. |
 | Not implemented | Live proxy org/root scope wiring, per-org proxy/cache ownership, and fail-closed runtime checks for missing org/root identity remain pending. |
 | Validation | Built/tested inside `openshell/ci:dev`: `cargo test --locked -p openshell-supervisor-network identity --lib` and `cargo check --locked -p openshell-supervisor-network` passed. |
+
+## 2026-07-06 Relay Org Validation Slice
+
+| Item | Result |
+|---|---|
+| Branch | `hugo/nested-org-relay-org-validation` |
+| Implemented | Reused the existing org-id validator at `SupervisorSessionRegistry::open_relay_with_target`; invalid org ids fail before pending relay state or `RelayOpen` emission. Hardened org-id syntax rejects path/CLI-ambiguous forms: `.`/`..`, leading `.`, and leading `-`. |
+| Not implemented | Gateway-minted org identity and org runtime routing remain pending. |
+| Validation | Built/tested inside `openshell/ci:dev` with direct Rust toolchain path and `CARGO_TARGET_DIR=/tmp/openshell-target`: `cargo fmt --check`, `cargo test --locked -p openshell-server org_id --lib`, `cargo test --locked -p openshell-supervisor-network identity --lib`, `cargo test --locked -p openshell-supervisor-network uid_scoped --lib`, `cargo test --locked -p openshell-policy uid_scoped --lib`, and `cargo check --locked -p openshell-server -p openshell-supervisor-network -p openshell-policy` passed. Docker note: host worktree mount cannot write repo-local `target`, so CI runs must use container-local or named-volume `CARGO_TARGET_DIR`. |

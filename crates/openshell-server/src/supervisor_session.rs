@@ -284,6 +284,8 @@ impl SupervisorSessionRegistry {
         ),
         Status,
     > {
+        crate::grpc::validate_optional_org_id(org_id)?;
+
         let tx = self
             .wait_for_session(sandbox_id, session_wait_timeout)
             .await?;
@@ -1027,6 +1029,26 @@ mod tests {
             }
             other => panic!("expected RelayOpen, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn open_relay_for_org_rejects_invalid_org_id_before_pending_insert() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        registry.register("sbx".to_string(), "s1".to_string(), tx, make_shutdown());
+
+        let err = registry
+            .open_relay_for_org("sbx", "..", Duration::from_secs(1))
+            .await
+            .expect_err("invalid org_id must be rejected");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("org_id"));
+        assert!(registry.pending_relays.lock().unwrap().is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "invalid org_id must not emit RelayOpen"
+        );
     }
 
     #[tokio::test]

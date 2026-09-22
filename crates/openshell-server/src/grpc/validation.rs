@@ -93,7 +93,7 @@ pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(
     Ok(())
 }
 
-pub(super) fn validate_optional_org_id(org_id: &str) -> Result<(), Status> {
+pub(crate) fn validate_optional_org_id(org_id: &str) -> Result<(), Status> {
     if org_id.is_empty() {
         return Ok(());
     }
@@ -103,6 +103,11 @@ pub(super) fn validate_optional_org_id(org_id: &str) -> Result<(), Status> {
         )));
     }
     reject_control_chars(org_id, "org_id")?;
+    if org_id == "." || org_id == ".." || org_id.starts_with('-') || org_id.starts_with('.') {
+        return Err(Status::invalid_argument(
+            "org_id must not be '.', '..', or start with '-' or '.'",
+        ));
+    }
     if !org_id
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
@@ -1130,26 +1135,51 @@ mod tests {
 
     #[test]
     fn validate_exec_request_allows_org_id() {
-        let req = ExecSandboxRequest {
-            sandbox_id: "id".to_string(),
-            command: vec!["id".to_string()],
-            org_id: "org.alpha-1".to_string(),
-            ..Default::default()
-        };
-        assert!(validate_exec_request_fields(&req).is_ok());
+        for org_id in ["org.alpha-1", "org_alpha_1", "org1"] {
+            let req = ExecSandboxRequest {
+                sandbox_id: "id".to_string(),
+                command: vec!["id".to_string()],
+                org_id: org_id.to_string(),
+                ..Default::default()
+            };
+            assert!(
+                validate_exec_request_fields(&req).is_ok(),
+                "expected org_id {org_id:?} to pass"
+            );
+        }
     }
 
     #[test]
     fn validate_exec_request_rejects_invalid_org_id() {
-        let req = ExecSandboxRequest {
-            sandbox_id: "id".to_string(),
-            command: vec!["id".to_string()],
-            org_id: "org/alpha".to_string(),
-            ..Default::default()
-        };
-        let err = validate_exec_request_fields(&req).unwrap_err();
-        assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(err.message().contains("org_id"));
+        let mut invalid_org_ids = vec![
+            "org/alpha".to_string(),
+            "org alpha".to_string(),
+            ".".to_string(),
+            "..".to_string(),
+            ".org".to_string(),
+            "-org".to_string(),
+            "org\nalpha".to_string(),
+            "org\ralpha".to_string(),
+            "org\0alpha".to_string(),
+        ];
+        invalid_org_ids.push("a".repeat(MAX_ORG_ID_LEN + 1));
+
+        for org_id in invalid_org_ids {
+            let req = ExecSandboxRequest {
+                sandbox_id: "id".to_string(),
+                command: vec!["id".to_string()],
+                org_id: org_id.clone(),
+                ..Default::default()
+            };
+            let err = validate_exec_request_fields(&req)
+                .expect_err(&format!("expected org_id {org_id:?} to be rejected"));
+            assert_eq!(err.code(), Code::InvalidArgument);
+            assert!(
+                err.message().contains("org_id"),
+                "expected org_id error for {org_id:?}, got {}",
+                err.message()
+            );
+        }
     }
 
     #[test]
