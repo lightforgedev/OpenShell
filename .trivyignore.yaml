@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# False positives only; unimplemented hardening and accepted risks stay visible.
+# The workflow requires concrete basenames so packaged charts receive the same
+# narrow exception.
+misconfigurations:
+  # The Kubernetes compute driver creates the per-sandbox Service and outer
+  # egress NetworkPolicy in the configured sandbox namespace. The chart also
+  # requires an explicit CNI-enforcement acknowledgement at install time.
+  - id: KSV-0056
+    paths:
+      - "**/role.yaml"
+    statement: >-
+      The namespace-scoped gateway role can create Services and NetworkPolicy
+      resources so the compute driver can connect each sandbox runtime to its
+      supervisor while denying direct workload egress.
