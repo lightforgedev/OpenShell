@@ -94,6 +94,30 @@ pub fn probe_availability() -> LandlockAvailability {
 pub struct PreparedRuleset {
     ruleset: landlock::RulesetCreated,
     compatibility: LandlockCompatibility,
+    evidence: Option<LandlockEvidence>,
+}
+
+#[derive(Clone, Copy)]
+struct LandlockEvidence {
+    abi: i32,
+    rules_applied: usize,
+}
+
+impl PreparedRuleset {
+    pub fn evidence_env(&self) -> Option<[(String, String); 2]> {
+        let evidence = self.evidence?;
+
+        Some([
+            (
+                openshell_core::sandbox_env::LANDLOCK_ABI.to_string(),
+                evidence.abi.to_string(),
+            ),
+            (
+                openshell_core::sandbox_env::LANDLOCK_RULES_APPLIED.to_string(),
+                evidence.rules_applied.to_string(),
+            ),
+        ])
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +186,7 @@ fn prepare_capability_free_baseline_at(root: &Path) -> Result<PreparedRuleset> {
     Ok(PreparedRuleset {
         ruleset,
         compatibility: LandlockCompatibility::HardRequirement,
+        evidence: None,
     })
 }
 
@@ -246,9 +271,9 @@ fn prepare_with_path_open_mode(
 
     // Probe first: kernels without Landlock (e.g. gVisor's sentry returns
     // ENOSYS) would otherwise log misleading "Applying"+"Built" events.
-    let availability = probe_availability();
-    if !matches!(availability, LandlockAvailability::Available { .. }) {
-        match compatibility {
+    let landlock_abi = match probe_availability() {
+        LandlockAvailability::Available { abi } => abi,
+        availability => match compatibility {
             LandlockCompatibility::BestEffort => {
                 openshell_ocsf::ocsf_emit!(
                     openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
@@ -278,8 +303,8 @@ fn prepare_with_path_open_mode(
                     "Landlock unavailable in hard_requirement mode: {availability}"
                 ));
             }
-        }
-    }
+        },
+    };
 
     let total_paths = read_only.len() + read_write.len();
     // Read-only policy must also deny pathname truncation. The mandatory
@@ -358,6 +383,12 @@ fn prepare_with_path_open_mode(
         Ok(PreparedRuleset {
             ruleset,
             compatibility: compatibility.clone(),
+            evidence: matches!(compatibility, LandlockCompatibility::HardRequirement).then_some(
+                LandlockEvidence {
+                    abi: landlock_abi,
+                    rules_applied,
+                },
+            ),
         })
     })();
 
@@ -608,6 +639,34 @@ mod tests {
         if let Err(err) = result {
             panic!("hard_requirement should accept mixed directory and device paths: {err}");
         }
+    }
+
+    #[test]
+    fn hard_requirement_preparation_exports_actual_evidence() {
+        let LandlockAvailability::Available { abi } = probe_availability() else {
+            return;
+        };
+
+        let prepared = prepare(
+            &hard_requirement_policy(vec![PathBuf::from("/tmp")], vec![]),
+            None,
+        )
+        .expect("hard-requirement policy should prepare")
+        .expect("configured filesystem policy should produce a ruleset");
+        let evidence = prepared
+            .evidence_env()
+            .expect("hard-requirement ruleset should export evidence");
+
+        assert_eq!(evidence[0].0, openshell_core::sandbox_env::LANDLOCK_ABI);
+        assert_eq!(evidence[0].1, abi.to_string());
+        assert_eq!(
+            evidence[1].0,
+            openshell_core::sandbox_env::LANDLOCK_RULES_APPLIED
+        );
+        assert!(
+            evidence[1].1.parse::<usize>().is_ok_and(|count| count > 0),
+            "prepared ruleset must report at least one applied rule"
+        );
     }
 
     #[test]
