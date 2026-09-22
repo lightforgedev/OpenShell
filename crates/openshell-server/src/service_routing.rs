@@ -741,6 +741,7 @@ fn gateway_ocsf_ctx(sandbox_id: &str, sandbox_name: &str) -> SandboxContext {
     SandboxContext {
         sandbox_id: sandbox_id.to_string(),
         sandbox_name: sandbox_name.to_string(),
+        org_id: None,
         container_image: "openshell/gateway".to_string(),
         hostname: "openshell-gateway".to_string(),
         product_version: VERSION.to_string(),

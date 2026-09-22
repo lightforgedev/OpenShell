@@ -16,6 +16,7 @@ static OCSF_CTX: OnceLock<SandboxContext> = OnceLock::new();
 static OCSF_CTX_FALLBACK: LazyLock<SandboxContext> = LazyLock::new(|| SandboxContext {
     sandbox_id: String::new(),
     sandbox_name: String::new(),
+    org_id: None,
     container_image: String::new(),
     hostname: "test".to_string(),
     product_version: env!("CARGO_PKG_VERSION").to_string(),
