@@ -33,8 +33,9 @@ misconfigurations:
     statement: >-
       Images come from ghcr.io/nvidia/openshell, this project's own registry.
 
-  # The Kubernetes compute driver creates its runtime infrastructure and the
-  # per-sandbox outer egress fence in the configured sandbox namespace.
+  # The Kubernetes compute driver creates the per-sandbox Service and outer
+  # egress NetworkPolicy in the configured sandbox namespace. The chart also
+  # requires an explicit CNI-enforcement acknowledgement at install time.
   - id: KSV-0056
     paths:
       - "**/role.yaml"
