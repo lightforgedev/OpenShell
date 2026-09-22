@@ -608,6 +608,7 @@ impl OpenShellClient {
     pub async fn exec(&self, name: &str, cmd: &[String], opts: ExecOptions) -> Result<ExecResult> {
         let request = proto::ExecSandboxRequest {
             sandbox: name.to_string(),
+            org_id: String::new(),
             workspace_scope: Some(proto::workspace_selector("default")),
             command: cmd.to_vec(),
             workdir: opts.workdir.unwrap_or_default(),
@@ -1068,6 +1069,7 @@ impl WorkspaceScopedClient {
     pub async fn exec(&self, name: &str, cmd: &[String], opts: ExecOptions) -> Result<ExecResult> {
         let request = proto::ExecSandboxRequest {
             sandbox: name.to_string(),
+            org_id: String::new(),
             workspace_scope: Some(proto::workspace_selector(&self.workspace)),
             command: cmd.to_vec(),
             workdir: opts.workdir.unwrap_or_default(),
