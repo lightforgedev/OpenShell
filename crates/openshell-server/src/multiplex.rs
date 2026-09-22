@@ -43,6 +43,7 @@ use crate::{
     service_http_router,
 };
 
+#[cfg(feature = "connect-manager-test-bearer")]
 const CONNECT_MANAGER_TEST_BEARER: &str = "aegis-connect-manager-test-v1";
 
 /// Request-ID generator that produces a UUID v4 for each inbound request.
@@ -517,6 +518,10 @@ impl<S> AuthGrpcRouter<S> {
         allow_unauthenticated_users: bool,
         allow_connect_manager_test_bearer: bool,
     ) -> Self {
+        assert!(
+            !allow_connect_manager_test_bearer || cfg!(debug_assertions),
+            "Connect Manager test bearer cannot be enabled in a release build"
+        );
         Self {
             inner,
             authenticator_chain,
@@ -541,6 +546,7 @@ fn unauthenticated_dev_user_principal() -> Principal {
     })
 }
 
+#[cfg(feature = "connect-manager-test-bearer")]
 fn connect_manager_test_principal(headers: &http::HeaderMap) -> Option<Principal> {
     let expected = format!("Bearer {CONNECT_MANAGER_TEST_BEARER}");
     (headers
@@ -558,6 +564,11 @@ fn connect_manager_test_principal(headers: &http::HeaderMap) -> Option<Principal
             },
         })
     })
+}
+
+#[cfg(not(feature = "connect-manager-test-bearer"))]
+fn connect_manager_test_principal(_headers: &http::HeaderMap) -> Option<Principal> {
+    None
 }
 
 fn status_response(status: tonic::Status) -> Response<tonic::body::Body> {
