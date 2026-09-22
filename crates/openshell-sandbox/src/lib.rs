@@ -1,10 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `OpenShell` Sandbox library.
-//!
-//! This crate provides process sandboxing and monitoring capabilities.
+//! Capability-free in-workload sandbox boundary.
 
+<<<<<<< HEAD
 mod activity_aggregator;
 mod denial_aggregator;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -67,13 +66,62 @@ use openshell_supervisor_network::opa::OpaEngine;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
 use openshell_supervisor_process::skills;
 use tokio::sync::mpsc::UnboundedSender;
+=======
+>>>>>>> upstream/main
 #[cfg(target_os = "linux")]
-use tokio::time::timeout;
+mod accept_interrupt;
+pub mod boundary_exec;
+pub mod boundary_io;
+mod boundary_server;
+pub mod child_env;
+#[cfg(target_os = "linux")]
+pub(crate) mod delegated;
+#[cfg(unix)]
+pub mod identity;
+#[cfg(target_os = "linux")]
+pub mod main_session;
+pub mod managed_children;
+#[cfg(target_os = "linux")]
+mod network_broker;
+#[cfg(all(target_os = "linux", feature = "perf-harness"))]
+pub mod perf;
+#[cfg(unix)]
+pub mod process;
+mod pty;
+pub mod sandbox;
 
-/// Run a command in the sandbox.
+/// Results of actively qualifying the admitted workload runtime before the
+/// sandbox consumes protected bootstrap material.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "qualification preserves independently exercised security results"
+)]
+pub struct RuntimeQualification {
+    pub seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence,
+    pub landlock_abi: u32,
+    pub landlock_allow_deny: bool,
+    pub udp_dns_round_trip: bool,
+    pub tcp_dns_round_trip: bool,
+    pub tcp_allow_round_trip: bool,
+    pub tcp_deny_round_trip: bool,
+}
+
+/// Placeholder used when compiling the package on a non-Linux host.
+///
+/// The sandbox binary rejects execution on those hosts before constructing a
+/// qualification, but retaining the type keeps the library API portable for
+/// workspace-wide checks.
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimeQualification;
+
+/// Run the authenticated boundary-local sandbox.
 ///
 /// # Errors
 ///
+<<<<<<< HEAD
 /// Returns an error if the command fails to start or encounters a fatal error.
 #[allow(
     clippy::too_many_arguments,
@@ -2192,4 +2240,14 @@ filesystem_policy:
         let local_policy = SandboxPolicy::try_from(proto).expect("conversion should succeed");
         assert!(matches!(local_policy.network.mode, NetworkMode::Proxy));
     }
+=======
+/// Returns an error when the protected bootstrap is invalid or the boundary
+/// listener cannot be established.
+pub fn run(
+    config_path: &std::path::Path,
+    qualification: RuntimeQualification,
+) -> miette::Result<()> {
+    boundary_server::run_boundary(config_path, qualification)
+        .map_err(|error| miette::miette!(error))
+>>>>>>> upstream/main
 }

@@ -24,7 +24,7 @@
 
 use clap::Args;
 use k8s_openapi::ByteString;
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{ConfigMap, Secret};
 use kube::Client;
 use kube::api::{Api, ObjectMeta, PostParams};
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -78,6 +78,33 @@ pub struct CertgenArgs {
     /// For local debugging.
     #[arg(long)]
     dry_run: bool,
+
+    /// Name of a `ConfigMap` to create containing the CA certificate (key: ca.crt)
+    /// for `BackendTLSPolicy` backend validation. The CA is always read from the
+    /// authoritative server Secret: --server-secret-name in full PKI mode,
+    /// --backend-ca-source-secret in --jwt-only mode.
+    #[arg(long, value_name = "NAME")]
+    backend_ca_configmap_name: Option<String>,
+
+    /// Name of an existing `Secret` containing a ca.crt key to populate the
+    /// backend CA `ConfigMap` from. Required with --jwt-only when
+    /// --backend-ca-configmap-name is set (typically the server TLS `Secret`
+    /// created by cert-manager).
+    #[arg(long, value_name = "NAME", requires = "backend_ca_configmap_name")]
+    backend_ca_source_secret: Option<String>,
+
+    /// Maximum time in seconds to poll for the backend CA source `Secret` when
+    /// using cert-manager. Defaults to 90 seconds. The Helm chart sets this to
+    /// (Job activeDeadlineSeconds - 30) to leave margin for `ConfigMap` creation.
+    #[arg(long, value_name = "SECONDS", default_value = "90")]
+    backend_ca_poll_timeout_seconds: u64,
+
+    /// Fail with an error if the backend CA source `Secret` is not found within
+    /// the polling timeout. When false (default), the hook succeeds with a warning
+    /// and the `ConfigMap` is not created. The Helm chart sets this based on
+    /// pkiInitJob.failOnTimeout.
+    #[arg(long)]
+    backend_ca_fail_on_timeout: bool,
 }
 
 pub async fn run(args: CertgenArgs) -> Result<()> {
@@ -97,7 +124,13 @@ pub async fn run(args: CertgenArgs) -> Result<()> {
         run_local(dir, &args.server_sans)
     } else {
         let bundle = generate_pki(&args.server_sans)?;
-        run_kubernetes(&args, &bundle).await
+        run_kubernetes(&args, &bundle).await?;
+
+        if let Some(ref cm_name) = args.backend_ca_configmap_name {
+            create_backend_ca_configmap_if_needed(&args, cm_name).await?;
+        }
+
+        Ok(())
     }
 }
 
@@ -290,6 +323,165 @@ async fn create_tls_secrets(
         .await
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to create secret {client_name}"))?;
+    Ok(())
+}
+
+fn extract_ca_from_secret(secret: &Secret, name: &str) -> Result<String> {
+    let data = secret
+        .data
+        .as_ref()
+        .ok_or_else(|| miette::miette!("secret {name} has no data"))?;
+    let ca = data
+        .get("ca.crt")
+        .ok_or_else(|| miette::miette!("secret {name} has no ca.crt key"))?;
+    String::from_utf8(ca.0.clone())
+        .into_diagnostic()
+        .wrap_err("ca.crt is not valid UTF-8")
+}
+
+async fn create_backend_ca_configmap_if_needed(
+    args: &CertgenArgs,
+    configmap_name: &str,
+) -> Result<()> {
+    let namespace = args
+        .namespace
+        .as_deref()
+        .ok_or_else(|| miette::miette!("--namespace is required (or set POD_NAMESPACE)"))?;
+
+    let client = Client::try_default()
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to construct Kubernetes client for backend CA ConfigMap")?;
+    let secret_api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let cm_api: Api<ConfigMap> = Api::namespaced(client, namespace);
+
+    // Resolve the CA from the authoritative server Secret rather than the
+    // in-memory bundle so upgrades that enable BackendTLSPolicy on an
+    // existing release use the CA that actually signed the server cert.
+    let ca_pem = if let Some(source_secret) = &args.backend_ca_source_secret {
+        let poll_timeout = std::time::Duration::from_secs(args.backend_ca_poll_timeout_seconds);
+        let poll_interval = std::time::Duration::from_secs(2);
+        let start = std::time::Instant::now();
+
+        let secret = loop {
+            match secret_api
+                .get_opt(source_secret)
+                .await
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to read secret {source_secret}"))?
+            {
+                Some(secret) => break secret,
+                None if start.elapsed() >= poll_timeout => {
+                    let msg = format!(
+                        "Backend CA source secret {source_secret} not found after {timeout_secs}s; \
+                         ConfigMap {configmap_name} not created. This is expected if cert-manager \
+                         is still issuing the certificate.",
+                        timeout_secs = poll_timeout.as_secs()
+                    );
+                    if args.backend_ca_fail_on_timeout {
+                        return Err(miette::miette!(
+                            "{msg} Install failed due to --backend-ca-fail-on-timeout."
+                        ));
+                    }
+                    warn!(
+                        secret = %source_secret,
+                        configmap = %configmap_name,
+                        timeout_secs = poll_timeout.as_secs(),
+                        "{msg} Run helm upgrade after the TLS secret exists or the BackendTLSPolicy \
+                         will remain non-functional until the ConfigMap is created manually."
+                    );
+                    return Ok(());
+                }
+                None => {
+                    if start.elapsed().as_secs().is_multiple_of(10) {
+                        info!(
+                            secret = %source_secret,
+                            elapsed_secs = start.elapsed().as_secs(),
+                            "Waiting for cert-manager to issue TLS certificate..."
+                        );
+                    }
+                    tokio::time::sleep(poll_interval).await;
+                }
+            }
+        };
+
+        info!(
+            secret = %source_secret,
+            elapsed_secs = start.elapsed().as_secs(),
+            "cert-manager TLS certificate found."
+        );
+        extract_ca_from_secret(&secret, source_secret)?
+    } else if let Some(server_secret) = &args.server_secret_name {
+        let secret = secret_api
+            .get(server_secret)
+            .await
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read server secret {server_secret}"))?;
+        extract_ca_from_secret(&secret, server_secret)?
+    } else {
+        return Err(miette::miette!(
+            "--backend-ca-source-secret or --server-secret-name is required \
+             with --backend-ca-configmap-name"
+        ));
+    };
+
+    // Reconcile: create or update so the backend CA stays current across
+    // CA rotations and upgrades.
+    if let Some(existing) = cm_api
+        .get_opt(configmap_name)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read configmap {configmap_name}"))?
+    {
+        let up_to_date = existing
+            .data
+            .as_ref()
+            .and_then(|d| d.get("ca.crt"))
+            .map(String::as_str)
+            == Some(&ca_pem);
+        if up_to_date {
+            info!(
+                namespace = %namespace,
+                configmap = %configmap_name,
+                "Backend CA ConfigMap is up-to-date, skipping."
+            );
+            return Ok(());
+        }
+        let mut updated = existing;
+        updated.data = Some(BTreeMap::from([("ca.crt".to_string(), ca_pem)]));
+        cm_api
+            .replace(configmap_name, &PostParams::default(), &updated)
+            .await
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to update configmap {configmap_name}"))?;
+        info!(
+            namespace = %namespace,
+            configmap = %configmap_name,
+            "Backend CA ConfigMap updated with current CA."
+        );
+        return Ok(());
+    }
+
+    let configmap = ConfigMap {
+        metadata: ObjectMeta {
+            name: Some(configmap_name.to_string()),
+            ..Default::default()
+        },
+        data: Some(BTreeMap::from([("ca.crt".to_string(), ca_pem)])),
+        ..Default::default()
+    };
+
+    cm_api
+        .create(&PostParams::default(), &configmap)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create configmap {configmap_name}"))?;
+
+    info!(
+        namespace = %namespace,
+        configmap = %configmap_name,
+        "Backend CA ConfigMap created."
+    );
     Ok(())
 }
 
@@ -624,9 +816,11 @@ fn read_pem(path: &Path) -> Result<String> {
 }
 
 fn write_local_bundle(dir: &Path, bundle: &PkiBundle, paths: &LocalPaths) -> Result<()> {
-    // Stage to a sibling tmp dir so individual renames into the final layout
-    // are atomic on the same filesystem.
-    let temp = sibling_temp_dir(dir);
+    // Ensure output dir exists before staging inside it.
+    create_dir_restricted(dir)?;
+
+    // Stage inside the output dir so individual renames are atomic on the same filesystem.
+    let temp = staging_temp_dir(dir);
     if temp.exists() {
         std::fs::remove_dir_all(&temp)
             .into_diagnostic()
@@ -659,8 +853,7 @@ fn write_local_bundle(dir: &Path, bundle: &PkiBundle, paths: &LocalPaths) -> Res
     )?;
     write_pem(&temp_jwt.join("kid"), &bundle.jwt_key_id, false)?;
 
-    // Final destination (might not exist yet on first run).
-    create_dir_restricted(dir)?;
+    // Final destination subdirs (might not exist yet on first run).
     create_dir_restricted(&paths.server_dir)?;
     create_dir_restricted(&paths.client_dir)?;
     create_dir_restricted(&paths.jwt_dir)?;
@@ -687,7 +880,10 @@ fn write_local_bundle(dir: &Path, bundle: &PkiBundle, paths: &LocalPaths) -> Res
 }
 
 fn write_local_tls_bundle(bundle: &PkiBundle, paths: &LocalPaths) -> Result<()> {
-    let temp = sibling_temp_dir(&paths.server_dir);
+    create_dir_restricted(&paths.server_dir)?;
+    create_dir_restricted(&paths.client_dir)?;
+
+    let temp = staging_temp_dir(&paths.server_dir);
     if temp.exists() {
         std::fs::remove_dir_all(&temp)
             .into_diagnostic()
@@ -707,8 +903,6 @@ fn write_local_tls_bundle(bundle: &PkiBundle, paths: &LocalPaths) -> Result<()> 
     write_pem(&temp_client.join("tls.crt"), &bundle.client_cert_pem, false)?;
     write_pem(&temp_client.join("tls.key"), &bundle.client_key_pem, true)?;
 
-    create_dir_restricted(&paths.server_dir)?;
-    create_dir_restricted(&paths.client_dir)?;
     let renames: [(PathBuf, &Path); 6] = [
         (temp.join("ca.crt"), paths.ca_crt.as_path()),
         (temp.join("ca.key"), paths.ca_key.as_path()),
@@ -728,7 +922,9 @@ fn write_local_tls_bundle(bundle: &PkiBundle, paths: &LocalPaths) -> Result<()> 
 }
 
 fn write_local_jwt_bundle(bundle: &PkiBundle, paths: &LocalPaths) -> Result<()> {
-    let temp = sibling_temp_dir(&paths.jwt_dir);
+    create_dir_restricted(&paths.jwt_dir)?;
+
+    let temp = staging_temp_dir(&paths.jwt_dir);
     if temp.exists() {
         std::fs::remove_dir_all(&temp)
             .into_diagnostic()
@@ -740,7 +936,6 @@ fn write_local_jwt_bundle(bundle: &PkiBundle, paths: &LocalPaths) -> Result<()> 
     write_pem(&temp.join("public.pem"), &bundle.jwt_public_key_pem, false)?;
     write_pem(&temp.join("kid"), &bundle.jwt_key_id, false)?;
 
-    create_dir_restricted(&paths.jwt_dir)?;
     let renames: [(PathBuf, &Path); 3] = [
         (temp.join("signing.pem"), paths.jwt_signing.as_path()),
         (temp.join("public.pem"), paths.jwt_public.as_path()),
@@ -766,14 +961,9 @@ fn write_pem(path: &Path, contents: &str, owner_only: bool) -> Result<()> {
     Ok(())
 }
 
-fn sibling_temp_dir(dir: &Path) -> PathBuf {
-    // Use a sibling so std::fs::rename succeeds (same filesystem).
-    let mut name = dir
-        .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_default();
-    name.push(".certgen.tmp");
-    dir.with_file_name(name)
+fn staging_temp_dir(dir: &Path) -> PathBuf {
+    // Place temp inside dir so rename stays on the same filesystem as the destination.
+    dir.join(".certgen.tmp")
 }
 
 // ────────────────────────────── Shared utility ─────────────────────────────
@@ -790,7 +980,7 @@ fn print_bundle(bundle: &PkiBundle) {
 mod tests {
     use super::{
         CertSan, K8sAction, LocalAction, LocalPaths, decide_k8s, decide_local, jwt_signing_secret,
-        missing_required_server_sans, read_local_bundle, sibling_temp_dir, tls_secret,
+        missing_required_server_sans, read_local_bundle, staging_temp_dir, tls_secret,
         write_local_bundle, write_local_jwt_bundle, write_local_tls_bundle,
     };
     use openshell_bootstrap::pki::generate_pki;
@@ -902,10 +1092,10 @@ mod tests {
     }
 
     #[test]
-    fn sibling_temp_dir_is_adjacent_to_target() {
+    fn staging_temp_dir_is_inside_target() {
         assert_eq!(
-            sibling_temp_dir(Path::new("/var/lib/openshell/tls")),
-            Path::new("/var/lib/openshell/tls.certgen.tmp")
+            staging_temp_dir(Path::new("/var/lib/openshell/tls")),
+            Path::new("/var/lib/openshell/tls/.certgen.tmp")
         );
     }
 
@@ -922,7 +1112,7 @@ mod tests {
             assert!(f.is_file(), "missing {}", f.display());
         }
         assert!(
-            !sibling_temp_dir(&dir).exists(),
+            !staging_temp_dir(&dir).exists(),
             "temp dir should be cleaned up"
         );
 
@@ -1032,7 +1222,7 @@ mod tests {
     fn write_local_bundle_recovers_from_stale_temp_dir() {
         let parent = tempfile::tempdir().expect("tempdir");
         let dir = parent.path().join("tls");
-        let stale = sibling_temp_dir(&dir);
+        let stale = staging_temp_dir(&dir);
         std::fs::create_dir_all(&stale).unwrap();
         std::fs::write(stale.join("garbage"), "stale").unwrap();
 
