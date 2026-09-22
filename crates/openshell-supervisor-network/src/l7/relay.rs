@@ -18,13 +18,8 @@ use crate::l7::middleware::{
 };
 use crate::l7::provider::{L7Provider, RelayOutcome};
 use crate::l7::rest::WebSocketExtensionMode;
-<<<<<<< HEAD
-use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
-use crate::opa::{PolicyGenerationGuard, ProcessIds, TunnelPolicyEngine};
-=======
 use crate::l7::{EndpointObserver, EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
->>>>>>> upstream/main
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::endpoint_status::{EndpointObservationSender, EndpointResult};
@@ -61,8 +56,6 @@ pub struct L7EvalContext {
     pub ancestors: Vec<String>,
     /// Cmdline paths.
     pub cmdline_paths: Vec<String>,
-    /// Effective UID/GID for the process that opened the CONNECT tunnel.
-    pub process_ids: Option<ProcessIds>,
     /// Supervisor-only placeholder resolver for outbound headers.
     pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
     /// Live provider state used to scope static credentials to each request.
@@ -3080,28 +3073,16 @@ fn evaluate_l7_request_once(
         ));
     }
 
-<<<<<<< HEAD
-    let mut exec = serde_json::json!({
-        "path": ctx.binary_path,
-        "ancestors": ctx.ancestors,
-        "cmdline_paths": ctx.cmdline_paths,
-    });
-    if let Some(ids) = ctx.process_ids
-        && let Some(exec_obj) = exec.as_object_mut()
-    {
-        exec_obj.insert("uid".to_string(), serde_json::json!(ids.uid));
-        exec_obj.insert("gid".to_string(), serde_json::json!(ids.gid));
-    }
-
-    let input_json = serde_json::json!({
-=======
     let input = serde_json::json!({
->>>>>>> upstream/main
         "network": {
             "host": ctx.host,
             "port": ctx.port,
         },
-        "exec": exec,
+        "exec": {
+            "path": ctx.binary_path,
+            "ancestors": ctx.ancestors,
+            "cmdline_paths": ctx.cmdline_paths,
+        },
         "request": {
             "method": request.action,
             "path": request.target,
@@ -4063,7 +4044,6 @@ network_policies:
             binary_path: "/usr/bin/curl".into(),
             ancestors: vec![],
             cmdline_paths: vec![],
-            process_ids: None,
             secret_resolver: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
@@ -4205,7 +4185,6 @@ network_policies:
             binary_path: "/usr/bin/curl".into(),
             ancestors: vec![],
             cmdline_paths: vec![],
-            process_ids: None,
             secret_resolver: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
@@ -4602,7 +4581,6 @@ network_policies:
             binary_path: "/usr/bin/python3".into(),
             ancestors: vec![],
             cmdline_paths: vec![],
-            process_ids: None,
             secret_resolver: None,
             ..Default::default()
         };
@@ -4648,7 +4626,6 @@ network_policies:
             binary_path: "/usr/bin/python3".into(),
             ancestors: vec![],
             cmdline_paths: vec![],
-            process_ids: None,
             secret_resolver: None,
             ..Default::default()
         };
@@ -7632,7 +7609,6 @@ network_policies:
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
             cmdline_paths: vec![],
-            process_ids: None,
             secret_resolver: None,
             ..Default::default()
         };
@@ -7709,7 +7685,6 @@ network_policies:
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
             cmdline_paths: vec![],
-            process_ids: None,
             secret_resolver: None,
             ..Default::default()
         };
@@ -7832,7 +7807,6 @@ network_policies:
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
             cmdline_paths: vec![],
-            process_ids: None,
             secret_resolver: None,
             ..Default::default()
         };
@@ -7897,7 +7871,6 @@ network_policies:
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
             cmdline_paths: vec![],
-            process_ids: None,
             secret_resolver: None,
             ..Default::default()
         };
@@ -8620,7 +8593,6 @@ network_policies:
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
             cmdline_paths: vec![],
-            process_ids: None,
             secret_resolver: None,
             ..Default::default()
         };
@@ -8830,7 +8802,6 @@ network_policies:
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
             cmdline_paths: vec![],
-            process_ids: None,
             secret_resolver: resolver.map(Arc::new),
             ..Default::default()
         };
@@ -8960,7 +8931,6 @@ network_policies:
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
             cmdline_paths: vec![],
-            process_ids: None,
             secret_resolver: resolver.map(Arc::new),
             ..Default::default()
         };
@@ -9145,7 +9115,6 @@ network_policies:
             binary_path: "/usr/bin/curl".into(),
             ancestors: vec![],
             cmdline_paths: vec![],
-            process_ids: None,
             secret_resolver: None,
             ..Default::default()
         };
@@ -9238,7 +9207,6 @@ network_policies:
             binary_path: "/usr/bin/curl".into(),
             ancestors: vec![],
             cmdline_paths: vec![],
-            process_ids: None,
             secret_resolver: None,
             ..Default::default()
         };

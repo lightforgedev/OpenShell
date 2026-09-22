@@ -40,14 +40,10 @@ jobs:
     name: mise Lockfile
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
-<<<<<<< HEAD
-    runs-on: ubuntu-24.04
-=======
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
->>>>>>> upstream/main
     container:
-      image: ghcr.io/lightforgedev/openshell/ci:00797d6468b25b939185af7f53d1952145368f4f
+      image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -69,14 +65,10 @@ jobs:
     name: License Headers
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
-<<<<<<< HEAD
-    runs-on: ubuntu-24.04
-=======
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
->>>>>>> upstream/main
     container:
-      image: ghcr.io/lightforgedev/openshell/ci:00797d6468b25b939185af7f53d1952145368f4f
+      image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -158,18 +150,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-<<<<<<< HEAD
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.runner }}
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_VERSION: branch-checks-rust-${{ matrix.runner }}
-    container:
-      image: ghcr.io/lightforgedev/openshell/ci:00797d6468b25b939185af7f53d1952145368f4f
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-=======
         include:
           - runner: linux-amd64-cpu8
             system: x86_64-linux
@@ -179,7 +159,6 @@ jobs:
             system: aarch64-darwin
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
->>>>>>> upstream/main
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -377,11 +356,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        runner: [linux-amd64-cpu8, linux-arm64-cpu8]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     container:
-      image: ghcr.io/lightforgedev/openshell/ci:00797d6468b25b939185af7f53d1952145368f4f
+      image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -414,14 +393,10 @@ jobs:
     name: Go SDK
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
-<<<<<<< HEAD
-    runs-on: ubuntu-24.04
-=======
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
->>>>>>> upstream/main
     container:
-      image: ghcr.io/lightforgedev/openshell/ci:00797d6468b25b939185af7f53d1952145368f4f
+      image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}

@@ -1701,11 +1701,6 @@ fn canonicalize_mcp_profile_versions(versions: &mut [String]) {
 fn binary_to_proto(binary: &BinaryProfile) -> NetworkBinary {
     NetworkBinary {
         path: binary.path.clone(),
-<<<<<<< HEAD
-        harness: binary.harness,
-        ..Default::default()
-=======
->>>>>>> upstream/main
     }
 }
 

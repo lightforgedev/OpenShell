@@ -433,68 +433,10 @@ async fn proxy_to_endpoint(
     let websocket_upgrade = is_websocket_upgrade(&req);
     let downstream_upgrade = websocket_upgrade.then(|| hyper::upgrade::on(&mut req));
 
-<<<<<<< HEAD
-    let (_channel_id, relay_rx) = state
-        .supervisor_sessions
-        .open_relay_with_target(
-            sandbox.object_id(),
-            "",
-            relay_open::Target::Tcp(TcpRelayTarget {
-                host: RELAY_TARGET_HOST.to_string(),
-                port: u32::from(target_port),
-            }),
-            endpoint.object_id().to_string(),
-            Duration::from_secs(15),
-        )
-        .await
-        .map_err(|err| {
-            warn!(error = %err, sandbox_id = %endpoint.sandbox_id, "sandbox service routing: supervisor relay unavailable");
-            let route_err = ServiceRouteError::service_unreachable();
-            emit_service_relay_failure(&endpoint, target_port, route_err.reason);
-            route_err
-        })?;
-
-    let relay = tokio::time::timeout(Duration::from_secs(10), relay_rx)
-        .await
-        .map_err(|_| {
-            let err = ServiceRouteError::service_unreachable();
-            emit_service_relay_failure(&endpoint, target_port, "relay claim timed out");
-            err
-        })?
-        .map_err(|_| {
-            let err = ServiceRouteError::service_unreachable();
-            emit_service_relay_failure(&endpoint, target_port, "relay claim canceled");
-            err
-        })?
-        .map_err(|err| {
-            warn!(error = %err, "sandbox service routing: relay target open failed");
-            let route_err = ServiceRouteError::service_unreachable();
-            emit_service_relay_failure(&endpoint, target_port, route_err.reason);
-            route_err
-        })?;
-
-    let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
-        .handshake(TokioIo::new(relay))
-        .await
-        .map_err(|err| {
-            warn!(error = %err, "sandbox service routing: failed to start upstream HTTP client");
-            let route_err = ServiceRouteError::service_unreachable();
-            emit_service_relay_failure(&endpoint, target_port, route_err.reason);
-            route_err
-        })?;
-
-    if websocket_upgrade {
-        tokio::spawn(async move {
-            if let Err(err) = conn.with_upgrades().await {
-                warn!(error = %err, "sandbox service routing: upstream WebSocket connection failed");
-            }
-        });
-=======
     // An upgrade takes the connection over, so it is never pooled.
     let pool_key = upstream_pool_key(endpoint.object_id(), target_port);
     let pooled = if websocket_upgrade {
         None
->>>>>>> upstream/main
     } else {
         state.service_upstreams.take(&pool_key)
     };
@@ -586,6 +528,7 @@ async fn open_upstream(
     let (_channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
         state,
         sandbox.object_id(),
+        "",
         relay_open::Target::Tcp(TcpRelayTarget {
             host: RELAY_TARGET_HOST.to_string(),
             port: u32::from(target_port),

@@ -8,27 +8,14 @@
 #
 # Distroless Debian provides the glibc runtime required by the binary.
 
-<<<<<<< HEAD
-FROM debian:trixie-slim AS z3-runtime
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libz3-4 \
-    && cp "$(ldconfig -p | awk '/libz3\.so\.4/{print $NF; exit}')" /libz3.so.4 \
-    && rm -rf /var/lib/apt/lists/*
-
-=======
 ARG GATEWAY_BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97
->>>>>>> upstream/main
 FROM ${GATEWAY_BASE_IMAGE} AS gateway
 
 ARG TARGETARCH
 
 WORKDIR /app
 
-COPY --from=z3-runtime /libz3.so.4 /usr/lib/libz3.so.4
 COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /usr/local/bin/openshell-gateway
-
-ENV LD_LIBRARY_PATH=/usr/lib
 
 USER 1000:1000
 EXPOSE 8080

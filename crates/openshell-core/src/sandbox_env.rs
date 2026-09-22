@@ -243,14 +243,6 @@ pub const SANDBOX_UID: &str = "OPENSHELL_SANDBOX_UID";
 /// supervisor drops privileges to a group other than the UID's primary group.
 pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";
 
-<<<<<<< HEAD
-/// Landlock ABI observed after the child process successfully enforced the
-/// prepared filesystem ruleset.
-pub const LANDLOCK_ABI: &str = "OPENSHELL_LANDLOCK_ABI";
-
-/// Number of Landlock path rules applied to the child process.
-pub const LANDLOCK_RULES_APPLIED: &str = "OPENSHELL_LANDLOCK_RULES_APPLIED";
-=======
 /// Raw OCI `Config.User` declaration from the immutable image selected by a
 /// local container driver.
 ///
@@ -359,4 +351,3 @@ mod tests {
         assert!(MainProcessConfig::decode(r#"{"version":1,"command":[""],"tty":false}"#).is_err());
     }
 }
->>>>>>> upstream/main

@@ -9,14 +9,10 @@ mod relay;
 
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
-<<<<<<< HEAD
-use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard, ProcessIds};
-=======
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 #[cfg(target_os = "linux")]
 use crate::policy_dns::PolicyEndpointId;
 use crate::policy_dns::{MappingLookupError, ResolvedEndpointStore};
->>>>>>> upstream/main
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use crate::upstream_proxy::{self, UpstreamProxyConfig};
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
@@ -244,123 +240,6 @@ const CLOUD_METADATA_IPS: &[IpAddr] = &[
     IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 169, 254)),
 ];
 
-<<<<<<< HEAD
-/// Maximum total bytes for a streaming inference response body (32 MiB).
-#[cfg(not(test))]
-const MAX_STREAMING_BODY: usize = 32 * 1024 * 1024;
-// Keep unit tests deterministic without pushing tens of MiB through loopback.
-#[cfg(test)]
-const MAX_STREAMING_BODY: usize = 1024;
-
-/// Idle timeout per chunk when relaying streaming inference responses.
-///
-/// Reasoning models (e.g. nemotron-3-super, o1, o3) can pause for 60+ seconds
-/// between "thinking" and output phases. 120s provides headroom while still
-/// catching genuinely stuck streams.
-#[cfg(not(test))]
-const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-// Exercise idle-timeout truncation without slowing the full package test suite.
-#[cfg(test)]
-const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// Result of a proxy CONNECT policy decision.
-struct ConnectDecision {
-    action: NetworkAction,
-    /// Policy generation used for the L4 network decision.
-    generation: u64,
-    /// Resolved binary path.
-    binary: Option<PathBuf>,
-    /// PID owning the socket.
-    binary_pid: Option<u32>,
-    /// Effective UID/GID for the socket-owning process.
-    process_ids: Option<ProcessIds>,
-    /// Ancestor binary paths from process tree walk.
-    ancestors: Vec<PathBuf>,
-    /// Cmdline-derived absolute paths (for script detection).
-    cmdline_paths: Vec<PathBuf>,
-}
-
-/// Outcome of an inference interception attempt.
-///
-/// Returned by [`handle_inference_interception`] so the call site can emit
-/// a structured CONNECT deny log when the connection is not successfully routed.
-#[derive(Debug)]
-enum InferenceOutcome {
-    /// At least one request was successfully routed to a local inference backend.
-    Routed,
-    /// The connection was denied (TLS failure, non-inference request, etc.).
-    Denied { reason: String },
-}
-
-/// Inference routing context for sandbox-local execution.
-///
-/// Holds a `Router` (HTTP client) and cached sets of resolved routes.
-/// User routes serve `inference.local` traffic; system routes are consumed
-/// in-process by the supervisor for platform functions (e.g. agent harness).
-pub struct InferenceContext {
-    pub patterns: Vec<crate::l7::inference::InferenceApiPattern>,
-    router: openshell_router::Router,
-    /// Routes for the user-facing `inference.local` endpoint.
-    routes: Arc<tokio::sync::RwLock<Vec<openshell_router::config::ResolvedRoute>>>,
-    /// Routes for supervisor-only system inference (`sandbox-system`).
-    system_routes: Arc<tokio::sync::RwLock<Vec<openshell_router::config::ResolvedRoute>>>,
-}
-
-impl InferenceContext {
-    // `router`/`routes` are intentionally distinct nouns (the router and the
-    // route list it consumes); both names are clearer than alternatives.
-    #[allow(clippy::similar_names)]
-    pub fn new(
-        patterns: Vec<crate::l7::inference::InferenceApiPattern>,
-        router: openshell_router::Router,
-        routes: Vec<openshell_router::config::ResolvedRoute>,
-        system_routes: Vec<openshell_router::config::ResolvedRoute>,
-    ) -> Self {
-        Self {
-            patterns,
-            router,
-            routes: Arc::new(tokio::sync::RwLock::new(routes)),
-            system_routes: Arc::new(tokio::sync::RwLock::new(system_routes)),
-        }
-    }
-
-    /// Get a handle to the user route cache for background refresh.
-    pub fn route_cache(
-        &self,
-    ) -> Arc<tokio::sync::RwLock<Vec<openshell_router::config::ResolvedRoute>>> {
-        self.routes.clone()
-    }
-
-    /// Get a handle to the system route cache for background refresh.
-    pub fn system_route_cache(
-        &self,
-    ) -> Arc<tokio::sync::RwLock<Vec<openshell_router::config::ResolvedRoute>>> {
-        self.system_routes.clone()
-    }
-
-    /// Make an inference call using system routes (supervisor-only).
-    ///
-    /// This is the in-process API for platform functions. It bypasses the
-    /// CONNECT proxy entirely — the supervisor calls the router directly
-    /// from the host network namespace.
-    pub async fn system_inference(
-        &self,
-        protocol: &str,
-        method: &str,
-        path: &str,
-        headers: Vec<(String, String)>,
-        body: bytes::Bytes,
-    ) -> Result<openshell_router::ProxyResponse, openshell_router::RouterError> {
-        let routes = self.system_routes.read().await;
-        self.router
-            .proxy_with_candidates(protocol, method, path, headers, body, &routes)
-            .await
-    }
-}
-
-#[derive(Debug)]
-=======
->>>>>>> upstream/main
 pub struct ProxyHandle {
     #[allow(dead_code)]
     http_addr: Option<SocketAddr>,
@@ -2803,32 +2682,6 @@ async fn handle_mediated_connection(
         workload_addr,
         &host_lc,
         port,
-<<<<<<< HEAD
-        policy_name: matched_policy.clone().unwrap_or_default(),
-        binary_path: decision
-            .binary
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        ancestors: decision
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
-        cmdline_paths: decision
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
-        process_ids: decision.process_ids,
-        secret_resolver: secret_resolver.clone(),
-        activity_tx: activity_tx.clone(),
-        dynamic_credentials: dynamic_credentials.clone(),
-        token_grant_resolver: dynamic_credentials
-            .as_ref()
-            .map(|_| crate::l7::token_grant_injection::default_resolver()),
-    };
-=======
         &binary_str,
         &pid_str,
         &ancestors_str,
@@ -2858,7 +2711,6 @@ async fn handle_mediated_connection(
             endpoint_observation: endpoint_observation_tx,
         },
     );
->>>>>>> upstream/main
 
     if effective_tls_skip {
         // Policy validation rejects fail-closed middleware overlapping
@@ -3128,7 +2980,6 @@ async fn handle_mediated_connection(
 struct ResolvedIdentity {
     bin_path: PathBuf,
     binary_pid: u32,
-    process_ids: ProcessIds,
     ancestors: Vec<PathBuf>,
     cmdline_paths: Vec<PathBuf>,
     bin_hash: String,
@@ -3138,7 +2989,6 @@ struct ResolvedIdentity {
 #[derive(Debug, Eq, PartialEq)]
 struct PolicyIdentityKey {
     bin_path: PathBuf,
-    process_ids: ProcessIds,
     ancestors: Vec<PathBuf>,
     cmdline_paths: Vec<PathBuf>,
     bin_hash: String,
@@ -3149,7 +2999,6 @@ impl ResolvedIdentity {
     fn policy_key(&self) -> PolicyIdentityKey {
         PolicyIdentityKey {
             bin_path: self.bin_path.clone(),
-            process_ids: self.process_ids,
             ancestors: self.ancestors.clone(),
             cmdline_paths: self.cmdline_paths.clone(),
             bin_hash: self.bin_hash.clone(),
@@ -3165,7 +3014,6 @@ struct IdentityError {
     reason: String,
     binary: Option<PathBuf>,
     binary_pid: Option<u32>,
-    process_ids: Option<ProcessIds>,
     ancestors: Vec<PathBuf>,
 }
 
@@ -3180,19 +3028,8 @@ fn resolve_owner_identity(
             reason: format!("failed to resolve peer binary for PID {owner_pid}: {e}"),
             binary: None,
             binary_pid: Some(owner_pid),
-            process_ids: None,
             ancestors: vec![],
         })?;
-
-    let (uid, gid) =
-        crate::procfs::effective_process_ids(owner_pid).ok_or_else(|| IdentityError {
-            reason: format!("failed to resolve effective UID/GID for PID {owner_pid}"),
-            binary: Some(bin_path.clone()),
-            binary_pid: Some(owner_pid),
-            process_ids: None,
-            ancestors: vec![],
-        })?;
-    let process_ids = ProcessIds { uid, gid };
 
     let bin_hash = identity_cache
         .verify_or_cache_process_exe(&bin_path, owner_pid)
@@ -3200,7 +3037,6 @@ fn resolve_owner_identity(
             reason: format!("binary integrity check failed: {e}"),
             binary: Some(bin_path.clone()),
             binary_pid: Some(owner_pid),
-            process_ids: Some(process_ids),
             ancestors: vec![],
         })?;
 
@@ -3220,7 +3056,6 @@ fn resolve_owner_identity(
                 ),
                 binary: Some(bin_path.clone()),
                 binary_pid: Some(owner_pid),
-                process_ids: Some(process_ids),
                 ancestors: ancestors.clone(),
             })?;
     }
@@ -3232,7 +3067,6 @@ fn resolve_owner_identity(
     Ok(ResolvedIdentity {
         bin_path,
         binary_pid: owner_pid,
-        process_ids,
         ancestors,
         cmdline_paths,
         bin_hash,
@@ -3291,20 +3125,11 @@ fn resolve_process_identity(
 ) -> std::result::Result<ResolvedIdentity, IdentityError> {
     let socket_owners = crate::procfs::resolve_tcp_peer_socket_owners(entrypoint_pid, connection)
         .map_err(|e| IdentityError {
-<<<<<<< HEAD
-            reason: format!("failed to resolve peer binary: {e}"),
-            binary: None,
-            binary_pid: None,
-            process_ids: None,
-            ancestors: vec![],
-        })?;
-=======
         reason: format!("failed to resolve peer binary: {e}"),
         binary: None,
         binary_pid: None,
         ancestors: vec![],
     })?;
->>>>>>> upstream/main
 
     let mut identities = Vec::with_capacity(socket_owners.owners.len());
     for owner in &socket_owners.owners {
@@ -3323,7 +3148,6 @@ fn resolve_process_identity(
             ),
             binary: None,
             binary_pid: None,
-            process_ids: None,
             ancestors: vec![],
         });
     };
@@ -3350,7 +3174,6 @@ fn resolve_process_identity(
             ),
             binary: None,
             binary_pid: None,
-            process_ids: None,
             ancestors: vec![],
         });
     }
@@ -3378,7 +3201,6 @@ fn authorize_egress_intent(
                 identity: ProcessIdentityEvidence,
                 binary: Option<PathBuf>,
                 binary_pid: Option<u32>,
-                process_ids: Option<ProcessIds>,
                 ancestors: Vec<PathBuf>,
                 cmdline_paths: Vec<PathBuf>|
      -> EgressDecision {
@@ -3390,7 +3212,6 @@ fn authorize_egress_intent(
             endpoint: EndpointDecision::default(),
             binary,
             binary_pid,
-            process_ids,
             ancestors,
             cmdline_paths,
         }
@@ -3401,7 +3222,6 @@ fn authorize_egress_intent(
         return deny(
             "entrypoint process not yet spawned".into(),
             ProcessIdentityEvidence::Unavailable(IdentityUnavailableReason::LookupFailed),
-            None,
             None,
             None,
             vec![],
@@ -3418,7 +3238,6 @@ fn authorize_egress_intent(
                 ProcessIdentityEvidence::Unavailable(IdentityUnavailableReason::LookupFailed),
                 err.binary,
                 err.binary_pid,
-                err.process_ids,
                 err.ancestors,
                 vec![],
             );
@@ -3428,7 +3247,6 @@ fn authorize_egress_intent(
     let ResolvedIdentity {
         bin_path,
         binary_pid,
-        process_ids,
         ancestors,
         cmdline_paths,
         bin_hash,
@@ -3443,14 +3261,6 @@ fn authorize_egress_intent(
         cmdline_paths: cmdline_paths.clone(),
     };
 
-<<<<<<< HEAD
-    let result = match engine
-        .evaluate_network_action_with_generation_and_process_ids(&input, Some(process_ids))
-    {
-        Ok((action, generation)) => ConnectDecision {
-            action,
-            generation,
-=======
     let result = match engine.authorize_egress(&input) {
         Ok(authorization) => EgressDecision {
             intent: intent.clone(),
@@ -3458,10 +3268,8 @@ fn authorize_egress_intent(
             policy_generation: authorization.generation,
             identity: ProcessIdentityEvidence::Available,
             endpoint: EndpointDecision::from_authorization(&authorization),
->>>>>>> upstream/main
             binary: Some(bin_path),
             binary_pid: Some(binary_pid),
-            process_ids: Some(process_ids),
             ancestors,
             cmdline_paths,
         },
@@ -3470,7 +3278,6 @@ fn authorize_egress_intent(
             ProcessIdentityEvidence::Available,
             Some(bin_path),
             Some(binary_pid),
-            Some(process_ids),
             ancestors,
             cmdline_paths,
         ),
@@ -3624,7 +3431,6 @@ fn authorize_egress_intent(
         endpoint: EndpointDecision::default(),
         binary: None,
         binary_pid: None,
-        process_ids: None,
         ancestors: vec![],
         cmdline_paths: vec![],
     }
@@ -3725,39 +3531,6 @@ fn query_l7_route_snapshot(
         return None;
     }
 
-<<<<<<< HEAD
-    let input = crate::opa::NetworkInput {
-        host: host.to_string(),
-        port,
-        binary_path: decision.binary.clone().unwrap_or_default(),
-        binary_sha256: String::new(),
-        ancestors: decision.ancestors.clone(),
-        cmdline_paths: decision.cmdline_paths.clone(),
-    };
-
-    match engine
-        .query_endpoint_configs_with_generation_and_process_ids(&input, decision.process_ids)
-    {
-        Ok((vals, generation)) => Some(L7RouteSnapshot {
-            configs: vals
-                .into_iter()
-                .filter_map(|val| crate::l7::parse_l7_config(&val))
-                .map(|config| L7ConfigSnapshot { config })
-                .collect(),
-            generation,
-        }),
-        Err(e) => {
-            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(ActivityId::Fail)
-                .severity(SeverityId::Low)
-                .status(StatusId::Failure)
-                .dst_endpoint(Endpoint::from_domain(host, port))
-                .message(format!("Failed to query L7 endpoint config: {e}"))
-                .build();
-            ocsf_emit!(event);
-            None
-        }
-=======
     let configs: Vec<_> = decision
         .endpoint
         .policy_configs
@@ -3767,7 +3540,6 @@ fn query_l7_route_snapshot(
         .collect();
     if configs.is_empty() {
         return None;
->>>>>>> upstream/main
     }
     debug!(
         host,
@@ -3851,12 +3623,6 @@ fn query_endpoint_credential_guard(
         ancestors: decision.ancestors.clone(),
         cmdline_paths: decision.cmdline_paths.clone(),
     };
-<<<<<<< HEAD
-
-    match engine.query_endpoint_config_with_process_ids(&input, decision.process_ids) {
-        Ok(Some(val)) => crate::l7::parse_tls_mode(&val),
-        _ => crate::l7::TlsMode::Auto,
-=======
     let values = engine.query_endpoint_credential_guards(&input)?;
     let credentialed: Vec<_> = values
         .iter()
@@ -3865,7 +3631,6 @@ fn query_endpoint_credential_guard(
         .collect();
     if credentialed.is_empty() {
         return Ok(crate::l7::EndpointCredentialGuard::default());
->>>>>>> upstream/main
     }
 
     Ok(crate::l7::EndpointCredentialGuard {
@@ -4516,40 +4281,12 @@ fn query_allowed_ips(decision: &EgressDecision) -> Vec<String> {
         return vec![];
     }
 
-<<<<<<< HEAD
-    let input = crate::opa::NetworkInput {
-        host: host.to_string(),
-        port,
-        binary_path: decision.binary.clone().unwrap_or_default(),
-        binary_sha256: String::new(),
-        ancestors: decision.ancestors.clone(),
-        cmdline_paths: decision.cmdline_paths.clone(),
-    };
-
-    match engine.query_allowed_ips_with_process_ids(&input, decision.process_ids) {
-        Ok(ips) => ips,
-        Err(e) => {
-            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(ActivityId::Fail)
-                .severity(SeverityId::Low)
-                .status(StatusId::Failure)
-                .dst_endpoint(Endpoint::from_domain(host, port))
-                .message(format!(
-                    "Failed to query allowed_ips from endpoint config: {e}"
-                ))
-                .build();
-            ocsf_emit!(event);
-            vec![]
-        }
-    }
-=======
     decision
         .endpoint
         .policy_configs
         .first()
         .map(|config| endpoint_config_string_array(config, "allowed_ips"))
         .unwrap_or_default()
->>>>>>> upstream/main
 }
 
 fn endpoint_config_string_array(config: &regorus::Value, key: &str) -> Vec<String> {
@@ -4560,40 +4297,6 @@ fn endpoint_config_string_array(config: &regorus::Value, key: &str) -> Vec<Strin
     let Some(regorus::Value::Array(values)) = fields.get(&key) else {
         return Vec::new();
     };
-<<<<<<< HEAD
-
-    match engine.query_exact_declared_endpoint_host_with_process_ids(&input, decision.process_ids) {
-        Ok(is_exact_declared) => is_exact_declared,
-        Err(e) => {
-            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(ActivityId::Fail)
-                .severity(SeverityId::Low)
-                .status(StatusId::Failure)
-                .dst_endpoint(Endpoint::from_domain(host, port))
-                .message(format!("Failed to query exact declared endpoint host: {e}"))
-                .build();
-            ocsf_emit!(event);
-            false
-        }
-    }
-}
-
-/// Canonicalize the request-target for inference pattern detection.
-///
-/// Falls back to the raw path on canonicalization error: the request is then
-/// routed through the normal forward path, where `rest.rs::parse_http_request`
-/// will reject it properly. Returning the raw path here prevents a crafted
-/// target from bypassing inference routing without our detection logic having
-/// to implement a second, duplicate error-response surface.
-fn normalize_inference_path(path: &str) -> String {
-    match crate::l7::path::canonicalize_request_target(
-        path,
-        &crate::l7::path::CanonicalizeOptions::default(),
-    ) {
-        Ok((canon, _)) => canon.path,
-        Err(_) => path.to_string(),
-    }
-=======
     values
         .iter()
         .filter_map(|value| match value {
@@ -4601,7 +4304,6 @@ fn normalize_inference_path(path: &str) -> String {
             _ => None,
         })
         .collect()
->>>>>>> upstream/main
 }
 
 /// Extract the hostname from an absolute-form URI used in plain HTTP proxy requests.
@@ -5444,37 +5146,7 @@ async fn handle_forward_proxy(
     let mut forward_websocket_request =
         crate::l7::rest::request_is_websocket_upgrade(&forward_request_bytes);
     let mut request_body_credential_rewrite = false;
-<<<<<<< HEAD
-    let l7_ctx = crate::l7::relay::L7EvalContext {
-        host: host_lc.clone(),
-        port,
-        policy_name: matched_policy.clone().unwrap_or_default(),
-        binary_path: decision
-            .binary
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        ancestors: decision
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
-        cmdline_paths: decision
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
-        process_ids: decision.process_ids,
-        secret_resolver: secret_resolver.clone(),
-        activity_tx: activity_tx.cloned(),
-        dynamic_credentials: dynamic_credentials.clone(),
-        token_grant_resolver: dynamic_credentials
-            .as_ref()
-            .map(|_| crate::l7::token_grant_injection::default_resolver()),
-    };
-=======
     let mut deny_uninspected_credentials = false;
->>>>>>> upstream/main
     let mut l7_activity_pending = false;
 
     // 4b. If the endpoint has L7 config, evaluate the request against
@@ -9359,7 +9031,6 @@ network_policies:
             binary_path: "/usr/bin/curl".into(),
             ancestors: vec![],
             cmdline_paths: vec![],
-            process_ids: None,
             secret_resolver: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
@@ -9458,7 +9129,6 @@ network_policies:
             endpoint: EndpointDecision::from_authorization(&authorization),
             binary: Some(PathBuf::from("/usr/bin/node")),
             binary_pid: None,
-            process_ids: None,
             ancestors: vec![],
             cmdline_paths: vec![],
         };
@@ -9478,7 +9148,6 @@ network_policies:
             binary_path: "/usr/bin/node".to_string(),
             ancestors: vec![],
             cmdline_paths: vec![],
-            process_ids: None,
             secret_resolver: None,
             ..Default::default()
         };
@@ -9693,7 +9362,6 @@ network_policies:
             binary_path: "/usr/bin/node".to_string(),
             ancestors: vec![],
             cmdline_paths: vec![],
-            process_ids: None,
             secret_resolver: resolver,
             ..Default::default()
         };
@@ -9737,7 +9405,6 @@ network_policies:
             binary_path: "/usr/bin/node".to_string(),
             ancestors: vec![],
             cmdline_paths: vec![],
-            process_ids: None,
             secret_resolver: None,
             ..Default::default()
         };

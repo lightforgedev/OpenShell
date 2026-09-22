@@ -347,17 +347,8 @@ message L7QueryMatcher {
 // A binary identity for network policy matching.
 message NetworkBinary {
   string path = 1;
-<<<<<<< HEAD
-  // Deprecated: the harness concept has been removed. This field is ignored.
-  bool harness = 2 [deprecated = true];
-  // Optional effective UID scope. Zero means any UID.
-  uint32 uid = 3;
-  // Optional effective GID scope. Zero means any GID.
-  uint32 gid = 4;
-=======
   reserved 2;
   reserved "harness";
->>>>>>> upstream/main
 }
 
 // Request to get sandbox settings by sandbox name.

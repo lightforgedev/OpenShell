@@ -123,15 +123,10 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         sandbox_namespace: "default".to_string(),
         stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
         log_level: "info".to_string(),
-<<<<<<< HEAD
-        supervisor_bin: Some(PathBuf::from("/tmp/openshell-sandbox")),
-        supervisor_image_mount: None,
-=======
         sandbox_binary: Arc::new(b"\x7fELFtest".to_vec()),
         supervisor_image_id: "sha256:supervisor-test".to_string(),
         supervisor_grpc_endpoint: "https://host.openshell.internal:8443".to_string(),
         ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
->>>>>>> upstream/main
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
             cert: PathBuf::from("/tmp/tls.crt"),
@@ -1533,103 +1528,6 @@ fn build_binds_does_not_expose_host_runtime_material() {
 }
 
 #[test]
-fn supervisor_image_mount_replaces_gateway_local_bind() {
-    let image = concat!(
-        "example.com/openshell/supervisor@sha256:",
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-    );
-    let mut config = runtime_config();
-    config.supervisor_bin = None;
-    config.supervisor_image_mount = Some(image.to_string());
-
-    let body = build_container_create_body(&test_sandbox(), &config).unwrap();
-    let host_config = body.host_config.unwrap();
-    let binds = host_config.binds.unwrap();
-    let mounts = host_config.mounts.unwrap();
-
-    assert!(
-        !binds
-            .iter()
-            .any(|bind| bind.contains(SUPERVISOR_MOUNT_PATH))
-    );
-    assert!(mounts.iter().any(|mount| {
-        mount.typ == Some(MountTypeEnum::IMAGE)
-            && mount.source.as_deref() == Some(image)
-            && mount.target.as_deref() == Some(SUPERVISOR_CONTAINER_DIR)
-            && mount.read_only == Some(true)
-    }));
-    assert!(
-        !binds.iter().any(|bind| {
-            bind.contains(TLS_MOUNT_DIR) || bind.contains(SANDBOX_TOKEN_MOUNT_PATH)
-        })
-    );
-}
-
-#[test]
-fn gateway_material_archive_contains_restricted_token_and_tls_files() {
-    let tls = (b"ca".to_vec(), b"cert".to_vec(), b"key".to_vec());
-    let bytes = gateway_material_archive("signed-token", Some(&tls)).unwrap();
-    let mut archive = tar::Archive::new(bytes.as_slice());
-    let entries = archive.entries().unwrap();
-    let files = entries
-        .map(|entry| {
-            let mut entry = entry.unwrap();
-            let path = entry.path().unwrap().to_string_lossy().into_owned();
-            let mode = entry.header().mode().unwrap();
-            let mut contents = String::new();
-            entry.read_to_string(&mut contents).unwrap();
-            (path, (mode, contents))
-        })
-        .collect::<HashMap<_, _>>();
-
-    assert_eq!(
-        files.get("etc/openshell/auth/sandbox.jwt"),
-        Some(&(0o400, "signed-token\n".to_string()))
-    );
-    assert_eq!(
-        files.get("etc/openshell/tls/client/ca.crt"),
-        Some(&(0o444, "ca".to_string()))
-    );
-    assert_eq!(
-        files.get("etc/openshell/tls/client/tls.crt"),
-        Some(&(0o444, "cert".to_string()))
-    );
-    assert_eq!(
-        files.get("etc/openshell/tls/client/tls.key"),
-        Some(&(0o400, "key".to_string()))
-    );
-}
-
-#[test]
-fn supervisor_image_mount_requires_digest_and_exclusive_source() {
-    let mut config = DockerComputeConfig {
-        supervisor_image_mount: Some("example.com/openshell/supervisor:latest".to_string()),
-        ..Default::default()
-    };
-    assert!(
-        validate_supervisor_image_mount(&config)
-            .unwrap_err()
-            .to_string()
-            .contains("must be digest-pinned")
-    );
-
-    config.supervisor_image_mount = Some(
-        concat!(
-            "example.com/openshell/supervisor@sha256:",
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        )
-        .to_string(),
-    );
-    config.supervisor_bin = Some(PathBuf::from("/tmp/openshell-sandbox"));
-    assert!(
-        validate_supervisor_image_mount(&config)
-            .unwrap_err()
-            .to_string()
-            .contains("mutually exclusive")
-    );
-}
-
-#[test]
 fn build_container_create_body_includes_driver_config_mounts() {
     let mut sandbox = test_sandbox();
     let template = sandbox.spec.as_mut().unwrap().template.as_mut().unwrap();
@@ -2260,27 +2158,6 @@ fn validate_sandbox_rejects_unknown_driver_config_fields() {
 
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(err.message().contains("unknown field"));
-}
-
-#[test]
-fn validate_sandbox_rejects_removed_extra_hosts() {
-    let config = runtime_config();
-    let mut sandbox = test_sandbox();
-    sandbox
-        .spec
-        .as_mut()
-        .unwrap()
-        .template
-        .as_mut()
-        .unwrap()
-        .driver_config = Some(json_struct(serde_json::json!({
-        "extra_hosts": {"platform.internal": "10.240.7.9"}
-    })));
-
-    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
-
-    assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    assert!(err.message().contains("unknown field `extra_hosts`"));
 }
 
 #[test]

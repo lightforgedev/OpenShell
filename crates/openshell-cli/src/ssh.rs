@@ -105,15 +105,6 @@ async fn ssh_session_config(
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
-<<<<<<< HEAD
-    let response = client
-        .create_ssh_session(CreateSshSessionRequest {
-            sandbox_id: sandbox.object_id().to_string(),
-            org_id: String::new(),
-        })
-        .await
-        .into_diagnostic()?;
-=======
     let relay_registration_deadline =
         terminal_relay_registration_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
     let response = loop {
@@ -137,7 +128,6 @@ async fn ssh_session_config(
             Err(status) => return Err(status).into_diagnostic(),
         }
     };
->>>>>>> upstream/main
     let session = response.into_inner();
     validate_ssh_session_response(&session)
         .map_err(|err| miette::miette!("gateway returned invalid SSH session response: {err}"))?;
@@ -1520,15 +1510,9 @@ pub async fn sandbox_ssh_proxy(
     tx.send(TcpForwardFrame {
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
             TcpForwardInit {
-<<<<<<< HEAD
-                sandbox_id: sandbox_id.to_string(),
-                org_id: String::new(),
-                service_id: format!("ssh-proxy:{sandbox_id}"),
-=======
                 sandbox: sandbox_name.to_string(),
                 workspace: (workspace).to_string(),
                 service_id: format!("ssh-proxy:{sandbox_name}"),
->>>>>>> upstream/main
                 target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget {})),
                 authorization_token: token.to_string(),
             },

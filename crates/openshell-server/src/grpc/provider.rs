@@ -6974,11 +6974,6 @@ mod tests {
                         }],
                         binaries: vec![NetworkBinary {
                             path: "/usr/bin/advanced".to_string(),
-<<<<<<< HEAD
-                            harness: true,
-                            ..Default::default()
-=======
->>>>>>> upstream/main
                         }],
                         inference_capable: false,
                         discovery: None,

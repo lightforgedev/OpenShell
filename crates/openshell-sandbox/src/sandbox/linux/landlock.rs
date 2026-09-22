@@ -94,33 +94,6 @@ pub fn probe_availability() -> LandlockAvailability {
 pub struct PreparedRuleset {
     ruleset: landlock::RulesetCreated,
     compatibility: LandlockCompatibility,
-    evidence: LandlockEvidence,
-}
-
-/// Evidence that Landlock restrictions were successfully applied to a child.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LandlockEvidence {
-    pub abi: i32,
-    pub rules_applied: usize,
-}
-
-impl PreparedRuleset {
-    pub fn evidence_env(&self) -> Option<[(String, String); 2]> {
-        if !matches!(self.compatibility, LandlockCompatibility::HardRequirement) {
-            return None;
-        }
-
-        Some([
-            (
-                openshell_core::sandbox_env::LANDLOCK_ABI.to_string(),
-                self.evidence.abi.to_string(),
-            ),
-            (
-                openshell_core::sandbox_env::LANDLOCK_RULES_APPLIED.to_string(),
-                self.evidence.rules_applied.to_string(),
-            ),
-        ])
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,7 +247,7 @@ fn prepare_with_path_open_mode(
     // Probe first: kernels without Landlock (e.g. gVisor's sentry returns
     // ENOSYS) would otherwise log misleading "Applying"+"Built" events.
     let availability = probe_availability();
-    let LandlockAvailability::Available { abi: landlock_abi } = availability else {
+    if !matches!(availability, LandlockAvailability::Available { .. }) {
         match compatibility {
             LandlockCompatibility::BestEffort => {
                 openshell_ocsf::ocsf_emit!(
@@ -306,7 +279,7 @@ fn prepare_with_path_open_mode(
                 ));
             }
         }
-    };
+    }
 
     let total_paths = read_only.len() + read_write.len();
     // Read-only policy must also deny pathname truncation. The mandatory
@@ -330,8 +303,6 @@ fn prepare_with_path_open_mode(
     let result: Result<PreparedRuleset> = (|| {
         let access_all = AccessFs::from_all(abi);
         let access_read = AccessFs::from_read(abi);
-        let access_all_file = access_all & AccessFs::from_file(abi);
-        let access_read_file = access_read & AccessFs::from_file(abi);
 
         let mut ruleset = Ruleset::default();
         ruleset = ruleset
@@ -347,14 +318,7 @@ fn prepare_with_path_open_mode(
                 let allowed_access = access_for_path_fd(&path_fd, access_read, abi)?;
                 debug!(path = %path.display(), "Landlock allow read-only");
                 ruleset = ruleset
-<<<<<<< HEAD:crates/openshell-supervisor-process/src/sandbox/linux/landlock.rs
-                    .add_rule(PathBeneath::new(
-                        path_fd,
-                        access_for_path(path, access_read, access_read_file, compatibility)?,
-                    ))
-=======
                     .add_rule(PathBeneath::new(path_fd, allowed_access))
->>>>>>> upstream/main:crates/openshell-sandbox/src/sandbox/linux/landlock.rs
                     .into_diagnostic()?;
                 rules_applied += 1;
             }
@@ -365,14 +329,7 @@ fn prepare_with_path_open_mode(
                 let allowed_access = access_for_path_fd(&path_fd, access_all, abi)?;
                 debug!(path = %path.display(), "Landlock allow read-write");
                 ruleset = ruleset
-<<<<<<< HEAD:crates/openshell-supervisor-process/src/sandbox/linux/landlock.rs
-                    .add_rule(PathBeneath::new(
-                        path_fd,
-                        access_for_path(path, access_all, access_all_file, compatibility)?,
-                    ))
-=======
                     .add_rule(PathBeneath::new(path_fd, allowed_access))
->>>>>>> upstream/main:crates/openshell-sandbox/src/sandbox/linux/landlock.rs
                     .into_diagnostic()?;
                 rules_applied += 1;
             }
@@ -401,10 +358,6 @@ fn prepare_with_path_open_mode(
         Ok(PreparedRuleset {
             ruleset,
             compatibility: compatibility.clone(),
-            evidence: LandlockEvidence {
-                abi: landlock_abi,
-                rules_applied,
-            },
         })
     })();
 
@@ -448,7 +401,7 @@ fn prepare_with_path_open_mode(
 /// Respects the same `best_effort` / `hard_requirement` compatibility as
 /// [`prepare`]: if `restrict_self()` fails and the policy is `best_effort`,
 /// the error is logged and the sandbox continues without Landlock.
-pub fn enforce(prepared: PreparedRuleset) -> Result<Option<LandlockEvidence>> {
+pub fn enforce(prepared: PreparedRuleset) -> Result<()> {
     let result = prepared.ruleset.restrict_self().into_diagnostic();
     if let Err(err) = result {
         if matches!(prepared.compatibility, LandlockCompatibility::BestEffort) {
@@ -474,24 +427,13 @@ pub fn enforce(prepared: PreparedRuleset) -> Result<Option<LandlockEvidence>> {
                     ))
                     .build()
             );
-            return Ok(None);
+            return Ok(());
         }
         return Err(err);
     }
-    Ok(Some(prepared.evidence))
+    Ok(())
 }
 
-<<<<<<< HEAD:crates/openshell-supervisor-process/src/sandbox/linux/landlock.rs
-/// Legacy single-phase apply. Kept for non-Linux platforms and tests.
-/// On Linux, callers should use [`prepare`] + [`enforce`] for correct
-/// privilege ordering.
-#[allow(dead_code)] // Retained for backward compat; live callers use prepare+enforce.
-pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
-    if let Some(prepared) = prepare(policy, workdir)? {
-        let _ = enforce(prepared)?;
-    }
-    Ok(())
-=======
 /// Tailor a rule's access mask to the inode referenced by its already-open FD.
 ///
 /// Landlock directory-only rights such as `ReadDir` are invalid for regular
@@ -507,40 +449,6 @@ fn access_for_path_fd(
         rustix::fs::FileType::Directory => requested_access,
         _ => requested_access & AccessFs::from_file(abi),
     })
->>>>>>> upstream/main:crates/openshell-sandbox/src/sandbox/linux/landlock.rs
-}
-
-fn access_for_path(
-    path: &Path,
-    dir_access: BitFlags<AccessFs>,
-    file_access: BitFlags<AccessFs>,
-    compatibility: &LandlockCompatibility,
-) -> Result<BitFlags<AccessFs>> {
-    match path.metadata() {
-        Ok(metadata) if metadata.is_dir() => Ok(dir_access),
-        Ok(_) => Ok(file_access),
-        Err(err) => match compatibility {
-            LandlockCompatibility::BestEffort => {
-                openshell_ocsf::ocsf_emit!(
-                    openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                        .severity(openshell_ocsf::SeverityId::Medium)
-                        .status(openshell_ocsf::StatusId::Failure)
-                        .state(openshell_ocsf::StateId::Other, "degraded")
-                        .message(format!(
-                            "Skipping Landlock path with unreadable metadata (best-effort) [path:{} error:{err}]",
-                            path.display()
-                        ))
-                        .build()
-                );
-                Ok(file_access)
-            }
-            LandlockCompatibility::HardRequirement => Err(miette::miette!(
-                "Landlock path metadata unavailable in hard_requirement mode: {}: {}",
-                path.display(),
-                err,
-            )),
-        },
-    }
 }
 
 /// Attempt to open a path for Landlock rule creation.

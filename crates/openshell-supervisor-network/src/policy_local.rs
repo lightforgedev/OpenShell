@@ -1110,25 +1110,7 @@ fn network_rule_from_json(
     let binaries = rule
         .binaries
         .into_iter()
-<<<<<<< HEAD
-        .map(|binary| {
-            let mut proposal_binary = NetworkBinary {
-                path: binary.path,
-                uid: binary.uid,
-                gid: binary.gid,
-                ..Default::default()
-            };
-            // The deprecated harness bit is ignored by policy YAML, but OPA
-            // maps it to advisor_proposed to preserve the SSRF two-step flow.
-            #[allow(deprecated)]
-            {
-                proposal_binary.harness = true;
-            }
-            proposal_binary
-        })
-=======
         .map(|binary| NetworkBinary { path: binary.path })
->>>>>>> upstream/main
         .collect();
 
     Ok(NetworkPolicyRule {
@@ -1397,10 +1379,6 @@ struct NetworkEndpointJson {
 #[derive(Debug, Deserialize)]
 struct NetworkBinaryJson {
     path: String,
-    #[serde(default)]
-    uid: u32,
-    #[serde(default)]
-    gid: u32,
 }
 
 #[derive(Debug, Deserialize)]

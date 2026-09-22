@@ -1701,17 +1701,12 @@ message DeleteSandboxResponse {
 
 // Create SSH session request.
 message CreateSshSessionRequest {
-<<<<<<< HEAD
-  // Sandbox id.
-  string sandbox_id = 1;
-  // Optional nested organization runtime id. Empty selects the legacy
-  // sandbox-level runtime.
-  string org_id = 2;
-=======
   // Workspace scope. Only a named workspace selection is accepted.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   string sandbox = 1;
->>>>>>> upstream/main
+  // Optional nested organization runtime id. Empty selects the legacy
+  // sandbox-level runtime.
+  string org_id = 4;
 }
 
 // Create SSH session response.
@@ -1890,21 +1885,16 @@ message ExecSandboxRequest {
   // Initial terminal rows (used when tty=true, 0 = use default).
   uint32 rows = 9;
 
-<<<<<<< HEAD
-  // Optional OS user for this exec. Empty uses the sandbox policy user.
-  string run_as_user = 10;
-
-  // Optional nested organization runtime id. Empty selects the legacy
-  // sandbox-level runtime.
-  string org_id = 11;
-=======
   // Skip sourcing shell login/profile startup files before running the command.
   // When false (the default), the command runs through a login shell
   // (`bash -lc`) so user startup files (.bash_profile/.profile, and .bashrc if
   // sourced by them) are applied. When true, the command runs without those
   // files (`bash -c`), for automation that needs predictable startup behavior.
   bool no_login_shell = 10;
->>>>>>> upstream/main
+
+  // Optional nested organization runtime id. Empty selects the legacy
+  // sandbox-level runtime.
+  string org_id = 11;
 }
 
 // One stdout chunk from a sandbox exec.
@@ -1933,16 +1923,11 @@ message ExecSandboxEvent {
 
 // Initial frame for one TCP forward stream.
 message TcpForwardInit {
-<<<<<<< HEAD
-  // Sandbox id.
-  string sandbox_id = 1;
+  string sandbox = 1;
   // Optional nested organization runtime id. Empty selects the legacy
   // sandbox-level runtime.
   string org_id = 2;
-=======
-  string sandbox = 1;
   string workspace = 3;
->>>>>>> upstream/main
   // Optional service identifier for audit/correlation.
   string service_id = 4;
   // Target the gateway should request from the supervisor.

@@ -74,29 +74,7 @@ impl RegisteredSetting {
 ///    settable via `settings set`. The server validates that only registered
 ///    keys are accepted.
 /// 5. Add a unit test in this module's `tests` section to cover the new key.
-<<<<<<< HEAD
-pub const PROVIDERS_V2_ENABLED_KEY: &str = "providers_v2_enabled";
-
-/// Minimum OCSF severity rendered by the shorthand log layer.
 ///
-/// Defaults to `informational` when unset. Operators commonly set this to
-/// `medium` for container logs while leaving JSONL export available for full
-/// fidelity audit capture.
-pub const OCSF_SHORTHAND_MIN_SEVERITY_KEY: &str = "ocsf_shorthand_min_severity";
-
-/// Allowed values for [`OCSF_SHORTHAND_MIN_SEVERITY_KEY`].
-pub const OCSF_SHORTHAND_MIN_SEVERITY_VALUES: &[&str] = &[
-    "informational",
-    "low",
-    "medium",
-    "high",
-    "critical",
-    "fatal",
-];
-
-=======
-///
->>>>>>> upstream/main
 /// Sandbox-level opt-in for the agent-driven policy proposal surface.
 ///
 /// When true, the supervisor installs the `policy_advisor` skill, serves
@@ -145,14 +123,6 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
         kind: SettingValueKind::Bool,
         allowed_string_values: None,
     },
-<<<<<<< HEAD
-    // Minimum severity emitted by the human-readable OCSF shorthand log.
-    // Defaults to informational when unset.
-    RegisteredSetting {
-        key: OCSF_SHORTHAND_MIN_SEVERITY_KEY,
-        kind: SettingValueKind::String,
-        allowed_string_values: Some(OCSF_SHORTHAND_MIN_SEVERITY_VALUES),
-=======
     // Target OCSF schema version for JSONL downgrade. When set (e.g. "1.1"
     // or "1.3"), the JSONL layer strips fields and profiles that don't exist
     // in the target version. Empty or unset means no downgrade.
@@ -160,7 +130,6 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
         key: "ocsf_schema_version",
         kind: SettingValueKind::String,
         allowed_string_values: Some(OCSF_SCHEMA_VERSION_VALUES),
->>>>>>> upstream/main
     },
     // Sandbox-level opt-in for the agent-driven policy proposal surface.
     // See AGENT_POLICY_PROPOSALS_ENABLED_KEY for details. Defaults to false.
@@ -207,12 +176,7 @@ pub fn parse_bool_like(raw: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-<<<<<<< HEAD
-        OCSF_SHORTHAND_MIN_SEVERITY_KEY, OCSF_SHORTHAND_MIN_SEVERITY_VALUES,
-        PROPOSAL_APPROVAL_MODE_KEY, PROPOSAL_APPROVAL_MODE_VALUES, PROVIDERS_V2_ENABLED_KEY,
-=======
         OCSF_SCHEMA_VERSION_VALUES, PROPOSAL_APPROVAL_MODE_KEY, PROPOSAL_APPROVAL_MODE_VALUES,
->>>>>>> upstream/main
         REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind, parse_bool_like,
         registered_keys_csv, setting_for_key,
     };
@@ -279,25 +243,6 @@ mod tests {
         }
     }
 
-<<<<<<< HEAD
-    #[test]
-    fn ocsf_shorthand_min_severity_accepts_canonical_values_only() {
-        let setting = setting_for_key(OCSF_SHORTHAND_MIN_SEVERITY_KEY)
-            .expect("ocsf_shorthand_min_severity should be registered");
-        assert_eq!(setting.kind, SettingValueKind::String);
-        assert_eq!(
-            setting.allowed_string_values,
-            Some(OCSF_SHORTHAND_MIN_SEVERITY_VALUES)
-        );
-        for value in OCSF_SHORTHAND_MIN_SEVERITY_VALUES {
-            assert!(setting.validate_string_value(value).is_ok());
-        }
-        for bad in ["info", "med", "warn", "3", "Medium", ""] {
-            let err = setting
-                .validate_string_value(bad)
-                .expect_err(&format!("expected '{bad}' to be rejected"));
-            assert_eq!(err, OCSF_SHORTHAND_MIN_SEVERITY_VALUES);
-=======
     // ---- ocsf_schema_version validation ----
 
     #[test]
@@ -325,7 +270,6 @@ mod tests {
                 .validate_string_value(bad)
                 .expect_err(&format!("expected '{bad}' to be rejected"));
             assert_eq!(err, OCSF_SCHEMA_VERSION_VALUES);
->>>>>>> upstream/main
         }
     }
 

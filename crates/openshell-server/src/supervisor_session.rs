@@ -1343,6 +1343,7 @@ pub(crate) async fn forward_provider_status_query_to_owner(
 pub async fn open_routed_relay_with_target(
     state: &Arc<ServerState>,
     sandbox_id: &str,
+    org_id: &str,
     target: relay_open::Target,
     service_id: String,
     session_wait_timeout: Duration,
@@ -1358,6 +1359,7 @@ pub async fn open_routed_relay_with_target(
         channel_id: channel_id.clone(),
         target: Some(target),
         service_id,
+        org_id: org_id.to_string(),
     };
     open_routed_relay_with_message(state, sandbox_id, relay_open, session_wait_timeout).await
 }

@@ -341,25 +341,6 @@ openshell sandbox exec -n my-sandbox --tty -- /bin/bash
 
 OpenShell allocates a TTY automatically when both stdin and stdout are terminals. Force the behavior with `--tty` or disable it with `--no-tty`.
 
-<<<<<<< HEAD
-Run a command as a non-root OS user that exists inside the sandbox:
-
-```shell
-openshell sandbox exec -n my-sandbox --user ubuntu -- id
-```
-
-Use `--user` when a shared sandbox has multiple agent OS users and policy binds network grants to UID/GID. Root (`root` or `0`) is rejected.
-
-| Flag           | Purpose                                                  |
-| -------------- | -------------------------------------------------------- |
-| `-n`, `--name` | Sandbox to target.                                       |
-| `--workdir`    | Working directory for the command inside the sandbox.    |
-| `--timeout`    | Command timeout in seconds. `0` disables the timeout.    |
-| `--tty`        | Force TTY allocation.                                    |
-| `--no-tty`     | Disable TTY allocation even when attached to a terminal. |
-| `--env`        | Set an environment variable for the command (`KEY=VALUE`, repeatable). |
-| `--user`       | Run the command as a non-root OS user inside the sandbox. |
-=======
 | Flag              | Purpose                                                  |
 | ----------------- | -------------------------------------------------------- |
 | `-n`, `--name`    | Sandbox to target.                                       |
@@ -381,7 +362,6 @@ openshell sandbox exec -n my-sandbox --no-login-shell -- /usr/local/bin/managed-
 ```
 
 In this mode a sandbox user's login startup files cannot write to the command's output, create files, or otherwise affect the requested command before it starts. The command still runs under `bash -c`, which reads `BASH_ENV` if it is set in the command's environment. The default (login-shell) behavior is unchanged when the flag is omitted.
->>>>>>> upstream/main
 
 ## Set Environment Variables
 

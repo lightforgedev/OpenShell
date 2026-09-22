@@ -95,10 +95,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-<<<<<<< HEAD
-  build-cli:
-    needs: [pr_metadata]
-=======
       - name: Compute version
         id: version
         run: |
@@ -198,7 +194,6 @@ jobs:
 
   build-images:
     needs: [pr_metadata, build-binaries]
->>>>>>> upstream/main
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_any_e2e == 'true'
     permissions:
       contents: read

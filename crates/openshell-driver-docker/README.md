@@ -121,29 +121,12 @@ openshell sandbox create \
 
 ## Runtime Image
 
-<<<<<<< HEAD
-The Docker driver normally bind-mounts a host-side Linux `openshell-sandbox`
-binary into each sandbox container. When the gateway itself runs in a
-container against the host Docker socket, configure `supervisor_image_mount`
-with a digest-pinned supervisor image instead. The Docker daemon mounts that
-image directly at `/opt/openshell/bin`, avoiding gateway-local paths that the
-daemon cannot see. `supervisor_image_mount` is mutually exclusive with
-`supervisor_bin` and `supervisor_image`. Gateway startup probes the pinned image
-for the expected Linux supervisor binary. In this mode the gateway also uploads
-the sandbox JWT and configured guest TLS files into the stopped container
-before start; the trusted root supervisor owns them with read-only file modes,
-and workload identity validation rejects UID 0 before child startup.
-Gateway-local files are never exposed as invalid host bind paths.
-
-Binary resolution order when `supervisor_image_mount` is absent:
-=======
 `sandbox_runtime_image` contains the statically linked musl
 `/openshell-sandbox` binary. The driver extracts that binary as bytes and
 stages it into the stopped workload. `supervisor_image` contains the
 dynamically linked glibc `/openshell-supervisor` binary that runs in the
 host-networked supervisor container. Release and gateway image builds bake
 matching image tags into the binary.
->>>>>>> upstream/main
 
 ## Gateway session and TLS
 

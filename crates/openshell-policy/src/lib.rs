@@ -148,116 +148,6 @@ pub fn l7_config_alias_runtime_fields(
         }
     }
 }
-<<<<<<< HEAD
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GraphqlOperationDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_type: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    fields: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct L7RuleDef {
-    allow: L7AllowDef,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct L7AllowDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    method: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    path: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    command: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    query: BTreeMap<String, QueryMatcherDef>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_type: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    fields: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tool: Option<QueryMatcherDef>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    params: BTreeMap<String, ParamMatcherDef>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-enum QueryMatcherDef {
-    // Short form: `query: { repo: "NVIDIA/*" }`.
-    Glob(String),
-    // Expanded form: `query: { repo: { any: ["NVIDIA/*", "openai/*"] } }`.
-    Any(QueryAnyDef),
-}
-
-// MCP params can be authored as nested maps in YAML, but the runtime matcher
-// map remains flat so the Rego policy can share query-param matching.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-enum ParamMatcherDef {
-    Matcher(QueryMatcherDef),
-    Object(BTreeMap<String, Self>),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct QueryAnyDef {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    any: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct L7DenyRuleDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    method: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    path: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    command: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    query: BTreeMap<String, QueryMatcherDef>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_type: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    fields: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tool: Option<QueryMatcherDef>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    params: BTreeMap<String, ParamMatcherDef>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NetworkBinaryDef {
-    path: String,
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    uid: u32,
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    gid: u32,
-    /// Deprecated: ignored. Kept for backward compat with existing YAML files.
-    #[serde(default, skip_serializing)]
-    #[allow(dead_code)]
-    harness: bool,
-}
-
-// ---------------------------------------------------------------------------
-// YAML → proto conversion
-// ---------------------------------------------------------------------------
-
-=======
->>>>>>> upstream/main
 fn matcher_def_to_proto(matcher: QueryMatcherDef) -> L7QueryMatcher {
     match matcher {
         QueryMatcherDef::Glob(glob) => L7QueryMatcher { glob, any: vec![] },
@@ -708,16 +598,7 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                 binaries: rule
                     .binaries
                     .into_iter()
-<<<<<<< HEAD
-                    .map(|b| NetworkBinary {
-                        path: b.path,
-                        uid: b.uid,
-                        gid: b.gid,
-                        ..Default::default()
-                    })
-=======
                     .map(|b| NetworkBinary { path: b.path })
->>>>>>> upstream/main
                     .collect(),
             };
             (key, proto_rule)
@@ -907,12 +788,6 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
                     .iter()
                     .map(|b| NetworkBinaryDef {
                         path: b.path.clone(),
-<<<<<<< HEAD
-                        uid: b.uid,
-                        gid: b.gid,
-                        harness: false,
-=======
->>>>>>> upstream/main
                     })
                     .collect(),
             };
@@ -2469,30 +2344,6 @@ network_policies:
         assert_eq!(rule.endpoints[0].port, 443);
         assert_eq!(rule.binaries.len(), 1);
         assert_eq!(rule.binaries[0].path, "/usr/bin/curl");
-    }
-
-    #[test]
-    fn parse_and_serialize_uid_scoped_network_binary() {
-        let yaml = r"
-version: 1
-network_policies:
-  agent_a_curl:
-    endpoints:
-      - { host: api.github.com, port: 443 }
-    binaries:
-      - { path: /usr/bin/curl, uid: 20001, gid: 20001 }
-";
-        let policy = parse_sandbox_policy(yaml).expect("should parse");
-        let binary = &policy.network_policies["agent_a_curl"].binaries[0];
-        assert_eq!(binary.path, "/usr/bin/curl");
-        assert_eq!(binary.uid, 20001);
-        assert_eq!(binary.gid, 20001);
-
-        let serialized = serialize_sandbox_policy(&policy).expect("should serialize");
-        let reparsed = parse_sandbox_policy(&serialized).expect("serialized YAML should parse");
-        let reparsed_binary = &reparsed.network_policies["agent_a_curl"].binaries[0];
-        assert_eq!(reparsed_binary.uid, 20001);
-        assert_eq!(reparsed_binary.gid, 20001);
     }
 
     #[test]

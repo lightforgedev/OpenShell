@@ -5,19 +5,6 @@
 
 #![allow(clippy::result_large_err)]
 
-<<<<<<< HEAD
-use bollard::errors::Error as BollardError;
-use bollard::models::{
-    ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, CreateImageInfo,
-    DeviceRequest, EndpointSettings, HostConfig, Mount, MountImageOptions, MountTmpfsOptions,
-    MountTypeEnum, MountVolumeOptions, NetworkCreateRequest, NetworkingConfig, ProgressDetail,
-    RestartPolicy, RestartPolicyNameEnum, SystemInfo,
-};
-use bollard::query_parameters::{
-    CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
-    ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, StopContainerOptionsBuilder,
-    UploadToContainerOptionsBuilder,
-=======
 mod isolation;
 pub mod otel_tracing;
 
@@ -33,24 +20,16 @@ use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
     ListContainersOptionsBuilder, ListVolumesOptionsBuilder, LogsOptionsBuilder,
     RemoveContainerOptionsBuilder, StopContainerOptionsBuilder, UploadToContainerOptionsBuilder,
->>>>>>> upstream/main
 };
-use bollard::{Docker, body_full};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
-<<<<<<< HEAD
-    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_NAMESPACE, SUPERVISOR_CONTAINER_DIR, SUPERVISOR_IMAGE_BINARY_PATH,
-    supervisor_image_should_refresh,
-=======
     CONDITION_EXITED, CONDITION_RUNTIME_RESTART, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
     LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE,
     SANDBOX_RUNTIME_IMAGE_BINARY_PATH, extract_first_tar_entry, supervisor_image_should_refresh,
     temp_extract_container_name, validate_linux_elf_binary,
->>>>>>> upstream/main
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
@@ -201,19 +180,7 @@ pub struct DockerComputeConfig {
     /// the split runtime transitions to the explicit sandbox image setting.
     pub supervisor_bin: Option<PathBuf>,
 
-<<<<<<< HEAD
-    /// Optional digest-pinned image mounted directly by the Docker daemon at
-    /// the in-container supervisor directory. This is required when the
-    /// gateway itself runs in a container and gateway-local bind paths are not
-    /// visible to the host Docker daemon.
-    pub supervisor_image_mount: Option<String>,
-
-    /// Optional image used to extract the Linux `openshell-sandbox` binary.
-    /// Ignored when `supervisor_bin` is set. See `resolve_supervisor_bin` for
-    /// the full resolution order.
-=======
     /// Image containing the trusted `openshell-supervisor` binary.
->>>>>>> upstream/main
     pub supervisor_image: Option<String>,
 
     /// Host-side CA certificate for Docker sandbox mTLS.
@@ -293,7 +260,6 @@ impl Default for DockerComputeConfig {
             grpc_endpoint: String::new(),
             sandbox_runtime_image: None,
             supervisor_bin: None,
-            supervisor_image_mount: None,
             supervisor_image: None,
             guest_tls_ca: None,
             guest_tls_cert: None,
@@ -322,15 +288,10 @@ struct DockerDriverRuntimeConfig {
     sandbox_namespace: String,
     stop_timeout_secs: u32,
     log_level: String,
-<<<<<<< HEAD
-    supervisor_bin: Option<PathBuf>,
-    supervisor_image_mount: Option<String>,
-=======
     sandbox_binary: Arc<Vec<u8>>,
     supervisor_image_id: String,
     supervisor_grpc_endpoint: String,
     ssh_socket_path: String,
->>>>>>> upstream/main
     guest_tls: Option<DockerGuestTlsPaths>,
     gpu: DockerGpuRuntimeCapabilities,
     sandbox_pids_limit: Option<std::num::NonZeroI64>,
@@ -905,22 +866,6 @@ impl DockerComputeDriver {
                 docker_guest_tls_configured(&docker_config),
             );
         }
-<<<<<<< HEAD
-        let grpc_endpoint = docker_container_openshell_endpoint(
-            &docker_config.grpc_endpoint,
-            HOST_OPENSHELL_INTERNAL,
-            gateway_port,
-        );
-        let daemon_arch = normalize_docker_arch(version.arch.as_deref().unwrap_or_default());
-        let supervisor_image_mount = validate_supervisor_image_mount(&docker_config)?;
-        let supervisor_bin = if let Some(image) = supervisor_image_mount.as_deref() {
-            // Fail once at gateway startup if the pinned image does not carry
-            // the expected Linux supervisor binary.
-            let _ = extract_supervisor_bin_from_image(&docker, image).await?;
-            None
-        } else {
-            Some(resolve_supervisor_bin(&docker, &docker_config, &daemon_arch).await?)
-=======
         Url::parse(&docker_config.grpc_endpoint).map_err(|error| {
             Error::config(format!(
                 "invalid docker grpc_endpoint '{}': {error}",
@@ -958,7 +903,6 @@ impl DockerComputeDriver {
                         ))
                     })?,
             )
->>>>>>> upstream/main
         };
         let guest_tls = docker_guest_tls_paths(&docker_config)?;
         let driver = Self {
@@ -968,17 +912,11 @@ impl DockerComputeDriver {
                 image_pull_policy: docker_config.image_pull_policy,
                 sandbox_namespace: docker_config.sandbox_label.clone(),
                 stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
-<<<<<<< HEAD
-                log_level: config.log_level.clone(),
-                supervisor_bin,
-                supervisor_image_mount,
-=======
                 log_level: gateway_log_level.to_string(),
                 sandbox_binary,
                 supervisor_image_id,
                 supervisor_grpc_endpoint,
                 ssh_socket_path: docker_config.ssh_socket_path.clone(),
->>>>>>> upstream/main
                 guest_tls,
                 gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
@@ -1474,18 +1412,6 @@ impl DockerComputeDriver {
             .map_err(|status| {
                 DockerProvisioningFailure::new("IdentityResolutionFailed", status.message())
             })?;
-<<<<<<< HEAD
-        let upload_gateway_materials = self.config.supervisor_image_mount.is_some();
-        let token_file_created = if upload_gateway_materials {
-            false
-        } else {
-            write_sandbox_token_file(sandbox, &self.config)
-                .await
-                .map_err(|status| {
-                    DockerProvisioningFailure::new("SandboxTokenWriteFailed", status.message())
-                })?
-        };
-=======
         prepare_docker_boundary_state_dir(sandbox, &self.config).map_err(|status| {
             DockerProvisioningFailure::new("BoundaryStateCreateFailed", status.message())
         })?;
@@ -1516,7 +1442,6 @@ impl DockerComputeDriver {
                 "Docker control mode requires a gateway sandbox token",
             ));
         }
->>>>>>> upstream/main
 
         let container_name = container_name_for_sandbox(sandbox);
         let gpu_devices = match self
@@ -1635,31 +1560,6 @@ impl DockerComputeDriver {
             HashMap::from([("container_name".to_string(), container_name.clone())]),
         );
 
-<<<<<<< HEAD
-        if upload_gateway_materials
-            && let Err(status) = upload_gateway_materials_to_container(
-                &self.docker,
-                &container_name,
-                sandbox,
-                &self.config,
-            )
-            .await
-        {
-            let _ = self
-                .docker
-                .remove_container(
-                    &container_name,
-                    Some(RemoveContainerOptionsBuilder::default().force(true).build()),
-                )
-                .await;
-            return Err(DockerProvisioningFailure::new(
-                "SandboxMaterialUploadFailed",
-                status.message(),
-            ));
-        }
-
-        if let Err(err) = self.docker.start_container(&container_name, None).await {
-=======
         match prepare_docker_boundary_files(
             &self.docker,
             sandbox,
@@ -1704,7 +1604,6 @@ impl DockerComputeDriver {
         ))
         .await;
         if let Err(err) = start_result {
->>>>>>> upstream/main
             let cleanup = self
                 .docker
                 .remove_container(
@@ -3888,31 +3787,6 @@ fn build_binds(_sandbox: &DriverSandbox, _config: &DockerDriverRuntimeConfig) ->
 fn docker_boundary_state_dir(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
-<<<<<<< HEAD
-) -> Result<Vec<String>, Status> {
-    let mut binds = config
-        .supervisor_bin
-        .as_ref()
-        .map(|path| format!("{}:{}:ro,z", path.display(), SUPERVISOR_MOUNT_PATH))
-        .into_iter()
-        .collect::<Vec<_>>();
-    if config.supervisor_image_mount.is_none()
-        && let Some(tls) = &config.guest_tls
-    {
-        binds.push(format!("{}:{}:ro,z", tls.ca.display(), TLS_CA_MOUNT_PATH));
-        binds.push(format!(
-            "{}:{}:ro,z",
-            tls.cert.display(),
-            TLS_CERT_MOUNT_PATH
-        ));
-        binds.push(format!("{}:{}:ro,z", tls.key.display(), TLS_KEY_MOUNT_PATH));
-    }
-    if config.supervisor_image_mount.is_none()
-        && sandbox
-            .spec
-            .as_ref()
-            .is_some_and(|spec| !spec.sandbox_token.is_empty())
-=======
 ) -> Result<PathBuf, Status> {
     docker_boundary_state_dir_by_id(&sandbox.id, config)
 }
@@ -3985,7 +3859,6 @@ async fn create_docker_channel_volume(
         docker_supervisor_volume_name(sandbox, config),
     )
     .await
->>>>>>> upstream/main
     {
         let _ = remove_docker_volume(docker, &docker_channel_volume_name(sandbox, config)).await;
         return Err(error);
@@ -4069,87 +3942,6 @@ async fn remove_docker_volume(docker: &Docker, name: &str) -> Result<(), Status>
             }
         })
         .map_err(|error| Status::internal(format!("remove Docker sandbox runtime volume: {error}")))
-}
-
-async fn upload_gateway_materials_to_container(
-    docker: &Docker,
-    container_name: &str,
-    sandbox: &DriverSandbox,
-    config: &DockerDriverRuntimeConfig,
-) -> Result<(), Status> {
-    let token = sandbox
-        .spec
-        .as_ref()
-        .map(|spec| spec.sandbox_token.as_str())
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| Status::failed_precondition("sandbox token is required"))?;
-    let tls = if let Some(paths) = &config.guest_tls {
-        Some((
-            tokio::fs::read(&paths.ca)
-                .await
-                .map_err(|err| Status::internal(format!("read guest TLS CA failed: {err}")))?,
-            tokio::fs::read(&paths.cert)
-                .await
-                .map_err(|err| Status::internal(format!("read guest TLS cert failed: {err}")))?,
-            tokio::fs::read(&paths.key)
-                .await
-                .map_err(|err| Status::internal(format!("read guest TLS key failed: {err}")))?,
-        ))
-    } else {
-        None
-    };
-    let archive = gateway_material_archive(token, tls.as_ref())?;
-    docker
-        .upload_to_container(
-            container_name,
-            Some(UploadToContainerOptionsBuilder::default().path("/").build()),
-            body_full(archive.into()),
-        )
-        .await
-        .map_err(|err| internal_status("upload sandbox authentication material", err))
-}
-
-fn gateway_material_archive(
-    token: &str,
-    tls: Option<&(Vec<u8>, Vec<u8>, Vec<u8>)>,
-) -> Result<Vec<u8>, Status> {
-    let mut archive = tar::Builder::new(Vec::new());
-    append_gateway_material(
-        &mut archive,
-        "etc/openshell/auth/sandbox.jwt",
-        format!("{token}\n").as_bytes(),
-        0o400,
-    )?;
-    if let Some((ca, cert, key)) = tls {
-        append_gateway_material(&mut archive, "etc/openshell/tls/client/ca.crt", ca, 0o444)?;
-        append_gateway_material(
-            &mut archive,
-            "etc/openshell/tls/client/tls.crt",
-            cert,
-            0o444,
-        )?;
-        append_gateway_material(&mut archive, "etc/openshell/tls/client/tls.key", key, 0o400)?;
-    }
-    archive
-        .into_inner()
-        .map_err(|err| Status::internal(format!("finish sandbox material archive failed: {err}")))
-}
-
-fn append_gateway_material(
-    archive: &mut tar::Builder<Vec<u8>>,
-    path: &str,
-    contents: &[u8],
-    mode: u32,
-) -> Result<(), Status> {
-    let mut header = tar::Header::new_gnu();
-    header.set_size(contents.len() as u64);
-    header.set_mode(mode);
-    header.set_uid(0);
-    header.set_gid(0);
-    header.set_cksum();
-    archive
-        .append_data(&mut header, path, contents)
-        .map_err(|err| Status::internal(format!("append sandbox material failed: {err}")))
 }
 
 fn sandbox_token_host_path(
@@ -5651,22 +5443,6 @@ fn build_container_create_body_for_image(
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
     let resource_limits = docker_resource_limits(template)?;
-<<<<<<< HEAD
-    let mut user_mounts = docker_driver_mounts(driver_config)?;
-    if let Some(image) = &config.supervisor_image_mount {
-        user_mounts.insert(
-            0,
-            Mount {
-                target: Some(SUPERVISOR_CONTAINER_DIR.to_string()),
-                source: Some(image.clone()),
-                typ: Some(MountTypeEnum::IMAGE),
-                read_only: Some(true),
-                image_options: Some(MountImageOptions::default()),
-                ..Default::default()
-            },
-        );
-    }
-=======
     let workspace_root = driver_mounts::resolve_oci_workspace_root(&image.working_dir)
         .map_err(Status::failed_precondition)?;
     driver_mounts::validate_workspace_control_path(&workspace_root, BOUNDARY_MOUNT_PATH)
@@ -5709,7 +5485,6 @@ fn build_container_create_body_for_image(
         }),
         ..Default::default()
     });
->>>>>>> upstream/main
     let user_bind_strings = docker_driver_bind_strings(driver_config)?;
     let device_requests = gpu_device_ids.map(|device_ids| {
         vec![DeviceRequest {
@@ -5816,29 +5591,6 @@ fn build_container_create_body_for_image(
         networking_config: None,
         ..Default::default()
     })
-}
-
-fn validate_supervisor_image_mount(config: &DockerComputeConfig) -> CoreResult<Option<String>> {
-    let Some(image) = config.supervisor_image_mount.as_deref() else {
-        return Ok(None);
-    };
-    if config.supervisor_bin.is_some() || config.supervisor_image.is_some() {
-        return Err(Error::config(
-            "docker supervisor_image_mount is mutually exclusive with supervisor_bin and supervisor_image",
-        ));
-    }
-    let digest = image
-        .rsplit_once("@sha256:")
-        .filter(|(name, _)| !name.is_empty())
-        .map(|(_, digest)| digest);
-    if !digest.is_some_and(|digest| {
-        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-    }) {
-        return Err(Error::config(
-            "docker supervisor_image_mount must be digest-pinned",
-        ));
-    }
-    Ok(Some(image.to_string()))
 }
 
 /// Reject driver requests that arrive with neither a sandbox id nor a

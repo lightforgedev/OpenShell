@@ -741,16 +741,6 @@ pub fn policy_covers_rule(policy: &SandboxPolicy, proposed: &NetworkPolicyRule) 
         return false;
     }
     proposed.endpoints.iter().all(|target_endpoint| {
-<<<<<<< HEAD
-        policy.network_policies.values().any(|rule| {
-            rule.endpoints.iter().any(|endpoint| {
-                endpoints_overlap(endpoint, target_endpoint)
-                    && endpoint_l7_covers(endpoint, target_endpoint)
-            }) && proposed.binaries.iter().all(|target_binary| {
-                rule.binaries
-                    .iter()
-                    .any(|binary| binary_scope_matches(binary, target_binary))
-=======
         authorization_ports(target_endpoint)
             .into_iter()
             .all(|target_port| {
@@ -770,7 +760,6 @@ pub fn policy_covers_rule(policy: &SandboxPolicy, proposed: &NetworkPolicyRule) 
                             && rule_authorizes(rule, target_endpoint, target_port)
                     })
                 })
->>>>>>> upstream/main
             })
     })
 }
@@ -2294,22 +2283,9 @@ fn expand_access_preset(protocol: &str, access: &str) -> Option<Vec<L7Rule>> {
 }
 
 fn append_unique_binaries(existing: &mut Vec<NetworkBinary>, incoming: &[NetworkBinary]) {
-    let mut seen: HashSet<(String, u32, u32)> = existing.iter().map(binary_scope_key).collect();
+    let mut seen: HashSet<String> = existing.iter().map(|binary| binary.path.clone()).collect();
     for binary in incoming {
-<<<<<<< HEAD
-        if let Some(existing_binary) = existing
-            .iter_mut()
-            .find(|item| binary_scope_matches(item, binary))
-        {
-            if !is_advisor_proposed_binary(binary) {
-                mark_user_declared_binary(existing_binary);
-            }
-            continue;
-        }
-        if seen.insert(binary_scope_key(binary)) {
-=======
         if seen.insert(binary.path.clone()) {
->>>>>>> upstream/main
             existing.push(binary.clone());
         }
     }
@@ -2367,46 +2343,8 @@ fn dedup_strings(values: &mut Vec<String>) {
 }
 
 fn dedup_binaries(values: &mut Vec<NetworkBinary>) {
-<<<<<<< HEAD
-    let mut deduped: Vec<NetworkBinary> = Vec::with_capacity(values.len());
-    for binary in std::mem::take(values) {
-        if let Some(existing) = deduped
-            .iter_mut()
-            .find(|item| binary_scope_matches(item, &binary))
-        {
-            if !is_advisor_proposed_binary(&binary) {
-                mark_user_declared_binary(existing);
-            }
-        } else {
-            deduped.push(binary);
-        }
-    }
-    *values = deduped;
-}
-
-fn binary_scope_key(binary: &NetworkBinary) -> (String, u32, u32) {
-    (binary.path.clone(), binary.uid, binary.gid)
-}
-
-fn binary_scope_matches(left: &NetworkBinary, right: &NetworkBinary) -> bool {
-    left.path == right.path && left.uid == right.uid && left.gid == right.gid
-}
-
-fn is_advisor_proposed_binary(binary: &NetworkBinary) -> bool {
-    #[allow(deprecated)]
-    let advisor_proposed = binary.harness;
-    advisor_proposed
-}
-
-fn mark_user_declared_binary(binary: &mut NetworkBinary) {
-    #[allow(deprecated)]
-    {
-        binary.harness = false;
-    }
-=======
     let mut seen = HashSet::new();
     values.retain(|binary| seen.insert(binary.path.clone()));
->>>>>>> upstream/main
 }
 
 fn dedup_l7_rules(values: &mut Vec<L7Rule>) {

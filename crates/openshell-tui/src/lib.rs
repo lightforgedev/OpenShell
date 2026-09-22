@@ -954,13 +954,8 @@ async fn handle_shell_connect(
     let workspace = app.selected_sandbox_workspace();
     let session = {
         let req = openshell_core::proto::CreateSshSessionRequest {
-<<<<<<< HEAD
-            sandbox_id: sandbox_id.clone(),
-            org_id: String::new(),
-=======
             sandbox: sandbox_name.clone(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace.clone())),
->>>>>>> upstream/main
         };
         match tokio::time::timeout(Duration::from_secs(5), app.client.create_ssh_session(req)).await
         {
@@ -1093,15 +1088,10 @@ async fn handle_exec_command(
 ) -> Result<()> {
     let session = {
         let req = openshell_core::proto::CreateSshSessionRequest {
-<<<<<<< HEAD
-            sandbox_id: sandbox_id.clone(),
-            org_id: String::new(),
-=======
             sandbox: sandbox_name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
->>>>>>> upstream/main
         };
         match tokio::time::timeout(Duration::from_secs(5), app.client.create_ssh_session(req)).await
         {
@@ -1566,15 +1556,10 @@ async fn start_port_forwards(
     // Create SSH session.
     let session = {
         let req = openshell_core::proto::CreateSshSessionRequest {
-<<<<<<< HEAD
-            sandbox_id: sandbox_id.to_string(),
-            org_id: String::new(),
-=======
             sandbox: sandbox_name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
->>>>>>> upstream/main
         };
         match tokio::time::timeout(Duration::from_secs(10), client.create_ssh_session(req)).await {
             Ok(Ok(resp)) => resp.into_inner(),

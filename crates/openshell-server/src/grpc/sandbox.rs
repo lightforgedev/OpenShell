@@ -65,15 +65,10 @@ use super::provider::{
     get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique_with_catalog,
 };
 use super::validation::{
-<<<<<<< HEAD
-    level_matches, source_matches, validate_exec_request_fields,
-    validate_no_reserved_provider_policy_keys, validate_optional_org_id, validate_policy_safety,
-    validate_sandbox_spec,
-=======
     level_matches, source_matches, validate_and_canonicalize_policy, validate_dns1123_label,
     validate_exec_request_fields, validate_no_reserved_provider_policy_keys,
-    validate_policy_safety, validate_sandbox_governance_spec, validate_sandbox_spec,
->>>>>>> upstream/main
+    validate_optional_org_id, validate_policy_safety, validate_sandbox_governance_spec,
+    validate_sandbox_spec,
 };
 use super::{MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN};
 use crate::persistence::current_time_ms;
@@ -2028,27 +2023,16 @@ pub(super) async fn handle_exec_sandbox(
     // Open a relay channel through the supervisor session. Use a 15s
     // session-wait timeout, enough to cover a transient supervisor reconnect
     // while still failing quickly during normal operation.
-<<<<<<< HEAD
-    let (channel_id, relay_rx) = state
-        .supervisor_sessions
-        .open_relay_for_org(
-            sandbox.object_id(),
-            &req.org_id,
-            std::time::Duration::from_secs(15),
-        )
-        .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
-=======
     let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
         state,
         sandbox.object_id(),
+        &req.org_id,
         relay_open::Target::Ssh(SshRelayTarget {}),
         String::new(),
         std::time::Duration::from_secs(15),
     )
     .await
     .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
->>>>>>> upstream/main
 
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
@@ -2060,12 +2044,7 @@ pub(super) async fn handle_exec_sandbox(
         .transpose()
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let request_tty = req.tty;
-<<<<<<< HEAD
-    let run_as_user = req.run_as_user;
-    let org_id = req.org_id;
-=======
     let (cols, rows) = pty_dimensions(req.cols, req.rows);
->>>>>>> upstream/main
 
     let sandbox_id = sandbox.object_id().to_string();
 
@@ -2089,17 +2068,13 @@ pub(super) async fn handle_exec_sandbox(
             stdin_payload,
             execution_timeout,
             request_tty,
-<<<<<<< HEAD
-            &run_as_user,
-=======
             no_login_shell,
             cols,
             rows,
->>>>>>> upstream/main
         )
         .await
         {
-            warn!(sandbox_id = %sandbox_id, org_id = %org_id, error = %err, "ExecSandbox failed");
+            warn!(sandbox_id = %sandbox_id, error = %err, "ExecSandbox failed");
             let _ = tx.send(Err(err)).await;
         }
     });
@@ -2182,32 +2157,18 @@ pub(super) async fn handle_forward_tcp(
     }
 
     let connection_guard = acquire_forward_connection_guard(state, &init, &sandbox).await?;
-<<<<<<< HEAD
-    let (channel_id, relay_rx) = state
-        .supervisor_sessions
-        .open_relay_with_target(
-            sandbox.object_id(),
-            &init.org_id,
-            target,
-            init.service_id.clone(),
-            std::time::Duration::from_secs(15),
-        )
-        .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
-=======
     let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
         state,
         sandbox.object_id(),
+        &init.org_id,
         target,
         init.service_id.clone(),
         std::time::Duration::from_secs(15),
     )
     .await
     .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
->>>>>>> upstream/main
 
     let sandbox_id = sandbox.object_id().to_string();
-    let org_id = init.org_id.clone();
     let (tx, rx) = mpsc::channel::<Result<TcpForwardFrame, Status>>(256);
     tokio::spawn(async move {
         let _connection_guard = connection_guard;
@@ -2218,7 +2179,6 @@ pub(super) async fn handle_forward_tcp(
         };
 
         bridge_forward_tcp_stream(inbound, relay_stream, tx, &sandbox_id, &channel_id).await;
-        debug!(sandbox_id = %sandbox_id, org_id = %org_id, channel_id = %channel_id, "ForwardTcp relay ended");
     });
 
     let stream: Pin<
@@ -2348,14 +2308,6 @@ fn decrement_ssh_connection_count(counts: &std::sync::Mutex<HashMap<String, u32>
 }
 
 fn validate_tcp_forward_init(init: &TcpForwardInit) -> Result<relay_open::Target, Status> {
-<<<<<<< HEAD
-    if init.sandbox_id.is_empty() {
-        return Err(Status::invalid_argument("sandbox_id is required"));
-    }
-    validate_optional_org_id(&init.org_id)?;
-
-=======
->>>>>>> upstream/main
     if let Some(target) = init.target.as_ref() {
         return match target {
             tcp_forward_init::Target::Ssh(_) => {
@@ -2529,28 +2481,10 @@ pub(super) async fn handle_exec_sandbox_interactive(
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
-<<<<<<< HEAD
-    let (channel_id, relay_rx) = state
-        .supervisor_sessions
-        .open_relay_for_org(
-            sandbox.object_id(),
-            &req.org_id,
-            std::time::Duration::from_secs(15),
-        )
-        .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
-
-    let command_str = build_remote_exec_command(&req)
-        .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
-    let timeout_seconds = req.timeout_seconds;
-    let cols = if req.cols == 0 { 80 } else { req.cols };
-    let rows = if req.rows == 0 { 24 } else { req.rows };
-    let run_as_user = req.run_as_user;
-    let org_id = req.org_id;
-=======
     let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
         state,
         sandbox.object_id(),
+        &req.org_id,
         relay_open::Target::Ssh(SshRelayTarget {}),
         String::new(),
         std::time::Duration::from_secs(15),
@@ -2569,7 +2503,6 @@ pub(super) async fn handle_exec_sandbox_interactive(
         .transpose()
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let (cols, rows) = pty_dimensions(req.cols, req.rows);
->>>>>>> upstream/main
 
     let sandbox_id = sandbox.object_id().to_string();
 
@@ -2599,11 +2532,10 @@ pub(super) async fn handle_exec_sandbox_interactive(
             execution_timeout,
             cols,
             rows,
-            &run_as_user,
         )
         .await
         {
-            warn!(sandbox_id = %sandbox_id, org_id = %org_id, error = %err, "ExecSandboxInteractive failed");
+            warn!(sandbox_id = %sandbox_id, error = %err, "ExecSandboxInteractive failed");
             let _ = tx.send(Err(err)).await;
         }
     });
@@ -2628,12 +2560,7 @@ pub(super) async fn handle_create_ssh_session(
 ) -> Result<Response<CreateSshSessionResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-<<<<<<< HEAD
-    if req.sandbox_id.is_empty() {
-        return Err(Status::invalid_argument("sandbox_id is required"));
-    }
     validate_optional_org_id(&req.org_id)?;
-=======
     let sandbox = resolve_and_authorize_sandbox_name(
         state,
         &principal,
@@ -2643,7 +2570,6 @@ pub(super) async fn handle_create_ssh_session(
     )
     .await?;
     let sandbox_id = sandbox.object_id().to_string();
->>>>>>> upstream/main
 
     if !sandbox_relay_reachable(state, &sandbox) {
         return Err(Status::failed_precondition("sandbox is not ready"));
@@ -2668,15 +2594,11 @@ pub(super) async fn handle_create_ssh_session(
             deletion_time: None,
         }),
         sandbox_id: sandbox_id.clone(),
+        org_id: req.org_id.clone(),
         token: token.clone(),
         revoked: false,
-<<<<<<< HEAD
-        expires_at_ms,
-        org_id: req.org_id.clone(),
-=======
         expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(expires_at_ms)
             .map_err(|error| Status::internal(error.to_string()))?,
->>>>>>> upstream/main
     };
 
     // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
@@ -2714,12 +2636,8 @@ pub(super) async fn handle_create_ssh_session(
     };
 
     Ok(Response::new(CreateSshSessionResponse {
-<<<<<<< HEAD
-        sandbox_id: req.sandbox_id,
-        org_id: req.org_id,
-=======
         sandbox_id,
->>>>>>> upstream/main
+        org_id: req.org_id,
         token,
         gateway_host,
         gateway_port: gateway_port.into(),
@@ -2874,14 +2792,6 @@ fn exec_ssh_client_config() -> russh::client::Config {
     }
 }
 
-fn exec_ssh_user(run_as_user: &str) -> &str {
-    if run_as_user.is_empty() {
-        "sandbox"
-    } else {
-        run_as_user
-    }
-}
-
 /// Treat channel EOF before an exit status as relay failure, not exit code 1.
 fn exec_loop_result(exit_code: Option<i32>) -> Result<i32, Status> {
     exit_code.map_or_else(
@@ -2933,13 +2843,9 @@ async fn stream_exec_over_relay(
     stdin_payload: Vec<u8>,
     execution_timeout: Option<std::time::Duration>,
     request_tty: bool,
-<<<<<<< HEAD
-    run_as_user: &str,
-=======
     no_login_shell: bool,
     cols: u32,
     rows: u32,
->>>>>>> upstream/main
 ) -> Result<(), Status> {
     let command_preview: String = command
         .chars()
@@ -2964,12 +2870,8 @@ async fn stream_exec_over_relay(
         command,
         stdin_payload,
         request_tty,
-<<<<<<< HEAD
-        run_as_user,
-=======
         no_login_shell,
         (cols, rows),
->>>>>>> upstream/main
         tx.clone(),
     );
 
@@ -3025,7 +2927,6 @@ async fn stream_interactive_exec_over_relay(
     execution_timeout: Option<std::time::Duration>,
     cols: u32,
     rows: u32,
-    run_as_user: &str,
 ) -> Result<(), Status> {
     let command_preview: String = command
         .chars()
@@ -3052,7 +2953,6 @@ async fn stream_interactive_exec_over_relay(
         no_login_shell,
         cols,
         rows,
-        run_as_user,
         tx.clone(),
     );
 
@@ -3104,7 +3004,6 @@ async fn run_interactive_exec_with_russh(
     no_login_shell: bool,
     cols: u32,
     rows: u32,
-    run_as_user: &str,
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
 ) -> Result<i32, Status> {
     use openshell_core::proto::exec_sandbox_input::Payload;
@@ -3138,7 +3037,7 @@ async fn run_interactive_exec_with_russh(
         .map_err(|e| Status::internal(format!("failed to establish ssh transport: {e}")))?;
 
     match client
-        .authenticate_none(exec_ssh_user(run_as_user))
+        .authenticate_none("sandbox")
         .await
         .map_err(|e| Status::internal(format!("failed to authenticate ssh session: {e}")))?
     {
@@ -3317,12 +3216,8 @@ async fn run_exec_with_russh(
     command: &str,
     stdin_payload: Vec<u8>,
     request_tty: bool,
-<<<<<<< HEAD
-    run_as_user: &str,
-=======
     no_shell_login: bool,
     pty_size: (u32, u32),
->>>>>>> upstream/main
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
 ) -> Result<i32, Status> {
     let (cols, rows) = pty_size;
@@ -3356,7 +3251,7 @@ async fn run_exec_with_russh(
         .map_err(|e| Status::internal(format!("failed to establish ssh transport: {e}")))?;
 
     match client
-        .authenticate_none(exec_ssh_user(run_as_user))
+        .authenticate_none("sandbox")
         .await
         .map_err(|e| Status::internal(format!("failed to authenticate ssh session: {e}")))?
     {
@@ -3731,13 +3626,8 @@ mod tests {
     fn tcp_forward_init_allows_loopback_targets() {
         for host in ["127.0.0.1", "::1", "localhost"] {
             let init = TcpForwardInit {
-<<<<<<< HEAD
-                sandbox_id: "sbx".to_string(),
-                org_id: String::new(),
-=======
                 sandbox: "sbx".to_string(),
                 workspace: String::new(),
->>>>>>> upstream/main
                 service_id: String::new(),
                 target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
                     host: host.to_string(),
@@ -3752,13 +3642,8 @@ mod tests {
     #[test]
     fn tcp_forward_init_allows_ssh_target() {
         let init = TcpForwardInit {
-<<<<<<< HEAD
-            sandbox_id: "sbx".to_string(),
-            org_id: "org.alpha-1".to_string(),
-=======
             sandbox: "sbx".to_string(),
             workspace: String::new(),
->>>>>>> upstream/main
             target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget::default())),
             ..Default::default()
         };
@@ -3769,31 +3654,10 @@ mod tests {
     }
 
     #[test]
-    fn tcp_forward_init_rejects_invalid_org_id() {
-        let init = TcpForwardInit {
-            sandbox_id: "sbx".to_string(),
-            org_id: "org/alpha".to_string(),
-            target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget::default())),
-            ..Default::default()
-        };
-        assert_eq!(
-            validate_tcp_forward_init(&init)
-                .expect_err("invalid org id rejected")
-                .message(),
-            "org_id must contain only ASCII letters, digits, '_', '-', or '.'"
-        );
-    }
-
-    #[test]
     fn tcp_forward_init_rejects_non_loopback_targets() {
         let init = TcpForwardInit {
-<<<<<<< HEAD
-            sandbox_id: "sbx".to_string(),
-            org_id: String::new(),
-=======
             sandbox: "sbx".to_string(),
             workspace: String::new(),
->>>>>>> upstream/main
             service_id: String::new(),
             target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
                 host: "example.com".to_string(),
@@ -3812,13 +3676,8 @@ mod tests {
     #[test]
     fn tcp_forward_init_rejects_invalid_port() {
         let init = TcpForwardInit {
-<<<<<<< HEAD
-            sandbox_id: "sbx".to_string(),
-            org_id: String::new(),
-=======
             sandbox: "sbx".to_string(),
             workspace: String::new(),
->>>>>>> upstream/main
             service_id: String::new(),
             target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
                 host: "127.0.0.1".to_string(),
@@ -6819,17 +6678,11 @@ mod tests {
         let handle1 = tokio::spawn(async move {
             handle_create_ssh_session(
                 &state1,
-<<<<<<< HEAD
-                Request::new(CreateSshSessionRequest {
-                    sandbox_id: "sandbox-work".to_string(),
-                    org_id: String::new(),
-=======
                 authed_request(CreateSshSessionRequest {
                     sandbox: "work".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
->>>>>>> upstream/main
                 }),
             )
             .await
@@ -6839,17 +6692,11 @@ mod tests {
         let handle2 = tokio::spawn(async move {
             handle_create_ssh_session(
                 &state2,
-<<<<<<< HEAD
-                Request::new(CreateSshSessionRequest {
-                    sandbox_id: "sandbox-work".to_string(),
-                    org_id: String::new(),
-=======
                 authed_request(CreateSshSessionRequest {
                     sandbox: "work".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
->>>>>>> upstream/main
                 }),
             )
             .await
@@ -6884,44 +6731,6 @@ mod tests {
     }
 
     #[tokio::test]
-<<<<<<< HEAD
-    async fn create_ssh_session_persists_org_id() {
-        let state = test_server_state().await;
-        state
-            .store
-            .put_message(&test_sandbox("work", Vec::new()))
-            .await
-            .unwrap();
-
-        let response = handle_create_ssh_session(
-            &state,
-            Request::new(CreateSshSessionRequest {
-                sandbox_id: "sandbox-work".to_string(),
-                org_id: "org.alpha-1".to_string(),
-            }),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-
-        assert_eq!(response.org_id, "org.alpha-1");
-
-        let session = state
-            .store
-            .get_message::<SshSession>(&response.token)
-            .await
-            .unwrap()
-            .expect("session should persist");
-        assert_eq!(session.org_id, "org.alpha-1");
-
-        validate_ssh_forward_token(&state, &response.token, "sandbox-work", "org.alpha-1")
-            .await
-            .expect("matching org token should validate");
-        let err = validate_ssh_forward_token(&state, &response.token, "sandbox-work", "org.beta")
-            .await
-            .expect_err("mismatched org token should fail");
-        assert_eq!(err.code(), tonic::Code::Unauthenticated);
-=======
     async fn create_ssh_session_allows_terminal_sandbox_while_supervisor_is_reachable() {
         let state = test_server_state().await;
         let mut sandbox = test_sandbox("work", Vec::new());
@@ -6959,7 +6768,6 @@ mod tests {
 
         assert!(state.supervisor_sessions.disconnect("sandbox-work"));
         assert!(!sandbox_relay_reachable(&state, &sandbox));
->>>>>>> upstream/main
     }
 
     #[tokio::test]
@@ -6974,17 +6782,11 @@ mod tests {
         // Create a session first
         let response = handle_create_ssh_session(
             &state,
-<<<<<<< HEAD
-            Request::new(CreateSshSessionRequest {
-                sandbox_id: "sandbox-work".to_string(),
-                org_id: String::new(),
-=======
             authed_request(CreateSshSessionRequest {
                 sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
->>>>>>> upstream/main
             }),
         )
         .await

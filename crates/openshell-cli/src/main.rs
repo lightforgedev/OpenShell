@@ -1581,26 +1581,6 @@ enum SandboxCommands {
         output: OutputFormat,
     },
 
-    /// Watch sandbox lifecycle snapshots as JSON lines.
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Watch {
-        /// Sandbox name (defaults to last-used sandbox).
-        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
-        name: Option<String>,
-
-        /// Exit successfully after observing the Deleting phase.
-        #[arg(long)]
-        exit_on_deleting: bool,
-
-        /// Include public platform events in the stream.
-        #[arg(long)]
-        events: bool,
-
-        /// Idle timeout in seconds while waiting for stream events. 0 disables timeout.
-        #[arg(long, default_value_t = 0)]
-        timeout: u64,
-    },
-
     /// List sandboxes.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List {
@@ -1712,10 +1692,6 @@ enum SandboxCommands {
         /// a provider to the sandbox instead. Repeatable.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
-
-        /// OS user to run the command as inside the sandbox.
-        #[arg(long, value_name = "USER")]
-        user: Option<String>,
 
         /// Command and arguments to execute.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -3493,23 +3469,6 @@ async fn run_async() -> Result<()> {
                             )
                             .await?;
                         }
-                        SandboxCommands::Watch {
-                            name,
-                            exit_on_deleting,
-                            events,
-                            timeout,
-                        } => {
-                            let name = resolve_sandbox_name(name, &ctx.name)?;
-                            run::sandbox_watch(
-                                endpoint,
-                                &name,
-                                timeout,
-                                exit_on_deleting,
-                                events,
-                                &tls,
-                            )
-                            .await?;
-                        }
                         SandboxCommands::List {
                             page_size,
                             page_token,
@@ -3581,7 +3540,6 @@ async fn run_async() -> Result<()> {
                             tty,
                             no_tty,
                             envs,
-                            user,
                             command,
                             no_login_shell,
                         } => {
@@ -3603,11 +3561,7 @@ async fn run_async() -> Result<()> {
                                 timeout,
                                 tty_override,
                                 &env_map,
-<<<<<<< HEAD
-                                user.as_deref(),
-=======
                                 no_login_shell,
->>>>>>> upstream/main
                                 &tls,
                                 &cli.workspace,
                             )
@@ -5364,31 +5318,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
-    fn sandbox_watch_parses_deleting_guard() {
-        let cli = Cli::try_parse_from([
-            "openshell",
-            "sandbox",
-            "watch",
-            "aegis-governance-phase1",
-            "--exit-on-deleting",
-            "--events",
-            "--timeout",
-            "30",
-        ])
-        .expect("sandbox watch should parse");
-
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Watch {
-                    name: Some(name),
-                    exit_on_deleting: true,
-                    events: true,
-                    timeout: 30,
-                })
-            }) if name == "aegis-governance-phase1"
-=======
     fn sandbox_stop_and_start_accept_optional_names() {
         let stop = Cli::try_parse_from(["openshell", "sandbox", "stop", "demo"])
             .expect("stop command should parse");
@@ -5406,7 +5335,6 @@ mod tests {
             Some(Commands::Sandbox {
                 command: Some(SandboxCommands::Start { name: None }),
             })
->>>>>>> upstream/main
         ));
     }
 

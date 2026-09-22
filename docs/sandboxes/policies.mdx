@@ -44,8 +44,6 @@ network_policies:
         access: full
     binaries:
       - path: /usr/bin/curl
-        uid: 20001
-        gid: 20001
 
 # Dynamic: ordered middleware selected independently by admitted host.
 network_middlewares:
@@ -64,13 +62,7 @@ network_middlewares:
 
 Static sections are locked at sandbox creation. Changing them requires destroying and recreating the sandbox.
 Dynamic sections can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
-<<<<<<< HEAD
-Binary entries may include `uid` and/or `gid` to bind the grant to the socket owner's effective process identity. Omit both fields for legacy sandbox-wide binary matching.
-When a hot reload changes rules on an active HTTP L7 endpoint, existing keep-alive tunnels are closed before forwarding another parsed request. Credential-injection-only HTTP passthrough tunnels use the same reload boundary. Most HTTP clients reconnect automatically, and the next request is evaluated against the current policy.
-Raw streams are connection-scoped and outside L7 live-reload guarantees. This includes `tls: skip`, non-HTTP TCP payloads, HTTP upgrades such as WebSocket, and long-lived response streams such as SSE. A reload applies to the next connection or next parsed HTTP request; it does not interrupt an already-forwarded raw stream. Use `protocol: websocket` when policy should stay attached to the RFC 6455 upgrade and client text messages after the allowed upgrade. Add `websocket_credential_rewrite: true` only when the relay should rewrite credential placeholders in client-to-server WebSocket text messages. Add `request_body_credential_rewrite: true` only on inspected REST endpoints that need OpenShell to rewrite placeholders in supported text request bodies.
-=======
 When a hot reload changes rules, the supervisor publishes a new policy generation and closes connections pinned to the previous generation. This includes HTTP keep-alive tunnels, `tls: skip`, non-HTTP payloads, HTTP upgrades such as WebSocket, and long-lived response streams such as SSE. Most clients reconnect automatically, and the next connection or request is evaluated against the current policy. A parsed WebSocket relay closes with code `1012` when its attached policy generation becomes stale. Use `protocol: websocket` when policy should stay attached to the RFC 6455 upgrade and client text messages after the allowed upgrade. Provider-credentialed endpoints reject L4-only and `tls: skip` modes by default. On a credentialed WebSocket upgrade, OpenShell keeps the connection on the parsed relay and rejects binary frames unless the endpoint explicitly sets `allow_uninspected_credentials: true`. Add `websocket_credential_rewrite: true` when the relay should rewrite credential placeholders in client-to-server WebSocket text messages. Add `request_body_credential_rewrite: true` only on inspected REST endpoints that need OpenShell to rewrite placeholders in supported text request bodies.
->>>>>>> upstream/main
 
 | Section | Type | Description |
 |---|---|---|

@@ -71,25 +71,13 @@ pub fn prepare_capability_free(
 /// Calls `restrict_self()` for Landlock and applies seccomp filters.
 /// Neither operation requires root privileges.
 pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
-<<<<<<< HEAD:crates/openshell-supervisor-process/src/sandbox/linux/mod.rs
-    if let Some(ruleset) = prepared.landlock {
-        let _ = landlock::enforce(ruleset)?;
-=======
     for ruleset in prepared.landlock {
         landlock::enforce(ruleset)?;
->>>>>>> upstream/main:crates/openshell-sandbox/src/sandbox/linux/mod.rs
     }
     seccomp::apply(&prepared.policy)?;
     Ok(())
 }
 
-<<<<<<< HEAD:crates/openshell-supervisor-process/src/sandbox/linux/mod.rs
-pub fn landlock_evidence_env(prepared: &PreparedSandbox) -> Option<[(String, String); 2]> {
-    prepared
-        .landlock
-        .as_ref()
-        .and_then(landlock::PreparedRuleset::evidence_env)
-=======
 /// Enforce the capability-free child filter stack.
 ///
 /// Landlock precedes sandbox-TGID self-protection. The ordinary workload
@@ -107,7 +95,6 @@ pub fn enforce_capability_free(
         .map_err(|error| miette::miette!("install child self-protection filter: {error}"))?;
     seccomp::apply(&prepared.policy)?;
     Ok(())
->>>>>>> upstream/main:crates/openshell-sandbox/src/sandbox/linux/mod.rs
 }
 
 /// Apply the supervisor seccomp prelude after privileged bootstrap completes.

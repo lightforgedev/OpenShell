@@ -39,11 +39,7 @@ Homebrew and RPM upgrades migrate only exact package-generated schema-v1 default
 
 ## Layout
 
-<<<<<<< HEAD
-The file is rooted at `[openshell]`. Gateway-wide process settings live under `[openshell.gateway]`. Runtime settings seeded into the gateway settings store live under `[openshell.settings]`. Each compute driver owns its own `[openshell.drivers.<name>]` table. Shared keys set at gateway scope are inherited into driver tables when not overridden.
-=======
 The file is rooted at `[openshell]`. Gateway-wide settings live under `[openshell.gateway]`. Each compute driver owns its own `[openshell.drivers.<name>]` table. Credential drivers own `[openshell.credential_drivers.<name>]` tables. Driver-specific values are never inherited from gateway scope.
->>>>>>> upstream/main
 
 ```toml
 [openshell]
@@ -57,9 +53,6 @@ version = 2
 
 [openshell.gateway.oidc]
 # ... JWT bearer auth ...
-
-[openshell.settings]
-# ... global runtime settings ...
 
 [openshell.drivers.kubernetes]
 # ... driver-specific settings ...
@@ -219,21 +212,6 @@ endpoint     = "http://otel-collector.observability.svc:4317"
 service_name = "openshell-gateway"
 
 [openshell.gateway.oidc]
-<<<<<<< HEAD
-issuer        = "https://idp.example.com/realms/openshell"
-audience      = "openshell-cli"
-jwks_ttl_secs = 3600
-roles_claim   = "realm_access.roles"
-admin_role    = "openshell-admin"
-user_role     = "openshell-user"
-scopes_claim  = ""
-
-[openshell.settings]
-# Suppress routine successful OCSF shorthand events in container logs while
-# keeping denials/findings visible. Full JSONL export is controlled separately
-# by ocsf_json_enabled.
-ocsf_shorthand_min_severity = "medium"
-=======
 issuer                           = "https://idp.example.com/realms/openshell"
 audience                         = "openshell-cli"
 jwks_ttl_secs                    = 3600 # Must be greater than zero.
@@ -280,7 +258,6 @@ sa_token_ttl_secs      = 3600
 [openshell.credential_drivers.kubernetes-secrets]
 namespace = "openshell"
 allow_reference_namespace = false
->>>>>>> upstream/main
 ```
 
 Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to map a verified client certificate to a CLI user identity. This application-layer identity switch does not control the TLS handshake. When `client_ca_path` is set without OIDC, the listener requires a valid client certificate. When OIDC is configured, bearer-only clients may connect; the listener still validates any client certificate they present against the configured CA. Kubernetes deployments must leave `mtls_auth.enabled` unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
@@ -552,8 +529,6 @@ Multi-replica gateways relay session-bound traffic to the replica that owns a sa
 
 The gateway refuses to start when a peer endpoint is configured on a multi-replica backend and peer authentication is unavailable, because the replica could not serve relays from its peers. That happens when the pod identity variables are missing, when the in-cluster Kubernetes client cannot be built, or when the gateway is not running in a cluster. A plaintext `http://` peer endpoint is also rejected when the gateway serves TLS; use it only when the gateway itself serves plaintext.
 
-`[openshell.settings]` accepts registered runtime setting keys and applies them as global settings at every gateway startup. TOML is authoritative on restart: it overwrites runtime `openshell settings set --global` changes to the same keys. Unknown keys and wrong TOML value types are rejected during startup. These settings use the same validation and precedence as `openshell settings set --global`: gateway-global values override sandbox-scoped values.
-
 ## Driver References
 
 Each example is a complete TOML file for one compute driver. The examples repeat `[openshell]` and `[openshell.gateway]` so they stay copyable, and the driver tables list the accepted driver-specific keys. Drivers receive only their own tables, and the gateway rejects unknown gateway and driver fields.
@@ -747,27 +722,6 @@ guest_tls_cert = "/etc/openshell/certs/client.pem"
 guest_tls_key  = "/etc/openshell/certs/client-key.pem"
 
 [openshell.drivers.docker]
-<<<<<<< HEAD
-default_image      = "ghcr.io/nvidia/openshell/sandbox:latest"
-# Docker vocabulary: Always | IfNotPresent | Never. Empty behaves like IfNotPresent.
-image_pull_policy  = "IfNotPresent"
-sandbox_namespace  = "docker-dev"
-# Empty auto-detects https://host.openshell.internal:<gateway-port> when guest TLS is set.
-grpc_endpoint      = "https://host.openshell.internal:17670"
-# Skip the image-pull-and-extract step by pointing at a locally built binary.
-supervisor_bin     = "/usr/local/libexec/openshell/openshell-sandbox"
-# When supervisor_bin is omitted, Docker extracts /openshell-sandbox from this image.
-supervisor_image   = "ghcr.io/nvidia/openshell/supervisor:latest"
-# Containerized gateways using the host Docker socket should replace both
-# supervisor_bin and supervisor_image with a digest-pinned daemon image mount:
-# supervisor_image_mount = "ghcr.io/nvidia/openshell/supervisor@sha256:<digest>"
-guest_tls_ca       = "/etc/openshell/certs/ca.pem"
-guest_tls_cert     = "/etc/openshell/certs/client.pem"
-guest_tls_key      = "/etc/openshell/certs/client-key.pem"
-network_name       = "openshell-docker"
-host_gateway_ip    = "172.17.0.1"
-ssh_socket_path    = "/run/openshell/ssh.sock"
-=======
 socket_path        = "/var/run/docker.sock"
 default_image      = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 # Canonical values: always | if_not_present | never. `newer` is Podman-only.
@@ -781,7 +735,6 @@ grpc_endpoint      = "https://127.0.0.1:17670"
 # sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:<version>"
 # Supervisor runtime. Defaults to the gateway version.
 # supervisor_image = "ghcr.io/nvidia/openshell/supervisor:<version>"
->>>>>>> upstream/main
 # Unsafe operator override. Host bind mounts, including Docker local-driver
 # bind-backed volumes, expose gateway-host paths inside sandboxes and can
 # negate OpenShell isolation and filesystem controls.

@@ -359,23 +359,12 @@ impl InputSender {
 }
 
 struct SshHandler {
-<<<<<<< HEAD
-    policy: SandboxPolicy,
-    session_user: Option<String>,
-    workdir: Option<String>,
-    netns_fd: Option<RawFd>,
-    proxy_url: Option<String>,
-    ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
-    provider_credentials: ProviderCredentialState,
-    user_environment: HashMap<String, String>,
-=======
     /// Loopback port-forward, injected by the orchestrator (RFC 0012). In-pod
     /// this connects from inside the workload netns; a delegated backend
     /// tunnels into its guest. The handler does not know which.
     port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryLoopbackConnector>,
     boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
->>>>>>> upstream/main
     channels: HashMap<ChannelId, ChannelState>,
 }
 
@@ -405,72 +394,27 @@ impl SshHandler {
         main_session: Option<Arc<MainSession>>,
     ) -> Self {
         Self {
-<<<<<<< HEAD
-            policy,
-            session_user: None,
-            workdir,
-            netns_fd,
-            proxy_url,
-            ca_file_paths,
-            provider_credentials,
-            user_environment,
-=======
             port_forward,
             boundary_exec,
             main_session,
->>>>>>> upstream/main
             channels: HashMap::new(),
         }
     }
-
-    fn authenticate_user(&mut self, user: &str) -> Result<Auth, anyhow::Error> {
-        if requested_user_resolves_to_root(user)? {
-            return Ok(Auth::reject());
-        }
-        self.session_user = Some(user.to_string());
-        Ok(Auth::Accept)
-    }
-
-    fn policy_for_session_user(&self) -> SandboxPolicy {
-        let Some(user) = self.session_user.as_deref().filter(|user| !user.is_empty()) else {
-            return self.policy.clone();
-        };
-
-        let mut policy = self.policy.clone();
-        policy.process.run_as_user = Some(user.to_string());
-        policy.process.run_as_group = None;
-        policy
-    }
-}
-
-fn requested_user_resolves_to_root(user: &str) -> Result<bool, anyhow::Error> {
-    if user == "root" {
-        return Ok(true);
-    }
-    if user.parse::<u32>().is_ok_and(|uid| uid == 0) {
-        return Ok(true);
-    }
-
-    let Some(record) = nix::unistd::User::from_name(user)? else {
-        return Ok(false);
-    };
-
-    Ok(record.uid.as_raw() == 0 || record.gid.as_raw() == 0)
 }
 
 impl russh::server::Handler for SshHandler {
     type Error = anyhow::Error;
 
-    async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
-        self.authenticate_user(user)
+    async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
+        Ok(Auth::Accept)
     }
 
     async fn auth_publickey(
         &mut self,
-        user: &str,
+        _user: &str,
         _public_key: &russh::keys::PublicKey,
     ) -> Result<Auth, Self::Error> {
-        self.authenticate_user(user)
+        Ok(Auth::Accept)
     }
 
     async fn channel_open_session(
@@ -775,20 +719,11 @@ impl russh::server::Handler for SshHandler {
             }
         } else if name == "sftp" {
             session.channel_success(channel)?;
-            let policy = self.policy_for_session_user();
             // sftp-server speaks the SFTP binary protocol over stdin/stdout,
             // which the boundary executor preserves as separate pipes. This enables
             // modern scp (SFTP-based, OpenSSH 9.0+) and SFTP clients to
             // transfer files into and out of the sandbox.
-<<<<<<< HEAD
-            let input_sender = spawn_pipe_exec(
-                &policy,
-                self.workdir.clone(),
-                Some("/usr/lib/openssh/sftp-server".to_string()),
-                session.handle(),
-=======
             self.start_exec_spec(
->>>>>>> upstream/main
                 channel,
                 session.handle(),
                 openshell_isolation_interface::contract::ExecSpec {
@@ -950,52 +885,10 @@ impl SshHandler {
         handle: Handle,
         command: Option<String>,
     ) -> anyhow::Result<()> {
-<<<<<<< HEAD
-        let provider_env = self.provider_credentials.child_env_with_gcp_resolved();
-        let policy = self.policy_for_session_user();
-=======
->>>>>>> upstream/main
         let state = self
             .channels
             .get_mut(&channel)
             .ok_or_else(|| anyhow::anyhow!("start_shell on unknown channel {channel:?}"))?;
-<<<<<<< HEAD
-        if let Some(pty) = state.pty_request.take() {
-            // PTY was requested — allocate a real PTY (interactive shell or
-            // exec that explicitly asked for a terminal).
-            let (pty_master, input_sender) = spawn_pty_shell(
-                &policy,
-                self.workdir.clone(),
-                command,
-                &pty,
-                handle,
-                channel,
-                self.netns_fd,
-                self.proxy_url.clone(),
-                self.ca_file_paths.clone(),
-                &provider_env,
-                &self.user_environment,
-            )?;
-            state.pty_master = Some(pty_master);
-            state.input_sender = Some(input_sender);
-        } else {
-            // No PTY requested — use plain pipes so stdout/stderr are
-            // separate and output has clean LF line endings.  This is the
-            // path VSCode Remote-SSH exec commands take.
-            let input_sender = spawn_pipe_exec(
-                &policy,
-                self.workdir.clone(),
-                command,
-                handle,
-                channel,
-                self.netns_fd,
-                self.proxy_url.clone(),
-                self.ca_file_paths.clone(),
-                &provider_env,
-                &self.user_environment,
-            )?;
-            state.input_sender = Some(input_sender);
-=======
         let no_login_shell = state.no_login_shell;
         let pty = state.pty_request.take();
         let pty_requested = pty.is_some();
@@ -1040,7 +933,6 @@ impl SshHandler {
                 .resize(to_u16(pty.col_width.max(1)), to_u16(pty.row_height.max(1)))
                 .await
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
->>>>>>> upstream/main
         }
         Ok(())
     }
@@ -1214,588 +1106,6 @@ impl Default for PtyRequest {
     }
 }
 
-<<<<<<< HEAD
-/// Derive the session USER and HOME from the policy's `run_as_user`.
-///
-/// For name-based identities, looks up the home directory via `/etc/passwd`
-/// (or defaults to `/home/{user}`).
-///
-/// For numeric UIDs, there is no passwd entry — falls back to
-/// `("{uid}", "/sandbox")` so the agent session still has a meaningful
-/// USER identifier.
-fn session_user_and_home(policy: &SandboxPolicy) -> (String, String) {
-    match policy.process.run_as_user.as_deref() {
-        Some(user) if !user.is_empty() => {
-            // Numeric UID — no passwd entry expected; use default HOME.
-            if user.parse::<u32>().is_ok() {
-                return (user.to_string(), "/sandbox".to_string());
-            }
-            // Name-based identity — look up home from /etc/passwd.
-            let home = nix::unistd::User::from_name(user)
-                .ok()
-                .flatten()
-                .map_or_else(
-                    || format!("/home/{user}"),
-                    |u| u.dir.to_string_lossy().into_owned(),
-                );
-            (user.to_string(), home)
-        }
-        _ => ("sandbox".to_string(), "/sandbox".to_string()),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn apply_child_env(
-    cmd: &mut Command,
-    session_home: &str,
-    session_user: &str,
-    term: &str,
-    proxy_url: Option<&str>,
-    ca_file_paths: Option<&(PathBuf, PathBuf)>,
-    provider_env: &HashMap<String, String>,
-    user_environment: &HashMap<String, String>,
-) {
-    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
-
-    cmd.env_clear()
-        .env(openshell_core::sandbox_env::SANDBOX, "1")
-        .env("HOME", session_home)
-        .env("USER", session_user)
-        .env("SHELL", "/bin/bash")
-        .env("PATH", &path)
-        .env("TERM", term);
-
-    for (key, value) in user_environment {
-        if !key.starts_with("OPENSHELL_") {
-            cmd.env(key, value);
-        }
-    }
-
-    if let Some(url) = proxy_url {
-        for (key, value) in child_env::proxy_env_vars(url) {
-            cmd.env(key, value);
-        }
-    }
-
-    if let Some((ca_cert_path, combined_bundle_path)) = ca_file_paths {
-        for (key, value) in child_env::tls_env_vars(ca_cert_path, combined_bundle_path) {
-            cmd.env(key, value);
-        }
-    }
-
-    for (key, value) in provider_env {
-        if is_supervisor_only_env_var(key) {
-            continue;
-        }
-        cmd.env(key, value);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn spawn_pty_shell(
-    policy: &SandboxPolicy,
-    workdir: Option<String>,
-    command: Option<String>,
-    pty: &PtyRequest,
-    handle: Handle,
-    channel: ChannelId,
-    netns_fd: Option<RawFd>,
-    proxy_url: Option<String>,
-    ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
-    provider_env: &HashMap<String, String>,
-    user_environment: &HashMap<String, String>,
-) -> anyhow::Result<(std::fs::File, mpsc::Sender<Vec<u8>>)> {
-    let winsize = Winsize {
-        ws_row: to_u16(pty.row_height.max(1)),
-        ws_col: to_u16(pty.col_width.max(1)),
-        ws_xpixel: to_u16(pty.pixel_width),
-        ws_ypixel: to_u16(pty.pixel_height),
-    };
-    let openpty = openpty(Some(&winsize), None)?;
-    let master = std::fs::File::from(openpty.master);
-    let slave = std::fs::File::from(openpty.slave);
-    let slave_fd = slave.as_raw_fd();
-
-    let stdin = slave.try_clone()?;
-    let stdout = slave.try_clone()?;
-    let stderr = slave;
-    let mut reader = master.try_clone()?;
-    let mut writer = master.try_clone()?;
-
-    let mut cmd = command.map_or_else(
-        || {
-            let mut c = Command::new("/bin/bash");
-            c.arg("-i");
-            c
-        },
-        |command| {
-            let mut c = Command::new("/bin/bash");
-            c.arg("-lc").arg(command);
-            c
-        },
-    );
-
-    let term = if pty.term.is_empty() {
-        "xterm-256color"
-    } else {
-        pty.term.as_str()
-    };
-
-    // Derive USER and HOME from the policy's run_as_user when available,
-    // falling back to "sandbox" / "/sandbox" for backward compatibility.
-    let (session_user, session_home) = session_user_and_home(policy);
-    apply_child_env(
-        &mut cmd,
-        &session_home,
-        &session_user,
-        term,
-        proxy_url.as_deref(),
-        ca_file_paths.as_deref(),
-        provider_env,
-        user_environment,
-    );
-    cmd.stdin(stdin).stdout(stdout).stderr(stderr);
-
-    if let Some(dir) = workdir.as_deref() {
-        cmd.current_dir(dir);
-    }
-
-    // Probe Landlock availability from the parent process where tracing works.
-    #[cfg(target_os = "linux")]
-    sandbox::linux::log_sandbox_readiness(policy, workdir.as_deref());
-
-    // Phase 1 (as root): Prepare Landlock ruleset before drop_privileges.
-    #[cfg(target_os = "linux")]
-    let prepared_sandbox = sandbox::linux::prepare(policy, workdir.as_deref())
-        .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
-    #[cfg(target_os = "linux")]
-    if let Some(env_vars) = sandbox::linux::landlock_evidence_env(&prepared_sandbox) {
-        for (key, value) in env_vars {
-            cmd.env(key, value);
-        }
-    }
-
-    #[cfg(unix)]
-    {
-        unsafe_pty::install_pre_exec(
-            &mut cmd,
-            policy.clone(),
-            workdir.clone(),
-            slave_fd,
-            netns_fd,
-            #[cfg(target_os = "linux")]
-            prepared_sandbox,
-        )?;
-    }
-
-    let mut child = cmd.spawn()?;
-    #[cfg(target_os = "linux")]
-    let child_pid = child.id();
-    #[cfg(target_os = "linux")]
-    managed_children::register(child_pid);
-    let master_file = master;
-
-    let (sender, receiver) = mpsc::channel::<Vec<u8>>();
-    std::thread::spawn(move || {
-        while let Ok(bytes) = receiver.recv() {
-            if writer.write_all(&bytes).is_err() {
-                break;
-            }
-            let _ = writer.flush();
-        }
-    });
-
-    let runtime = tokio::runtime::Handle::current();
-    let runtime_reader = runtime.clone();
-    let handle_clone = handle.clone();
-    // Signal from the reader thread to the exit thread that all output has
-    // been forwarded.  The exit thread waits for this before sending the
-    // exit-status and closing the channel, ensuring the correct SSH protocol
-    // ordering: data → EOF → exit-status → close.
-    let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let data = CryptoVec::from_slice(&buf[..n]);
-                    let handle_clone = handle_clone.clone();
-                    let _ = runtime_reader
-                        .block_on(async move { handle_clone.data(channel, data).await });
-                }
-            }
-        }
-        // Send EOF to indicate no more data will be sent on this channel.
-        let eof_handle = handle_clone.clone();
-        let _ = runtime_reader.block_on(async move { eof_handle.eof(channel).await });
-        // Notify the exit thread that all output has been forwarded.
-        let _ = reader_done_tx.send(());
-    });
-
-    let handle_exit = handle;
-    let runtime_exit = runtime;
-    std::thread::spawn(move || {
-        let status = child.wait().ok();
-        #[cfg(target_os = "linux")]
-        managed_children::unregister(child_pid);
-        let code = status.and_then(|s| s.code()).unwrap_or(1).unsigned_abs();
-        // Wait for the reader thread to finish forwarding all output before
-        // sending exit-status and closing the channel.  This prevents the
-        // race where close() was called before exit_status_request().
-        //
-        // Use a timeout because a backgrounded grandchild process (e.g.
-        // `nohup daemon &`) may hold the PTY slave open indefinitely,
-        // preventing the reader from reaching EOF.  Two seconds is enough
-        // for any remaining buffered data to drain.
-        let _ = reader_done_rx.recv_timeout(Duration::from_secs(2));
-        drop(runtime_exit.spawn(async move {
-            let _ = handle_exit.exit_status_request(channel, code).await;
-            let _ = handle_exit.close(channel).await;
-        }));
-    });
-
-    Ok((master_file, sender))
-}
-
-/// Spawn a command using plain pipes (no PTY).
-///
-/// stdout is forwarded as SSH channel data and stderr as SSH extended data
-/// (type 1), preserving the separation that clients like `VSCode` Remote-SSH
-/// expect.  Output retains clean LF line endings (no CRLF translation).
-#[allow(clippy::too_many_arguments)]
-fn spawn_pipe_exec(
-    policy: &SandboxPolicy,
-    workdir: Option<String>,
-    command: Option<String>,
-    handle: Handle,
-    channel: ChannelId,
-    netns_fd: Option<RawFd>,
-    proxy_url: Option<String>,
-    ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
-    provider_env: &HashMap<String, String>,
-    user_environment: &HashMap<String, String>,
-) -> anyhow::Result<mpsc::Sender<Vec<u8>>> {
-    let mut cmd = command.map_or_else(
-        || {
-            // No command — read from stdin.  Do *not* pass `-i`; interactive
-            // mode reads .bashrc, writes prompts to stderr, and can introduce
-            // just enough latency for VS Code Remote-SSH's platform detection
-            // to time out and fall back to "windows".  Plain `bash` with piped
-            // stdin already reads commands line-by-line (script mode), which is
-            // exactly what VS Code's local server expects.
-            Command::new("/bin/bash")
-        },
-        |command| {
-            let mut c = Command::new("/bin/bash");
-            // Use login shell (-l) so that .profile/.bashrc are sourced and
-            // tool-specific env vars (VIRTUAL_ENV, UV_PYTHON_INSTALL_DIR, etc.)
-            // are available without hardcoding them here.
-            c.arg("-lc").arg(command);
-            c
-        },
-    );
-
-    let (session_user, session_home) = session_user_and_home(policy);
-    apply_child_env(
-        &mut cmd,
-        &session_home,
-        &session_user,
-        "dumb",
-        proxy_url.as_deref(),
-        ca_file_paths.as_deref(),
-        provider_env,
-        user_environment,
-    );
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    if let Some(dir) = workdir.as_deref() {
-        cmd.current_dir(dir);
-    }
-
-    // Probe Landlock availability from the parent process where tracing works.
-    #[cfg(target_os = "linux")]
-    sandbox::linux::log_sandbox_readiness(policy, workdir.as_deref());
-
-    // Phase 1 (as root): Prepare Landlock ruleset before drop_privileges.
-    #[cfg(target_os = "linux")]
-    let prepared_sandbox = sandbox::linux::prepare(policy, workdir.as_deref())
-        .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
-    #[cfg(target_os = "linux")]
-    if let Some(env_vars) = sandbox::linux::landlock_evidence_env(&prepared_sandbox) {
-        for (key, value) in env_vars {
-            cmd.env(key, value);
-        }
-    }
-
-    #[cfg(unix)]
-    {
-        unsafe_pty::install_pre_exec_no_pty(
-            &mut cmd,
-            policy.clone(),
-            workdir.clone(),
-            netns_fd,
-            #[cfg(target_os = "linux")]
-            prepared_sandbox,
-        )?;
-    }
-
-    let mut child = cmd.spawn()?;
-    #[cfg(target_os = "linux")]
-    let child_pid = child.id();
-    #[cfg(target_os = "linux")]
-    managed_children::register(child_pid);
-
-    let child_stdin = child.stdin.take();
-    let child_stdout = child.stdout.take().expect("stdout must be piped");
-    let child_stderr = child.stderr.take().expect("stderr must be piped");
-
-    // stdin writer thread
-    let (sender, receiver) = mpsc::channel::<Vec<u8>>();
-    std::thread::spawn(move || {
-        let Some(mut stdin) = child_stdin else {
-            return;
-        };
-        while let Ok(bytes) = receiver.recv() {
-            if stdin.write_all(&bytes).is_err() {
-                break;
-            }
-            let _ = stdin.flush();
-        }
-    });
-
-    let runtime = tokio::runtime::Handle::current();
-
-    // Signal from the reader threads to the exit thread that all output has
-    // been forwarded.
-    let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
-
-    // stdout reader
-    let stdout_handle = handle.clone();
-    let stdout_runtime = runtime.clone();
-    let reader_done_stdout = reader_done_tx.clone();
-    std::thread::spawn(move || {
-        let mut reader = child_stdout;
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let data = CryptoVec::from_slice(&buf[..n]);
-                    let h = stdout_handle.clone();
-                    let _ = stdout_runtime.block_on(async move { h.data(channel, data).await });
-                }
-            }
-        }
-        let _ = reader_done_stdout.send(());
-    });
-
-    // stderr reader — sends as extended data (type 1)
-    let stderr_handle = handle.clone();
-    let stderr_runtime = runtime.clone();
-    std::thread::spawn(move || {
-        let mut reader = child_stderr;
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let data = CryptoVec::from_slice(&buf[..n]);
-                    let h = stderr_handle.clone();
-                    let _ = stderr_runtime
-                        .block_on(async move { h.extended_data(channel, 1, data).await });
-                }
-            }
-        }
-        let _ = reader_done_tx.send(());
-    });
-
-    // Exit waiter thread
-    let handle_exit = handle;
-    let runtime_exit = runtime;
-    std::thread::spawn(move || {
-        let status = child.wait().ok();
-        #[cfg(target_os = "linux")]
-        managed_children::unregister(child_pid);
-        let code = status.and_then(|s| s.code()).unwrap_or(1).unsigned_abs();
-        // Wait for both reader threads.
-        let _ = reader_done_rx.recv_timeout(Duration::from_secs(2));
-        let _ = reader_done_rx.recv_timeout(Duration::from_secs(1));
-        drop(runtime_exit.spawn(async move {
-            let _ = handle_exit.eof(channel).await;
-            let _ = handle_exit.exit_status_request(channel, code).await;
-            let _ = handle_exit.close(channel).await;
-        }));
-    });
-
-    Ok(sender)
-}
-
-mod unsafe_pty {
-    #[cfg(not(target_os = "linux"))]
-    use super::sandbox;
-    use super::{Command, RawFd, SandboxPolicy, Winsize, drop_privileges, setsid};
-    #[cfg(unix)]
-    use std::os::unix::process::CommandExt;
-
-    #[allow(unsafe_code)]
-    pub fn set_winsize(fd: RawFd, winsize: Winsize) -> std::io::Result<()> {
-        let rc = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &winsize) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    #[allow(unsafe_code)]
-    // `libc::TIOCSCTTY` is `u32` on macOS/BSD and `u64` on Linux; allow the
-    // cross-platform conversion so the same expression compiles everywhere.
-    #[allow(clippy::useless_conversion)]
-    fn set_controlling_tty(fd: RawFd) -> std::io::Result<()> {
-        let rc = unsafe { libc::ioctl(fd, libc::TIOCSCTTY.into(), 0) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    #[allow(unsafe_code)]
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(
-            clippy::unnecessary_wraps,
-            reason = "Linux pre_exec setup can fail while non-Linux setup cannot."
-        )
-    )]
-    pub fn install_pre_exec(
-        cmd: &mut Command,
-        policy: SandboxPolicy,
-        _workdir: Option<String>,
-        slave_fd: RawFd,
-        netns_fd: Option<RawFd>,
-        #[cfg(target_os = "linux")] prepared: crate::sandbox::linux::PreparedSandbox,
-    ) -> anyhow::Result<()> {
-        // Wrap in Option so we can .take() it out of the FnMut closure.
-        // pre_exec is only called once (after fork, before exec).
-        #[cfg(target_os = "linux")]
-        let mut prepared = Some(prepared);
-        #[cfg(target_os = "linux")]
-        let supervisor_identity_mount = crate::process::supervisor_identity_mount_from_env()
-            .map_err(|err| {
-                anyhow::anyhow!("failed to prepare supervisor identity isolation: {err}")
-            })?;
-        unsafe {
-            cmd.pre_exec(move || {
-                setsid().map_err(|err| std::io::Error::other(err.to_string()))?;
-                set_controlling_tty(slave_fd)?;
-
-                enter_netns_and_sandbox(
-                    netns_fd,
-                    &policy,
-                    #[cfg(target_os = "linux")]
-                    supervisor_identity_mount,
-                    #[cfg(target_os = "linux")]
-                    prepared.take(),
-                )
-            });
-        }
-        Ok(())
-    }
-
-    /// Pre-exec hook for pipe-based (non-PTY) exec.
-    ///
-    /// Skips `setsid` and `TIOCSCTTY` since there is no controlling terminal.
-    #[allow(unsafe_code)]
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(
-            clippy::unnecessary_wraps,
-            reason = "Linux pre_exec setup can fail while non-Linux setup cannot."
-        )
-    )]
-    pub fn install_pre_exec_no_pty(
-        cmd: &mut Command,
-        policy: SandboxPolicy,
-        _workdir: Option<String>,
-        netns_fd: Option<RawFd>,
-        #[cfg(target_os = "linux")] prepared: crate::sandbox::linux::PreparedSandbox,
-    ) -> anyhow::Result<()> {
-        #[cfg(target_os = "linux")]
-        let mut prepared = Some(prepared);
-        #[cfg(target_os = "linux")]
-        let supervisor_identity_mount = crate::process::supervisor_identity_mount_from_env()
-            .map_err(|err| {
-                anyhow::anyhow!("failed to prepare supervisor identity isolation: {err}")
-            })?;
-        unsafe {
-            cmd.pre_exec(move || {
-                enter_netns_and_sandbox(
-                    netns_fd,
-                    &policy,
-                    #[cfg(target_os = "linux")]
-                    supervisor_identity_mount,
-                    #[cfg(target_os = "linux")]
-                    prepared.take(),
-                )
-            });
-        }
-        Ok(())
-    }
-
-    fn enter_netns_and_sandbox(
-        netns_fd: Option<RawFd>,
-        policy: &SandboxPolicy,
-        #[cfg(target_os = "linux")] supervisor_identity_mount: Option<
-            &crate::process::SupervisorIdentityMountNamespace,
-        >,
-        #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
-    ) -> std::io::Result<()> {
-        // Enter network namespace before dropping privileges.
-        // This ensures SSH shell processes are isolated to the same
-        // network namespace as the entrypoint, forcing all traffic
-        // through the veth pair and CONNECT proxy.
-        #[cfg(target_os = "linux")]
-        if let Some(fd) = netns_fd {
-            #[allow(unsafe_code)]
-            let result = unsafe { libc::setns(fd, libc::CLONE_NEWNET) };
-            if result != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        let _ = netns_fd;
-
-        #[cfg(target_os = "linux")]
-        if let Some(mount) = supervisor_identity_mount {
-            mount.enter_for_child()?;
-        }
-
-        // Drop privileges. initgroups/setgid/setuid need /etc/group and
-        // /etc/passwd which would be blocked if Landlock were already enforced.
-        drop_privileges(policy).map_err(|err| std::io::Error::other(err.to_string()))?;
-        crate::process::harden_child_process()
-            .map_err(|err| std::io::Error::other(err.to_string()))?;
-
-        // Phase 2: Enforce the prepared Landlock ruleset + seccomp.
-        // restrict_self() does not require root.
-        #[cfg(target_os = "linux")]
-        if let Some(prepared) = prepared {
-            crate::sandbox::linux::enforce(prepared)
-                .map_err(|err| std::io::Error::other(err.to_string()))?;
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        sandbox::apply(policy, None).map_err(|err| std::io::Error::other(err.to_string()))?;
-
-        Ok(())
-    }
-}
-
-=======
->>>>>>> upstream/main
 fn to_u16(value: u32) -> u16 {
     u16::try_from(value.min(u32::from(u16::MAX))).unwrap_or(u16::MAX)
 }
@@ -2150,25 +1460,6 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
 
         drop(listener);
-    }
-
-    #[test]
-    fn requested_user_resolves_numeric_zero_aliases_to_root() {
-        assert!(requested_user_resolves_to_root("0").unwrap());
-        assert!(requested_user_resolves_to_root("00").unwrap());
-        assert!(requested_user_resolves_to_root("000").unwrap());
-    }
-
-    #[test]
-    fn requested_user_resolves_root_name_to_root_when_present() {
-        if nix::unistd::User::from_name("root").unwrap().is_some() {
-            assert!(requested_user_resolves_to_root("root").unwrap());
-        }
-    }
-
-    #[test]
-    fn requested_user_does_not_treat_unknown_name_as_root() {
-        assert!(!requested_user_resolves_to_root("__openshell_unknown_user__").unwrap());
     }
 
     /// Verify that dropping the input sender (the operation `channel_eof`

@@ -8008,12 +8008,7 @@ mod tests {
             sandbox_id: sandbox_id.to_string(),
             token: format!("token-{id}"),
             revoked: false,
-<<<<<<< HEAD
-            expires_at_ms: 0,
-            org_id: String::new(),
-=======
             expiration_time: None,
->>>>>>> upstream/main
         }
     }
 

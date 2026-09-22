@@ -10,12 +10,9 @@
 # Configuration precedence (highest to lowest):
 #   CLI flag  >  OPENSHELL_* env var  >  TOML file  >  built-in default
 #
-# Process settings with an OPENSHELL_* mapping can be overridden in
-# ~/.config/openshell/gateway.env or through:
+# To override settings without editing this file, set OPENSHELL_* variables
+# in ~/.config/openshell/gateway.env or run:
 #   systemctl --user edit openshell-gateway
-# Runtime keys under [openshell.settings] have no environment mapping. Edit
-# ~/.config/openshell/gateway.toml for a durable override; runtime CLI changes
-# to a key still present below are overwritten at the next gateway start.
 
 [openshell]
 version = 2
@@ -27,18 +24,9 @@ version = 2
 # Pin to the Podman compute driver. Without this, the gateway auto-detects
 # in order: Kubernetes, Podman, Docker. Pinning prevents unexpected driver
 # selection if Docker is also installed on the host.
-<<<<<<< HEAD
-compute_drivers = ["podman"]
-
-[openshell.settings]
-# Keep user-service/container logs focused on warnings and findings. JSONL
-# audit export remains controlled separately by ocsf_json_enabled.
-ocsf_shorthand_min_severity = "medium"
-=======
 compute_driver = "podman"
 
 [openshell.drivers.podman]
 # Keep the packaged local-gateway readiness behavior after health checks became
 # opt-in in the Podman driver. Omit this setting only to disable health checks.
 health_check_interval_secs = 10
->>>>>>> upstream/main
