@@ -489,11 +489,12 @@ management. RBAC uses a namespace-scoped Role.
 
 **Managed** auto-creates a K8s namespace per workspace on first sandbox create.
 Each new namespace receives a ServiceAccount and the configured gateway-only
-SSH ingress NetworkPolicy. Configured image-pull Secrets are copied from the
-driver's source namespace on every sandbox create so registry credential
-rotations propagate. Their names are operator-selected gateway configuration,
-not caller attachments. Copies carry gateway and workspace ownership labels; an
-unrelated existing target is never adopted. The namespace also copies
+SSH ingress NetworkPolicy. Each sandbox runtime generation gets immutable copies
+of the configured image-pull Secrets, read from the driver's source namespace and
+named after the generation, so a sandbox picks up rotated registry credentials
+on its next start. Their sources are operator-selected gateway configuration,
+not caller attachments. An existing Secret with a generation name fails the
+create and is never adopted. The namespace also copies
 OpenShift SCC UID-range and supplemental-group annotations from the gateway
 namespace when present. The driver deletes the namespace during workspace
 deletion. The workspace remains durably `Terminating` until the Kubernetes API
@@ -505,14 +506,15 @@ DNS-1123 label at startup) so the namespace prefix fits within the K8s 63-charac
 limit. RBAC promotes sandbox CRD permissions to a ClusterRole and adds namespace
 `create`/`delete` and ServiceAccount `create`/`get` permissions.
 
-Secret copies use server-side apply. Kubernetes authorizes an apply to an
-existing Secret as `patch`, but also requires `create` authorization when the
-target does not exist. RBAC cannot constrain `create` by `resourceNames`, so
-managed mode grants cluster-wide Secret `create`, `list`, and `delete` for
-generation-scoped bootstrap Secret creation and rollback recovery while keeping
-source reads and subsequent patches restricted to the explicitly configured TLS
-and image-pull Secret names. Recovery lists bootstrap Secrets by sandbox and
-component labels, then deletes stale generations with UID preconditions. The
+Outside shared mode, the gateway client TLS material is staged into each
+generation's supervisor bootstrap Secret rather than mounted from a Secret in
+the workspace namespace. Every Secret the driver writes into a workspace
+namespace is therefore generation-scoped, immutable, and created with `create`
+only. RBAC cannot constrain `create` by `resourceNames`, so managed mode grants
+cluster-wide Secret `create` and `delete`; source reads use a Role in the
+driver's source namespace. Recovery deletes the Secrets of the recorded and
+target runtime generations by exact name; Pod owner references let garbage
+collection remove any other generation. The
 driver exercises these broad permissions only in gateway-owned managed
 namespaces. This depends on the managed-mode ownership invariant described below;
 the gateway ServiceAccount must not be shared with unrelated workloads.
@@ -520,6 +522,9 @@ the gateway ServiceAccount must not be shared with unrelated workloads.
 Operator mode does not create NetworkPolicies or copy image-pull Secrets.
 Platform teams must apply the gateway ingress boundary and provision configured
 image-pull Secrets in every operator-managed namespace.
+The gateway ClusterRole grants no Secret permissions in operator mode. The
+`openshell-workspace` chart Role installed in each operator-managed namespace
+grants bootstrap Secret `create` and `delete`.
 
 **Operator** uses pre-provisioned namespaces discovered through two optional
 sources: a K8s label selector (`operator_namespace_label`) and a drop-in
@@ -579,9 +584,10 @@ isolation boundary.
 ### Credential Driver Integration
 
 The Kubernetes Secrets credential driver (`openshell-driver-kubernetes-secrets`)
-stores secrets in workspace-specific namespaces when `workspace_mode` is managed
-or operator. In shared mode, all secrets render into the single configured
-namespace.
+stores every provider credential in its single configured namespace, in every
+workspace mode, and rejects handles that reference another namespace. The
+gateway reaches those Secrets through a namespaced Role; the gateway
+ClusterRole grants no credential Secret permissions.
 
 When runtime infrastructure changes, validate the relevant sandbox e2e path and
 update the matching driver README if a maintainer-facing constraint changes.

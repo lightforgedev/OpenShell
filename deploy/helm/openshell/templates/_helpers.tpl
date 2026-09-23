@@ -170,6 +170,27 @@ Namespace where sandbox pods are created. An explicit
 {{- end }}
 
 {{/*
+Secrets in the sandbox namespace whose contents the Kubernetes driver stages
+into per-generation Secrets in workspace namespaces, as a JSON array. Empty in
+shared workspace mode.
+*/}}
+{{- define "openshell.workspaceSecretSourceNames" -}}
+{{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" -}}
+{{- $names := list -}}
+{{- if and (ne $workspaceMode "shared") (not .Values.server.disableTls) -}}
+{{- $names = append $names .Values.server.tls.clientTlsSecretName -}}
+{{- end -}}
+{{- if eq $workspaceMode "managed" -}}
+{{- range .Values.server.sandboxImagePullSecrets -}}
+{{- if .name -}}
+{{- $names = append $names .name -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- uniq $names | toJson -}}
+{{- end }}
+
+{{/*
 Namespace where Kubernetes Secret-backed provider credentials live.
 */}}
 {{- define "openshell.credentialKubernetesSecretsNamespace" -}}
