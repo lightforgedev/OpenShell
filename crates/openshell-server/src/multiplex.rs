@@ -43,7 +43,7 @@ use crate::{
     service_http_router,
 };
 
-#[cfg(feature = "connect-manager-test-bearer")]
+#[cfg(any(test, feature = "connect-manager-test-bearer"))]
 const CONNECT_MANAGER_TEST_BEARER: &str = "aegis-connect-manager-test-v1";
 
 /// Request-ID generator that produces a UUID v4 for each inbound request.
@@ -546,7 +546,7 @@ fn unauthenticated_dev_user_principal() -> Principal {
     })
 }
 
-#[cfg(feature = "connect-manager-test-bearer")]
+#[cfg(any(test, feature = "connect-manager-test-bearer"))]
 fn connect_manager_test_principal(headers: &http::HeaderMap) -> Option<Principal> {
     let expected = format!("Bearer {CONNECT_MANAGER_TEST_BEARER}");
     (headers
@@ -566,7 +566,7 @@ fn connect_manager_test_principal(headers: &http::HeaderMap) -> Option<Principal
     })
 }
 
-#[cfg(not(feature = "connect-manager-test-bearer"))]
+#[cfg(not(any(test, feature = "connect-manager-test-bearer")))]
 fn connect_manager_test_principal(_headers: &http::HeaderMap) -> Option<Principal> {
     None
 }
