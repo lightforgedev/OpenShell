@@ -123,8 +123,12 @@ ARG OPENSHELL_IMAGE_TAG
 RUN --mount=type=cache,id=cargo-registry-cli-macos,sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-cli-macos,sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-cli-macos-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
+    --mount=type=secret,id=READ_ONLY_GITHUB_TOKEN,required=false \
     if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
       sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
+    fi && \
+    if [ -f /run/secrets/READ_ONLY_GITHUB_TOKEN ]; then \
+      export READ_ONLY_GITHUB_TOKEN="$(cat /run/secrets/READ_ONLY_GITHUB_TOKEN)"; \
     fi && \
     cargo build --release --target aarch64-apple-darwin -p openshell-cli --features bundled-z3 && \
     cp target/aarch64-apple-darwin/release/openshell /openshell

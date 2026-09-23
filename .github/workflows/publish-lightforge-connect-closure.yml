@@ -142,6 +142,8 @@ jobs:
     needs: merge-ci
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      READ_ONLY_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -155,6 +157,7 @@ jobs:
           docker buildx build \
             --file deploy/docker/Dockerfile.cli-macos \
             --build-arg CARGO_TARGET_CACHE_SCOPE="connect-${GITHUB_SHA}" \
+            --secret id=READ_ONLY_GITHUB_TOKEN,env=READ_ONLY_GITHUB_TOKEN \
             --target binary \
             --output type=local,dest=out/ \
             .
