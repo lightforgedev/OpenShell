@@ -55,6 +55,12 @@ TCP mediation accepts use the same authenticated transport recovery as process w
 
 A renewed Sandbox Protocol bearer is authenticated even when its credential epoch is unchanged. The supervisor confirms that bearer on the active physical connection and records its fingerprint only after confirmation succeeds, preserving pending streams and the mediation session. Changing the credential epoch still requires an authenticated replacement connection.
 
+Local single-player Docker, Podman, and VM gateways propagate an omitted
+`gateway_jwt.ttl_secs` value to both launch-scoped credential profiles. Those
+credentials use `exp = 0`, so host suspension cannot strand the supervisor
+after a refresh deadline passes. Shared deployments retain expiring credentials
+and a durable compute-platform bootstrap identity.
+
 Unauthenticated TLS handshakes have a separate bounded asynchronous pool and
 five-second deadline, never consuming authenticated control slots or threads.
 The socket broker reserves the TCP control-listener port against workload
@@ -669,6 +675,12 @@ sandbox workload directly. The relay supports:
   buffer, and a single stdin lease across client disconnects. Ctrl-C interrupts
   the foreground process. For read-only attachments, Ctrl-C only exits the
   current viewer.
+- Supervised CLI attachment. After an established SSH transport fails, the CLI
+  remains alive, requests a fresh SSH session from the gateway, and reattaches
+  to the same canonical main process within a bounded recovery window. It does
+  not stop or restart the sandbox to recover the client connection. The same
+  deadline bounds replacement-session RPCs. Process-targeted termination is
+  forwarded to the SSH child, which the CLI reaps before exiting.
 - Independent interactive shell sessions.
 - Command execution. Commands run through a login shell (`bash -lc`) by default,
   so the first of the user's `.bash_profile`, `.bash_login`, or `.profile` is
