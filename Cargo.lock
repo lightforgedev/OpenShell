@@ -4841,6 +4841,7 @@ dependencies = [
  "openshell-isolation-interface",
  "openshell-ocsf",
  "openshell-policy",
+ "openshell-policy-schema",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
  "prost-types",
