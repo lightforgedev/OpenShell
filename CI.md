@@ -73,9 +73,14 @@ Main and manual runs also build release binaries, with `continue-on-error: true`
 so Windows failures do not fail the workflow.
 
 Every approved `Branch E2E Checks` run builds the RPM packages, including
-runs without optional E2E labels. Core integration qualification installs the
-CLI and gateway RPMs on Fedora with rootful and rootless Podman and runs conformance using
-the matching runtime images. Release Dev and Release Tag run the same RPM lane.
+runs without optional E2E labels. Core integration qualification builds and installs
+the DEB on Ubuntu with Docker and installs the CLI and gateway RPMs on Fedora with
+rootful and rootless Podman. These lanes run conformance using the matching runtime
+images. Release Dev and Release Tag use the same package installers.
+Fedora provider-refresh tests also use RPMs. The Podman driver-specific suites
+retain the binary installer because their fixtures configure its system service,
+local HTTP gateway, and CLI path. The manual Integration Tests workflow defaults
+to the package installers and downloads the packages selected by its matrix.
 
 Three opt-in labels enable the long-running E2E suites:
 
