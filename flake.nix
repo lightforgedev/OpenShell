@@ -125,9 +125,23 @@
           firmwarePkgs = tmachineRuntimePkgs;
         };
         artifacts = pkgs.callPackage ./tests/artifacts.nix { inherit rustToolchain toolchains; };
+        checkProtobufCompatibility = pkgs.writeShellApplication {
+          name = "check-protobuf-compatibility";
+          runtimeInputs = [
+            pkgs.buf
+            pkgs.git
+          ];
+          text = ''
+            exec ${pkgs.python3}/bin/python3 ${./tasks/scripts}/check_proto_compatibility.py "$@"
+          '';
+        };
       in
       {
         apps = {
+          check-protobuf-compatibility = {
+            type = "app";
+            program = "${checkProtobufCompatibility}/bin/check-protobuf-compatibility";
+          };
           build-artifacts = {
             type = "app";
             program = "${artifacts.all}/bin/build-artifacts";
