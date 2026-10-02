@@ -2506,7 +2506,7 @@ async fn sandbox_exec_streaming_grpc(
                     if forwarded > MAX_EXEC_STDIN_BYTES {
                         return Err(std::io::Error::new(
                             ErrorKind::InvalidInput,
-                            piped_stdin_limit_error().to_string(),
+                            "streamed stdin exceeds the 4 MiB limit; the command may have processed partial input; use `sandbox upload` for larger input",
                         ));
                     }
                     if stdin_tx
@@ -2648,7 +2648,9 @@ async fn sandbox_exec_streaming_grpc(
             Some(exec_sandbox_event::Payload::Exit(exit)) => {
                 exit_code = exit.exit_code;
                 exit_seen = true;
-                break;
+                // Process exit does not complete the RPC. Keep draining so a
+                // failing final gRPC status cannot turn partial output into
+                // a successful execution result.
             }
             None => {}
         }
