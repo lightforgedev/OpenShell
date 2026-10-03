@@ -52,11 +52,12 @@ use openshell_core::proto::compute::v1::{
     DriverSandboxTemplate as SandboxTemplate, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
     GpuResourceCapabilities, ListSandboxesRequest, ListSandboxesResponse,
-    MemoryResourceCapabilities, ResourceCapabilities, StartSandboxRequest, StartSandboxResponse,
-    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
-    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
-    compute_driver_server::ComputeDriver, watch_sandboxes_event,
+    MemoryResourceCapabilities, ResolvedWorkloadIdentity, ResourceCapabilities,
+    StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
+    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
+    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesRequest,
+    WatchSandboxesSandboxEvent, WorkloadIdentityRequest, compute_driver_server::ComputeDriver,
+    watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
@@ -1391,6 +1392,10 @@ impl VmDriver {
                 &overlay_disk,
                 &owner_source_disk,
                 overlay_preparation,
+                sandbox
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.workload_identity.as_ref()),
             )
             .await
             .map_err(|err| Status::internal(format!("prepare guest overlay disk failed: {err}")))?;
@@ -1723,6 +1728,18 @@ impl VmDriver {
                 Some(record) if !record.deleting => {
                     record.process = Some(process.clone());
                     record.gpu_bdf.clone_from(&gpu_bdf);
+                    let identity = &runtime_descriptor.workload_identity;
+                    record
+                        .snapshot
+                        .status
+                        .get_or_insert_with(SandboxStatus::default)
+                        .resolved_identity = Some(ResolvedWorkloadIdentity {
+                        uid: identity.uid,
+                        gid: identity.gid,
+                        supplementary_gids: identity.supplementary_gids.clone(),
+                        source: identity.source.clone(),
+                        resource_digest: identity.resource_digest.clone(),
+                    });
                     snapshot_to_publish = Some(record.snapshot.clone());
                 }
                 _ => {
@@ -2153,38 +2170,41 @@ impl VmDriver {
                 continue;
             }
 
-            if tokio::fs::metadata(state_dir.join(SANDBOX_STOPPED_FILE))
+            let inactive_condition = if tokio::fs::metadata(state_dir.join(SANDBOX_STOPPED_FILE))
                 .await
                 .is_ok()
             {
-                let snapshot = sandbox_snapshot(&sandbox, stopped_condition(), false);
-                let mut registry = self.registry.lock().await;
-                registry.entry(sandbox.id.clone()).or_insert(SandboxRecord {
-                    snapshot: snapshot.clone(),
-                    state_dir: state_dir.clone(),
-                    process: None,
-                    provisioning_task: None,
-                    gpu_bdf: None,
-                    deleting: false,
-                });
-                drop(registry);
-                self.publish_snapshot(snapshot);
-                info!(sandbox_id = %sandbox.id, "vm driver: restored stopped sandbox without launching compute");
-                continue;
-            }
-
-            if tokio::fs::try_exists(state_dir.join(MAIN_PROCESS_EXITED_FILE))
+                Some(stopped_condition())
+            } else if tokio::fs::try_exists(state_dir.join(MAIN_PROCESS_EXITED_FILE))
                 .await
                 .unwrap_or(false)
             {
-                let snapshot = sandbox_snapshot(
-                    &sandbox,
-                    error_condition(
-                        "ProcessExited",
-                        "Canonical main process exited before VM driver restart",
-                    ),
-                    false,
-                );
+                Some(error_condition(
+                    "ProcessExited",
+                    "Canonical main process exited before VM driver restart",
+                ))
+            } else {
+                None
+            };
+            if let Some(condition) = inactive_condition {
+                // These sandboxes do not run the launch path that publishes
+                // identity. Recover it from the same validated owner marker
+                // before either GetSandbox or WatchSandboxes can observe them.
+                let identity = match read_persisted_workload_identity(&state_dir).await {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        warn!(sandbox_id = %sandbox.id, %error, "vm driver: ignoring invalid persisted workload identity");
+                        // Keep inactive resources manageable even when their
+                        // identity cannot be trusted. Explicit deletion still
+                        // needs this registry entry to remove persisted state.
+                        None
+                    }
+                };
+                let mut snapshot = sandbox_snapshot(&sandbox, condition, false);
+                snapshot
+                    .status
+                    .get_or_insert_with(SandboxStatus::default)
+                    .resolved_identity = identity;
                 let mut registry = self.registry.lock().await;
                 registry.entry(sandbox.id.clone()).or_insert(SandboxRecord {
                     snapshot: snapshot.clone(),
@@ -2198,7 +2218,7 @@ impl VmDriver {
                 self.publish_snapshot(snapshot);
                 info!(
                     sandbox_id = %sandbox.id,
-                    "vm driver: preserved terminal sandbox without restarting canonical process"
+                    "vm driver: restored inactive sandbox without launching compute"
                 );
                 continue;
             }
@@ -2765,6 +2785,7 @@ impl VmDriver {
         overlay_disk: &Path,
         owner_source_disk: &Path,
         preparation: OverlayPreparation,
+        requested_identity: Option<&WorkloadIdentityRequest>,
     ) -> Result<SandboxOwnerIdentity, String> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let overlay_disk = overlay_disk.to_path_buf();
@@ -2786,6 +2807,9 @@ impl VmDriver {
             preparation,
         )
         .await?;
+        // Validate before creating or recovering an overlay. A conflicting
+        // request must never change the persisted owner or its files.
+        validate_vm_workload_identity(requested_identity, owner_state)?;
         let owner_state_written_before_prepare =
             write_owner_state && preparation == OverlayPreparation::Fresh;
         if owner_state_written_before_prepare {
@@ -5769,6 +5793,35 @@ async fn persisted_sandbox_owner_identity(
     Ok(None)
 }
 
+/// Reconstruct status from the owner chosen during preparation, never from a
+/// new driver default or a status embedded in the persisted create request.
+/// Missing or v1 markers do not contain an identity to report. Invalid owner
+/// data must not be published as a resolved identity.
+async fn read_persisted_workload_identity(
+    state_dir: &Path,
+) -> Result<Option<ResolvedWorkloadIdentity>, String> {
+    let contents = match tokio::fs::read_to_string(state_dir.join(SANDBOX_OWNER_STATE_FILE)).await {
+        Ok(contents) if contents.trim() == SANDBOX_OWNER_STATE_V1 => return Ok(None),
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read sandbox owner state: {error}")),
+    };
+    let owner = parse_sandbox_owner_state(&contents)
+        .map_err(|error| format!("invalid sandbox owner state: {error}"))?;
+    let resource_digest = match read_persisted_image_identity(state_dir).await {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("read persisted VM image identity: {error}")),
+    };
+    Ok(Some(ResolvedWorkloadIdentity {
+        uid: owner.uid,
+        gid: owner.gid,
+        supplementary_gids: Vec::new(),
+        source: "vm-config".into(),
+        resource_digest,
+    }))
+}
+
 async fn sandbox_owner_identity_from_image(
     image_path: &Path,
 ) -> Result<SandboxOwnerIdentity, String> {
@@ -6788,8 +6841,33 @@ fn status_with_condition(
         sandbox_fd: String::new(),
         conditions: vec![condition],
         deleting,
-        ..Default::default()
+        ..snapshot.status.clone().unwrap_or_default()
     }
+}
+
+/// VM init reconciles the named `sandbox` account to this overlay's owner.
+/// Numeric selectors assert that same immutable identity; they cannot select
+/// a new owner. Each empty selector independently accepts the driver default.
+fn validate_vm_workload_identity(
+    request: Option<&WorkloadIdentityRequest>,
+    owner: SandboxOwnerIdentity,
+) -> Result<(), String> {
+    let Some(request) = request else {
+        return Ok(());
+    };
+    for (field, selector, expected) in [
+        ("run_as_user", request.user.as_str(), owner.uid),
+        ("run_as_group", request.group.as_str(), owner.gid),
+    ] {
+        if selector.is_empty() || selector == "sandbox" || selector.parse::<u32>() == Ok(expected) {
+            continue;
+        }
+        return Err(format!(
+            "VM {field} '{selector}' conflicts with the resolved workload identity {}:{}; omit the selector or request the driver-owned identity",
+            owner.uid, owner.gid
+        ));
+    }
+    Ok(())
 }
 
 fn provisioning_condition() -> SandboxCondition {
@@ -7458,6 +7536,172 @@ mod tests {
         }
     }
 
+    async fn assert_inactive_restore_retains_identity(marker: &str, reason: &str) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        // Current driver defaults and serialized status are not evidence of
+        // the identity that owns an already prepared overlay.
+        driver.config.sandbox_uid = Some(9000);
+        driver.config.sandbox_gid = Some(9001);
+        let sandbox = Sandbox {
+            id: "sb-inactive-identity".into(),
+            name: "inactive-identity".into(),
+            status: Some(SandboxStatus {
+                resolved_identity: Some(ResolvedWorkloadIdentity {
+                    uid: 8000,
+                    gid: 8001,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let state_dir = sandboxes_root_dir(temp.path()).join(&sandbox.id);
+        tokio::fs::create_dir_all(&state_dir).await.unwrap();
+        write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+        write_sandbox_owner_state(
+            &state_dir,
+            SandboxOwnerIdentity {
+                uid: 4242,
+                gid: 4343,
+            },
+        )
+        .await
+        .unwrap();
+        write_sandbox_image_metadata(&state_dir, "unused-image", "sha256:original-image")
+            .await
+            .unwrap();
+        tokio::fs::write(state_dir.join(marker), b"inactive\n")
+            .await
+            .unwrap();
+        let mut events = driver.events.subscribe();
+
+        driver.restore_persisted_sandboxes().await;
+
+        let restored = driver
+            .get_sandbox(&sandbox.id, &sandbox.name)
+            .await
+            .unwrap()
+            .unwrap();
+        let status = restored.status.as_ref().unwrap();
+        assert_eq!(status.conditions[0].reason, reason);
+        let identity = status
+            .resolved_identity
+            .as_ref()
+            .expect("restored overlay owner");
+        assert_eq!((identity.uid, identity.gid), (4242, 4343));
+        assert!(identity.supplementary_gids.is_empty());
+        assert_eq!(identity.source, "vm-config");
+        assert_eq!(identity.resource_digest, "sha256:original-image");
+        let registry = driver.registry.lock().await;
+        let record = registry.get(&sandbox.id).unwrap();
+        assert!(record.process.is_none());
+        assert!(record.provisioning_task.is_none());
+        drop(registry);
+        let event = events.try_recv().expect("restored snapshot event");
+        let Some(watch_sandboxes_event::Payload::Sandbox(event)) = event.payload else {
+            panic!("expected sandbox snapshot event");
+        };
+        assert_eq!(event.sandbox.as_ref(), Some(&restored));
+        assert_eq!(
+            tokio::fs::read_to_string(state_dir.join(SANDBOX_OWNER_STATE_FILE))
+                .await
+                .unwrap(),
+            "sandbox-owner-v2:4242:4343\n"
+        );
+        assert!(state_dir.join(marker).exists());
+    }
+
+    #[tokio::test]
+    async fn stopped_restore_retains_persisted_workload_identity() {
+        assert_inactive_restore_retains_identity(SANDBOX_STOPPED_FILE, "ComputeStopped").await;
+    }
+
+    #[tokio::test]
+    async fn terminal_restore_retains_persisted_workload_identity() {
+        assert_inactive_restore_retains_identity(MAIN_PROCESS_EXITED_FILE, "ProcessExited").await;
+    }
+
+    #[tokio::test]
+    async fn inactive_restore_keeps_invalid_metadata_manageable() {
+        for (marker, reason) in [
+            (SANDBOX_STOPPED_FILE, "ComputeStopped"),
+            (MAIN_PROCESS_EXITED_FILE, "ProcessExited"),
+        ] {
+            for invalid_owner in [true, false] {
+                let temp = tempfile::tempdir().unwrap();
+                let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+                driver.config.state_dir = temp.path().to_path_buf();
+                let sandbox = Sandbox {
+                    id: "sb-invalid-owner".into(),
+                    name: "invalid-owner".into(),
+                    ..Default::default()
+                };
+                let state_dir = sandboxes_root_dir(temp.path()).join(&sandbox.id);
+                tokio::fs::create_dir_all(&state_dir).await.unwrap();
+                write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+                tokio::fs::write(state_dir.join(marker), b"inactive\n")
+                    .await
+                    .unwrap();
+                let owner = if invalid_owner {
+                    "sandbox-owner-v2:0:4343\n"
+                } else {
+                    "sandbox-owner-v2:4242:4343\n"
+                };
+                tokio::fs::write(state_dir.join(SANDBOX_OWNER_STATE_FILE), owner)
+                    .await
+                    .unwrap();
+                if !invalid_owner {
+                    // A directory deterministically fails read_to_string on every test host.
+                    tokio::fs::create_dir(state_dir.join(IMAGE_IDENTITY_FILE))
+                        .await
+                        .unwrap();
+                }
+                let mut events = driver.events.subscribe();
+
+                driver.restore_persisted_sandboxes().await;
+
+                let restored = driver
+                    .get_sandbox(&sandbox.id, &sandbox.name)
+                    .await
+                    .unwrap()
+                    .expect("inactive sandbox remains manageable");
+                let status = restored.status.as_ref().unwrap();
+                assert_eq!(status.conditions[0].reason, reason);
+                assert!(status.resolved_identity.is_none());
+                let registry = driver.registry.lock().await;
+                let record = registry.get(&sandbox.id).unwrap();
+                assert!(record.process.is_none());
+                assert!(record.provisioning_task.is_none());
+                drop(registry);
+                let event = events.try_recv().expect("inactive snapshot event");
+                let Some(watch_sandboxes_event::Payload::Sandbox(event)) = event.payload else {
+                    panic!("expected sandbox snapshot");
+                };
+                assert_eq!(event.sandbox.as_ref(), Some(&restored));
+                assert!(state_dir.join(marker).exists());
+                assert_eq!(
+                    tokio::fs::read_to_string(state_dir.join(SANDBOX_OWNER_STATE_FILE))
+                        .await
+                        .unwrap(),
+                    owner
+                );
+                assert!(
+                    driver
+                        .delete_sandbox(&sandbox.id, &sandbox.name)
+                        .await
+                        .unwrap()
+                        .deleted
+                );
+                assert!(
+                    !state_dir.exists(),
+                    "explicit delete removes retained state"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn startup_does_not_restore_terminal_canonical_process() {
         let temp = tempfile::tempdir().unwrap();
@@ -7492,6 +7736,10 @@ mod tests {
         assert!(record.process.is_none());
         assert!(record.provisioning_task.is_none());
         let status = record.snapshot.status.as_ref().expect("terminal status");
+        assert!(
+            status.resolved_identity.is_none(),
+            "an absent owner marker must not invent an identity"
+        );
         assert!(status.conditions.iter().any(|condition| {
             condition.reason == "ProcessExited" && condition.status == "False"
         }));
@@ -7591,6 +7839,7 @@ mod tests {
                 Path::new("/unused"),
                 Path::new("/unused"),
                 OverlayPreparation::Fresh,
+                None,
             )
             .instrument(parent)
             .await;
@@ -8174,6 +8423,117 @@ mod tests {
                 .expect_err("path-unsafe sandbox id should be rejected");
             assert_eq!(err.code(), Code::InvalidArgument, "id={sandbox_id:?}");
             assert!(err.message().contains("sandbox id"), "id={sandbox_id:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn conflicting_vm_identity_preserves_overlay_and_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = SandboxOwnerIdentity {
+            uid: 1000,
+            gid: 1001,
+        };
+        write_sandbox_owner_state(directory.path(), owner)
+            .await
+            .unwrap();
+        let overlay = directory.path().join(SANDBOX_OVERLAY_IMAGE);
+        std::fs::write(&overlay, b"existing overlay must not be touched").unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.sandbox_uid = Some(10000);
+        driver.config.sandbox_gid = Some(10001);
+        let request = WorkloadIdentityRequest {
+            user: "10000".into(),
+            group: "10001".into(),
+        };
+        let error = driver
+            .prepare_runtime_overlay(
+                directory.path(),
+                &overlay,
+                Path::new("/must-not-read-image"),
+                OverlayPreparation::PreserveExisting,
+                Some(&request),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("run_as_user '10000'"), "{error}");
+        assert!(error.contains("1000:1001"), "{error}");
+        assert_eq!(
+            std::fs::read(&overlay).unwrap(),
+            b"existing overlay must not be touched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(SANDBOX_OWNER_STATE_FILE)).unwrap(),
+            owner.marker_contents()
+        );
+    }
+
+    #[test]
+    fn vm_workload_identity_checks_independent_numeric_and_symbolic_selectors() {
+        let owner = SandboxOwnerIdentity {
+            uid: 1000,
+            gid: 1001,
+        };
+        validate_vm_workload_identity(None, owner).unwrap();
+        for (user, group) in [
+            ("", ""),
+            ("1000", ""),
+            ("", "1001"),
+            ("sandbox", "1001"),
+            ("1000", "sandbox"),
+            ("sandbox", "sandbox"),
+        ] {
+            validate_vm_workload_identity(
+                Some(&WorkloadIdentityRequest {
+                    user: user.into(),
+                    group: group.into(),
+                }),
+                owner,
+            )
+            .unwrap();
+        }
+        for (user, group, field) in [
+            ("10000", "", "run_as_user"),
+            ("", "10001", "run_as_group"),
+            ("sandbox", "10001", "run_as_group"),
+            ("nobody", "", "run_as_user"),
+        ] {
+            let error = validate_vm_workload_identity(
+                Some(&WorkloadIdentityRequest {
+                    user: user.into(),
+                    group: group.into(),
+                }),
+                owner,
+            )
+            .unwrap_err();
+            assert!(error.contains(field), "{error}");
+            assert!(error.contains("1000:1001"), "{error}");
+        }
+    }
+
+    #[test]
+    fn vm_lifecycle_status_retains_resolved_workload_identity() {
+        let identity = ResolvedWorkloadIdentity {
+            uid: 1000,
+            gid: 1001,
+            source: "vm-config".into(),
+            resource_digest: "sha256:image".into(),
+            ..Default::default()
+        };
+        let snapshot = Sandbox {
+            status: Some(SandboxStatus {
+                resolved_identity: Some(identity.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for condition in [
+            provisioning_condition(),
+            stopped_condition(),
+            deleting_condition(),
+            error_condition("ProcessExited", "exited"),
+        ] {
+            let status = status_with_condition(&snapshot, condition, false);
+            assert_eq!(status.resolved_identity.as_ref(), Some(&identity));
         }
     }
 
