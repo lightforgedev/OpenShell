@@ -138,10 +138,14 @@ mod tests {
     // decoding or deadline updates cannot claim an existing attempt.
     // SessionRedirect and SupervisorHello.redirected are supervisor control
     // traffic and are never stored.
+    // Token-grant owner fields add gateway-derived metadata to endpoints and
+    // profile credentials reachable from stored policies and provider profiles.
+    // Legacy payloads decode empty owners; the gateway rebuilds their authority
+    // from effective policy rather than trusting persisted owner stamps.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "65f095ab84e3fa37ff2a933bbd22bd1cd337e23faf2a517bc9b4e72ed325c28d";
+        "3fead4a66e57e6828072109564fa25b5b65ef541b35098d9ed7f0785387fe0aa";
     const DURABLE_SCHEMA_SHA256: &str =
-        "c2d62733c8c4a17d831729ea261373b42e979f00ef5b6f79761f3501f27e6fc5";
+        "96269474903e077df4d4861db0dd1004b8a7205604ffadcdaff98d0124f18147";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
