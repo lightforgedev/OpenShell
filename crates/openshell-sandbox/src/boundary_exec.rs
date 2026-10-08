@@ -205,6 +205,18 @@ impl LocalBoundaryExec {
             .map_err(|error| BackendError::Process(error.to_string()))
     }
 
+    #[cfg(target_os = "linux")]
+    fn inject_landlock_evidence(
+        command: &mut Command,
+        prepared: Option<&crate::sandbox::linux::PreparedSandbox>,
+    ) {
+        if let Some(prepared) = prepared
+            && let Some(env_vars) = crate::sandbox::linux::landlock_evidence_env(prepared)
+        {
+            command.envs(env_vars);
+        }
+    }
+
     fn spawn_piped(&self, spec: &ExecSpec) -> Result<SpawnedExec, BackendError> {
         self.runtime.ensure_active()?;
         let mut command = self.command(spec)?;
@@ -215,6 +227,8 @@ impl LocalBoundaryExec {
         let effective_workdir = spec.workdir.as_deref().or(self.base_workdir.as_deref());
         #[cfg(target_os = "linux")]
         let prepared = self.prepare_sandbox(effective_workdir)?;
+        #[cfg(target_os = "linux")]
+        Self::inject_landlock_evidence(&mut command, prepared.as_ref());
         #[cfg(target_os = "linux")]
         let child_hardening =
             openshell_isolation_interface::linux::child_seccomp::prepare(std::process::id())
@@ -326,6 +340,8 @@ impl LocalBoundaryExec {
         let effective_workdir = spec.workdir.as_deref().or(self.base_workdir.as_deref());
         #[cfg(target_os = "linux")]
         let prepared = self.prepare_sandbox(effective_workdir)?;
+        #[cfg(target_os = "linux")]
+        Self::inject_landlock_evidence(&mut command, prepared.as_ref());
         #[cfg(target_os = "linux")]
         let child_hardening =
             openshell_isolation_interface::linux::child_seccomp::prepare(std::process::id())
@@ -708,6 +724,37 @@ mod tests {
             crate::boundary_io::BoundaryRuntimeState::new(),
             launcher,
         )
+    }
+
+    #[test]
+    fn exec_child_inherits_prepared_landlock_evidence() {
+        let mut policy = SandboxPolicy {
+            version: 1,
+            filesystem: openshell_core::policy::FilesystemPolicy::default(),
+            network: openshell_core::policy::NetworkPolicy::default(),
+            landlock: openshell_core::policy::LandlockPolicy {
+                compatibility: openshell_core::policy::LandlockCompatibility::HardRequirement,
+            },
+            process: openshell_core::policy::ProcessPolicy::default(),
+        };
+        policy.filesystem.read_write.push("/tmp".into());
+
+        let Ok(Some(prepared)) = crate::process::prepare_child_sandbox(&policy, None, &[]) else {
+            return;
+        };
+        let expected = crate::sandbox::linux::landlock_evidence_env(&prepared)
+            .expect("hard Landlock preparation must produce evidence");
+        let mut command = Command::new("/usr/bin/env");
+
+        LocalBoundaryExec::inject_landlock_evidence(&mut command, Some(&prepared));
+
+        let actual = command
+            .get_envs()
+            .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
+            .collect::<HashMap<_, _>>();
+        for (key, value) in &expected {
+            assert_eq!(actual.get(key.as_str()), Some(&value.as_str()));
+        }
     }
 
     #[test]
