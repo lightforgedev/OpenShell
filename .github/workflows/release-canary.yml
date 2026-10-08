@@ -20,6 +20,7 @@ defaults:
     shell: bash
 
 env:
+  CANARY_SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
   OPENSHELL_VERSION: dev
   OPENSHELL_TELEMETRY_ENABLED: "false"
 
@@ -38,7 +39,7 @@ jobs:
       - name: Install and check gateway status
         run: |
           set -euo pipefail
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
+          curl -LsSf "https://raw.githubusercontent.com/NVIDIA/OpenShell/${CANARY_SOURCE_SHA}/install.sh" | sh
           openshell --version
           openshell status
 
@@ -79,7 +80,7 @@ jobs:
       - name: Install and check status
         run: |
           set -euo pipefail
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
+          curl -LsSf "https://raw.githubusercontent.com/NVIDIA/OpenShell/${CANARY_SOURCE_SHA}/install.sh" | sh
           openshell status
           sandbox="rc-${GITHUB_RUN_ID}"
           openshell sandbox create --name "$sandbox" --detach
@@ -167,7 +168,7 @@ jobs:
             OPENSHELL_VERSION="$OPENSHELL_VERSION" \
             OPENSHELL_TELEMETRY_ENABLED="$OPENSHELL_TELEMETRY_ENABLED" \
             CANARY_SANDBOX="rc-${GITHUB_RUN_ID}" \
-            INSTALL_SH_URL="https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh" \
+            INSTALL_SH_URL="https://raw.githubusercontent.com/NVIDIA/OpenShell/${CANARY_SOURCE_SHA}/install.sh" \
             bash -s <<'EOF'
           set -euo pipefail
           mkdir -p "${HOME}/.config/openshell"
@@ -341,7 +342,7 @@ jobs:
           set -euo pipefail
           mkdir -p "${HOME}/.config/openshell"
           printf 'OPENSHELL_COMPUTE_DRIVER=docker\n' > "${HOME}/.config/openshell/gateway.env"
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
+          curl -LsSf "https://raw.githubusercontent.com/NVIDIA/OpenShell/${CANARY_SOURCE_SHA}/install.sh" | sh
 
       - name: Register kind gateway and check status
         run: |

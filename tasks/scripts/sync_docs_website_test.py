@@ -90,9 +90,10 @@ def test_sync_workflow_serializes_sync_and_publish() -> None:
     assert publish_input["type"] == "boolean"
     assert publish_input["default"] == "false"
     assert workflow["concurrency"]["group"] == "docs-website"
-    assert workflow["concurrency"]["queue"] == "max"
+    assert workflow["concurrency"]["cancel-in-progress"] == "false"
     publish_workflow = read_workflow("publish-docs-website.yml")
-    assert publish_workflow["concurrency"]["queue"] == "max"
+    assert publish_workflow["concurrency"]["group"] == "docs-website"
+    assert publish_workflow["concurrency"]["cancel-in-progress"] == "false"
 
     steps = workflow["jobs"]["sync"]["steps"]
     step_names = [step["name"] for step in steps]

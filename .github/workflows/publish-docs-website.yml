@@ -25,7 +25,6 @@ permissions:
 concurrency:
   group: docs-website
   cancel-in-progress: false
-  queue: max
 
 defaults:
   run:

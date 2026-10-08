@@ -68,10 +68,10 @@ struct DeviceTokenErrorResponse {
 ///
 /// Validates that the discovery document's `issuer` field matches the
 /// configured issuer URL to prevent SSRF or misdirection.
-async fn discover(issuer: &str, insecure: bool) -> Result<OidcDiscovery> {
+async fn discover(issuer: &str, _insecure: bool) -> Result<OidcDiscovery> {
     let normalized_issuer = issuer.trim_end_matches('/');
     let url = format!("{normalized_issuer}/.well-known/openid-configuration");
-    let client = http_client(insecure);
+    let client = http_client();
     let resp: OidcDiscovery = client
         .get(&url)
         .send()
@@ -92,13 +92,12 @@ async fn discover(issuer: &str, insecure: bool) -> Result<OidcDiscovery> {
     Ok(resp)
 }
 
-fn http_client(insecure: bool) -> reqwest::Client {
+fn http_client() -> reqwest::Client {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let mut builder = reqwest::ClientBuilder::new().redirect(reqwest::redirect::Policy::none());
-    if insecure {
-        builder = builder.danger_accept_invalid_certs(true);
-    }
-    builder.build().expect("failed to build HTTP client")
+    reqwest::ClientBuilder::new()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to build HTTP client")
 }
 
 fn build_scopes(scopes: Option<&str>) -> Vec<Scope> {
@@ -247,7 +246,7 @@ pub async fn oidc_browser_auth_flow(
 
     server_handle.abort();
 
-    let http = http_client(insecure);
+    let http = http_client();
     let token_response = client
         .exchange_code(AuthorizationCode::new(code))
         .set_pkce_verifier(pkce_verifier)
@@ -293,7 +292,7 @@ pub async fn oidc_client_credentials_flow(
         request = request.add_extra_param("audience", aud);
     }
 
-    let http = http_client(insecure);
+    let http = http_client();
     let token_response = request
         .request_async(&http)
         .await
@@ -328,7 +327,7 @@ pub async fn oidc_device_code_flow(
     })?;
 
     // Step 1: Request device and user codes
-    let http = http_client(insecure);
+    let http = http_client();
     let scopes_param = build_scopes(scopes)
         .iter()
         .map(|s| s.to_string())
@@ -733,20 +732,11 @@ mod tests {
 
     #[test]
     fn http_client_secure_rejects_self_signed() {
-        let client = http_client(false);
+        let client = http_client();
         let rt = tokio::runtime::Runtime::new().unwrap();
         // A real self-signed server isn't available in unit tests, but we can
         // verify the client is constructed and makes requests. The secure client
         // should exist and function for valid endpoints.
-        let result = rt.block_on(async { client.get("https://127.0.0.1:1").send().await });
-        assert!(result.is_err(), "connection to closed port should fail");
-    }
-
-    #[test]
-    fn http_client_insecure_builds_without_panic() {
-        let client = http_client(true);
-        // Verify the client is usable (doesn't panic on construction).
-        let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(async { client.get("https://127.0.0.1:1").send().await });
         assert!(result.is_err(), "connection to closed port should fail");
     }
@@ -761,10 +751,9 @@ mod tests {
     }
 
     #[test]
-    fn discover_insecure_passes_flag_through() {
+    fn discover_insecure_does_not_disable_oidc_tls_validation() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        // Same as above but with insecure=true. Should still fail on
-        // connection (no server) but must not panic.
+        // The compatibility flag no longer changes the OIDC HTTP client.
         let result = rt.block_on(discover("https://127.0.0.1:1/realms/test", true));
         assert!(result.is_err());
     }

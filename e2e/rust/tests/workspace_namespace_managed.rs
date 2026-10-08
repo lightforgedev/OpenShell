@@ -194,7 +194,7 @@ async fn managed_creates_namespace_with_labels() {
     .await;
     assert!(
         ok && copied_secret.contains("kubernetes.io/dockerconfigjson"),
-        "configured image-pull Secret should be copied into {ns}: {copied_secret}"
+        "configured image-pull Secret should be copied into {ns}"
     );
 
     // Verify SSH ingress is restricted to the gateway peer. Because Kubernetes

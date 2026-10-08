@@ -33,28 +33,28 @@ static SANDBOX_LIFECYCLE_LOCK: Mutex<()> = Mutex::const_new(());
 struct IdentityScenario {
     gateway_name: &'static str,
     username: &'static str,
-    password: &'static str,
+    password_env: &'static str,
     expected_role: &'static str,
 }
 
 const ADMIN: IdentityScenario = IdentityScenario {
     gateway_name: "oidc-pkce-admin",
     username: "admin@test",
-    password: "admin",
+    password_env: "OPENSHELL_E2E_OIDC_ADMIN_PASSWORD",
     expected_role: "openshell-admin",
 };
 
 const USER: IdentityScenario = IdentityScenario {
     gateway_name: "oidc-pkce-user",
     username: "user@test",
-    password: "user",
+    password_env: "OPENSHELL_E2E_OIDC_USER_PASSWORD",
     expected_role: "openshell-user",
 };
 
 const USER_B: IdentityScenario = IdentityScenario {
     gateway_name: "oidc-pkce-user-b",
     username: "user-b@test",
-    password: "user-b",
+    password_env: "OPENSHELL_E2E_OIDC_USER_B_PASSWORD",
     expected_role: "openshell-user",
 };
 
@@ -1087,13 +1087,9 @@ async fn login_identity(identity: IdentityScenario) -> LoginSession {
     let cookie_jar = temp.path().join("keycloak-cookies");
     let login_page = curl_get(&authorization_url, &cookie_jar).await;
     let login_action = extract_login_action(&login_page);
-    let callback_page = curl_login(
-        &login_action,
-        &cookie_jar,
-        identity.username,
-        identity.password,
-    )
-    .await;
+    let password = std::env::var(identity.password_env)
+        .unwrap_or_else(|_| panic!("OIDC E2E requires {}", identity.password_env));
+    let callback_page = curl_login(&login_action, &cookie_jar, identity.username, &password).await;
     assert!(
         callback_page.contains("Authentication successful"),
         "loopback callback did not return its success page:\n{callback_page}"
@@ -1358,8 +1354,7 @@ async fn assert_allowed(session: &LoginSession, args: &[&str], action: &str) -> 
     let output = run_session_cli(session, args).await;
     assert!(
         output.status.success(),
-        "{} should be allowed to {action}:\n{}",
-        session.identity.username,
+        "fixture identity should be allowed to {action}:\n{}",
         combined_output(&output)
     );
     output
@@ -1374,8 +1369,7 @@ async fn assert_workspace_allowed(
     let output = run_workspace_cli(session, workspace, args).await;
     assert!(
         output.status.success(),
-        "{} should be allowed to {action} in workspace {workspace}:\n{}",
-        session.identity.username,
+        "fixture identity should be allowed to {action} in workspace {workspace}:\n{}",
         combined_output(&output)
     );
     output
@@ -1444,10 +1438,7 @@ async fn delete_workspace(admin: &LoginSession, workspace: &str) {
         }
         let stderr = combined_output(&output);
         if !stderr.contains("still contains") {
-            panic!(
-                "{} should be allowed to delete workspace {workspace}:\n{stderr}",
-                admin.identity.username
-            );
+            panic!("admin fixture should be allowed to delete workspace {workspace}:\n{stderr}");
         }
         if attempt == 29 {
             panic!("workspace {workspace} still contains resources after 30 retries:\n{stderr}");
@@ -1481,8 +1472,7 @@ async fn assert_can_create_sandbox(session: &LoginSession, workspace: &str, sand
     if !create.status.success() {
         let _ = run_workspace_cli(session, workspace, &["sandbox", "delete", sandbox_name]).await;
         panic!(
-            "{} should be allowed to create sandbox {sandbox_name}:\n{create_output}",
-            session.identity.username
+            "fixture identity should be allowed to create sandbox {sandbox_name}:\n{create_output}"
         );
     }
 
@@ -1530,8 +1520,7 @@ async fn assert_can_delete_sandbox(session: &LoginSession, workspace: &str, sand
     if !delete.status.success() {
         let _ = run_workspace_cli(session, workspace, &["sandbox", "delete", sandbox_name]).await;
         panic!(
-            "{} should be allowed to delete sandbox {sandbox_name}:\n{delete_output}",
-            session.identity.username
+            "fixture identity should be allowed to delete sandbox {sandbox_name}:\n{delete_output}"
         );
     }
 

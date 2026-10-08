@@ -18,7 +18,7 @@ runs:
 
     - name: Configure prebuilt gateway
       shell: bash
-      run: |
+      run: | # zizmor: ignore[github-env] validated filename under the trusted workspace path
         gateway="$GITHUB_WORKSPACE/.e2e/prebuilt-gateway/openshell-gateway"
         chmod +x "$gateway"
         "$gateway" --version

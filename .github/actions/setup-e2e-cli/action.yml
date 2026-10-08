@@ -18,7 +18,7 @@ runs:
 
     - name: Configure prebuilt CLI
       shell: bash
-      run: |
+      run: | # zizmor: ignore[github-env] validated filename under the trusted workspace path
         cli="$GITHUB_WORKSPACE/.e2e/prebuilt-cli/openshell"
         chmod +x "$cli"
         "$cli" --version

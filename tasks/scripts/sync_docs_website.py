@@ -24,7 +24,7 @@ import yaml
 from packaging.version import InvalidVersion, Version
 
 SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-DISPLAY_VERSION_RE = re.compile(r"\bv?(\d+\.\d+\.\d+(?:[.-]?[A-Za-z0-9]+)*)\b")
+DISPLAY_VERSION_RE = re.compile(r"\bv?(\d+\.\d+\.\d+(?:[.-][A-Za-z0-9]+)*)\b")
 VERSION_AVAILABILITIES = {"beta", "deprecated", "ga", "stable"}
 SNAPSHOT_METADATA_FILE = ".docs-snapshots.yml"
 YamlMapping = dict[str, object]

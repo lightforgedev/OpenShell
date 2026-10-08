@@ -33,6 +33,7 @@ pub struct RefreshTokenInput {
     /// Scopes to resend with the refresh request. Some identity providers use
     /// these to select the API resource for the refreshed access token.
     pub scopes: Vec<String>,
+    /// Retained for API compatibility. OIDC HTTPS always verifies certificates.
     pub insecure: bool,
 }
 
@@ -108,9 +109,10 @@ impl std::fmt::Debug for RefreshTokenOutput {
 /// Discover OIDC endpoints from the issuer's well-known configuration.
 ///
 /// Validates that the discovery document's `issuer` field matches the
-/// configured issuer URL to prevent SSRF or misdirection. When `insecure`
-/// is true, TLS certificate verification is disabled (intended for
-/// development against self-signed gateways).
+/// configured issuer URL to prevent SSRF or misdirection. The `insecure`
+/// argument is retained for API compatibility; OIDC HTTPS always verifies
+/// certificates because discovery and token responses carry authentication
+/// authority.
 pub async fn discover(issuer: &str, insecure: bool) -> Result<OidcDiscovery> {
     let normalized_issuer = issuer.trim_end_matches('/');
     let url = format!("{normalized_issuer}/.well-known/openid-configuration");
@@ -137,14 +139,12 @@ pub async fn discover(issuer: &str, insecure: bool) -> Result<OidcDiscovery> {
 ///
 /// Disables redirects so token-endpoint responses aren't accidentally
 /// followed; OIDC providers should not redirect on the token endpoint.
-/// When `insecure` is true, TLS certificate verification is disabled.
-pub fn http_client(insecure: bool) -> reqwest::Client {
+pub fn http_client(_insecure: bool) -> reqwest::Client {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let mut builder = reqwest::ClientBuilder::new().redirect(reqwest::redirect::Policy::none());
-    if insecure {
-        builder = builder.danger_accept_invalid_certs(true);
-    }
-    builder.build().expect("failed to build HTTP client")
+    reqwest::ClientBuilder::new()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to build HTTP client")
 }
 
 /// Refresh an OIDC access token using the `refresh_token` grant.

@@ -173,7 +173,7 @@ async fn podman_userns_keep_id() {
     let sandbox_uid = strip_ansi(&id_output).trim().to_string();
     assert!(
         sandbox_uid.parse::<u32>().is_ok(),
-        "sandbox should report a numeric UID, got '{sandbox_uid}'"
+        "sandbox should report a numeric UID"
     );
 
     let cat_output = sandbox
@@ -184,7 +184,7 @@ async fn podman_userns_keep_id() {
     let mapping_count = uid_map.lines().count();
     assert!(
         mapping_count >= 1,
-        "userns=keep-id should produce UID mappings, got {mapping_count}: {uid_map}"
+        "userns=keep-id should produce UID mappings, got {mapping_count}"
     );
 
     sandbox.cleanup().await;
@@ -226,7 +226,7 @@ async fn podman_userns_auto() {
     let mapping_count = uid_map.lines().count();
     assert!(
         mapping_count >= 1,
-        "userns=auto should produce UID mappings, got {mapping_count}: {uid_map}"
+        "userns=auto should produce UID mappings, got {mapping_count}"
     );
 
     let id_output = sandbox
@@ -236,7 +236,7 @@ async fn podman_userns_auto() {
     let sandbox_uid = strip_ansi(&id_output).trim().to_string();
     assert!(
         sandbox_uid.parse::<u32>().is_ok(),
-        "sandbox should report a numeric UID, got '{sandbox_uid}'"
+        "sandbox should report a numeric UID"
     );
 
     sandbox.cleanup().await;
@@ -280,7 +280,7 @@ async fn podman_userns_private() {
     let sandbox_uid = strip_ansi(&id_output).trim().to_string();
     assert!(
         sandbox_uid.parse::<u32>().is_ok(),
-        "sandbox should report a numeric UID, got '{sandbox_uid}'"
+        "sandbox should report a numeric UID"
     );
 
     let cat_output = sandbox
@@ -291,7 +291,7 @@ async fn podman_userns_private() {
     let mapping_count = uid_map.lines().count();
     assert!(
         mapping_count >= 2,
-        "userns=private should produce at least 2 UID mappings, got {mapping_count}: {uid_map}"
+        "userns=private should produce at least 2 UID mappings, got {mapping_count}"
     );
 
     sandbox.cleanup().await;

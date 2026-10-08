@@ -8,11 +8,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  actions: read
-  attestations: write
   contents: read
-  id-token: write
-  packages: write
 
 env:
   LIGHTFORGE_CI_IMAGE: ghcr.io/lightforgedev/openshell/ci
@@ -44,6 +40,9 @@ jobs:
   build-ci:
     name: Build source-bound CI image (${{ matrix.arch }})
     needs: plan
+    permissions:
+      contents: read
+      packages: write
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -87,6 +86,9 @@ jobs:
   merge-ci:
     name: Publish source-bound CI manifest
     needs: build-ci
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
@@ -113,29 +115,95 @@ jobs:
   build-agent-cli:
     name: Build Linux agent CLI
     needs: merge-ci
-    uses: ./.github/workflows/rust-native-build.yml
-    with:
-      component: cli
-      arch: arm64
-      features: bundled-z3
-      artifact-name: connect-agent-openshell-cli-linux-arm64
-      checkout-ref: ${{ github.sha }}
-      runner_kind: github-hosted
-      ci_image: ghcr.io/lightforgedev/openshell/ci:${{ github.sha }}
-    secrets: inherit
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: ./.github/actions/build-rust-binary
+        with:
+          package: openshell-cli
+          binary: openshell
+          triple: aarch64-unknown-linux-musl
+          cargo-version: 0.0.0
+          artifact-name: connect-agent-openshell-cli-linux-arm64
 
   build-supervisor-binary:
-    name: Build Linux supervisor binary
+    name: Build Linux sandbox binary
     needs: merge-ci
-    uses: ./.github/workflows/rust-native-build.yml
-    with:
-      component: sandbox
-      arch: arm64
-      artifact-name: connect-openshell-supervisor-linux-arm64
-      checkout-ref: ${{ github.sha }}
-      runner_kind: github-hosted
-      ci_image: ghcr.io/lightforgedev/openshell/ci:${{ github.sha }}
-    secrets: inherit
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: ./.github/actions/build-rust-binary
+        with:
+          package: openshell-sandbox
+          binary: openshell-sandbox
+          triple: aarch64-unknown-linux-musl
+          cargo-version: 0.0.0
+          artifact-name: connect-openshell-supervisor-linux-arm64
+
+  build-gateway-binary:
+    name: Build Linux gateway binary
+    needs: merge-ci
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: ./.github/actions/build-rust-binary
+        with:
+          package: openshell-gateway
+          binary: openshell-gateway
+          triple: aarch64-unknown-linux-gnu
+          cargo-version: 0.0.0
+          artifact-name: connect-openshell-gateway-linux-arm64
+          extra-cargo-flags: --features bundled-z3
+
+  build-runtime-supervisor-binary:
+    name: Build Linux runtime supervisor
+    needs: merge-ci
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: ./.github/actions/build-rust-binary
+        with:
+          package: openshell-supervisor
+          binary: openshell-supervisor
+          triple: aarch64-unknown-linux-gnu
+          cargo-version: 0.0.0
+          artifact-name: connect-runtime-supervisor-linux-arm64
 
   build-host-cli:
     name: Build Darwin host CLI
@@ -173,31 +241,87 @@ jobs:
 
   publish-gateway:
     name: Publish Gateway image
-    needs: merge-ci
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: gateway
-      platform: linux/arm64
-      image-registry: ghcr.io/lightforgedev/openshell
-      image-tag: ${{ github.sha }}
-      checkout-ref: ${{ github.sha }}
-      runner_kind: github-hosted
-      ci_image: ghcr.io/lightforgedev/openshell/ci:${{ github.sha }}
-    secrets: inherit
+    needs: build-gateway-binary
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: ./.github/actions/setup-buildx
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: connect-openshell-gateway-linux-arm64
+          path: downloads/gateway
+
+      - name: Build and publish gateway image
+        env:
+          CI: "true"
+          DOCKER_BUILDER: openshell
+          DOCKER_PLATFORM: linux/arm64
+          DOCKER_PUSH: "1"
+          IMAGE_REGISTRY: ${{ env.LIGHTFORGE_IMAGE_REGISTRY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          install -Dm0755 downloads/gateway/openshell-gateway \
+            deploy/docker/.build/prebuilt-binaries/arm64/openshell-gateway
+          tasks/scripts/docker-build-image.sh gateway
+          docker buildx imagetools inspect \
+            "${LIGHTFORGE_IMAGE_REGISTRY}/gateway:${GITHUB_SHA}" >/dev/null
 
   publish-supervisor:
     name: Publish Supervisor image
-    needs: merge-ci
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: supervisor
-      platform: linux/arm64
-      image-registry: ghcr.io/lightforgedev/openshell
-      image-tag: ${{ github.sha }}
-      checkout-ref: ${{ github.sha }}
-      runner_kind: github-hosted
-      ci_image: ghcr.io/lightforgedev/openshell/ci:${{ github.sha }}
-    secrets: inherit
+    needs: build-runtime-supervisor-binary
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: ./.github/actions/setup-buildx
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: connect-runtime-supervisor-linux-arm64
+          path: downloads/supervisor
+
+      - name: Build and publish supervisor image
+        env:
+          CI: "true"
+          DOCKER_BUILDER: openshell
+          DOCKER_PLATFORM: linux/arm64
+          DOCKER_PUSH: "1"
+          IMAGE_REGISTRY: ${{ env.LIGHTFORGE_IMAGE_REGISTRY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          install -Dm0755 downloads/supervisor/openshell-supervisor \
+            deploy/docker/.build/prebuilt-binaries/arm64/openshell-supervisor
+          tasks/scripts/docker-build-image.sh supervisor
+          docker buildx imagetools inspect \
+            "${LIGHTFORGE_IMAGE_REGISTRY}/supervisor:${GITHUB_SHA}" >/dev/null
 
   receipt:
     name: Verify and attest Connect closure receipt
@@ -209,6 +333,12 @@ jobs:
       - publish-gateway
       - publish-supervisor
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+      packages: read
     steps:
       - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee
         with:
