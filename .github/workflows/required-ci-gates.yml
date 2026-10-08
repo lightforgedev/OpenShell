@@ -34,6 +34,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER_FROM_EVENT: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA_FROM_EVENT: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REF_FROM_EVENT: ${{ github.event.pull_request.head.ref }}
           PR_LABELS_FROM_EVENT: ${{ toJSON(github.event.pull_request.labels.*.name) }}
           GITHUB_SHA_FROM_CONTEXT: ${{ github.sha }}
           GITHUB_REF_NAME_FROM_CONTEXT: ${{ github.ref_name }}
@@ -74,18 +75,16 @@ jobs:
 
           resolve_pull_request_event() {
             CONTEXT_KIND="pull_request"
-            WORKFLOW_EVENT="push"
+            WORKFLOW_EVENT="workflow_dispatch"
             PR_NUMBER="$PR_NUMBER_FROM_EVENT"
             HEAD_SHA="$PR_HEAD_SHA_FROM_EVENT"
             LABELS_JSON=$(jq -c . <<< "$PR_LABELS_FROM_EVENT")
-            MIRROR_REF="pull-request/$PR_NUMBER"
-            EXPECTED_HEAD_BRANCH="$MIRROR_REF"
+            EXPECTED_HEAD_BRANCH="$PR_HEAD_REF_FROM_EVENT"
             STATUS_TARGET_URL="https://github.com/$GH_REPO/pull/$PR_NUMBER"
           }
 
           load_pr_context() {
             CONTEXT_KIND="pull_request"
-            WORKFLOW_EVENT="push"
             PR_NUMBER="$1"
 
             local pr state
@@ -98,8 +97,7 @@ jobs:
 
             HEAD_SHA=$(jq -r '.head.sha' <<< "$pr")
             LABELS_JSON=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER" --jq '[.labels[].name]')
-            MIRROR_REF="pull-request/$PR_NUMBER"
-            EXPECTED_HEAD_BRANCH="$MIRROR_REF"
+            EXPECTED_HEAD_BRANCH=$(jq -r '.head.ref' <<< "$pr")
             STATUS_TARGET_URL="https://github.com/$GH_REPO/pull/$PR_NUMBER"
           }
 
@@ -127,14 +125,9 @@ jobs:
               return
             fi
 
-            if [ "$WORKFLOW_RUN_EVENT" != "push" ]; then
+            if [ "$WORKFLOW_RUN_EVENT" != "workflow_dispatch" ]; then
               echo "Ignoring workflow_run from event '$WORKFLOW_RUN_EVENT'."
               exit 0
-            fi
-
-            if [[ "$WORKFLOW_RUN_HEAD_BRANCH" =~ ^pull-request/([0-9]+)$ ]]; then
-              load_pr_context "${BASH_REMATCH[1]}"
-              return
             fi
 
             local associated_prs pr
@@ -146,6 +139,8 @@ jobs:
             fi
 
             load_pr_context "$(jq -r '.number' <<< "$pr")"
+            WORKFLOW_EVENT="workflow_dispatch"
+            EXPECTED_HEAD_BRANCH="$WORKFLOW_RUN_HEAD_BRANCH"
           }
 
           resolve_context() {
@@ -167,7 +162,7 @@ jobs:
             local context="$1"
             local mirror_sha
 
-            if [ "$CONTEXT_KIND" = "merge_group" ]; then
+            if [ "$CONTEXT_KIND" = "merge_group" ] || [ "$WORKFLOW_EVENT" != "push" ]; then
               return 0
             fi
 

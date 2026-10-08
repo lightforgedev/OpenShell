@@ -1,10 +1,6 @@
 name: Release Tag
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
-      - "!v*.*.*-pre.*"
   workflow_dispatch:
     inputs:
       tag:
@@ -16,10 +12,9 @@ permissions:
   contents: read
   packages: read
 
-# Resolve the tag once: prefer the workflow_dispatch input, fall back to the
-# push-event ref.  Every job references this via env.RELEASE_TAG.
+# Resolve the manually selected release tag once.
 env:
-  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  RELEASE_TAG: ${{ inputs.tag }}
 
 defaults:
   run:

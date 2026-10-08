@@ -1,11 +1,6 @@
 name: Branch E2E Checks
 
 on:
-  merge_group:
-    types: [checks_requested]
-  push:
-    branches:
-      - "pull-request/[0-9]+"
   workflow_dispatch: {}
 
 permissions: {}
