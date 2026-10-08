@@ -1,14 +1,12 @@
 name: Branch Docs Preview
 
 on:
-  pull_request:
-    paths:
-      - "docs/**"
-      - "fern/**"
-      - "mise.toml"
-      - "tasks/docs.toml"
-      - ".github/workflows/branch-docs.yml"
-      - ".github/workflows/release-tag.yml"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Optional PR number for the preview id and comment
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -52,7 +50,7 @@ jobs:
         id: generate-docs
         env:
           FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
-          PREVIEW_ID: pr-${{ github.event.pull_request.number }}
+          PREVIEW_ID: ${{ inputs.pr_number && format('pr-{0}', inputs.pr_number) || format('manual-{0}', github.run_id) }}
         working-directory: ./fern
         run: |
           OUTPUT=$(fern generate --docs --preview --id "$PREVIEW_ID" 2>&1)
@@ -65,10 +63,10 @@ jobs:
           echo "preview_url=$URL" >> "$GITHUB_OUTPUT"
 
       - name: Post or update PR comment
-        if: ${{ steps.fern-preview.outputs.enabled == 'true' }}
+        if: ${{ steps.fern-preview.outputs.enabled == 'true' && inputs.pr_number != '' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ inputs.pr_number }}
           PREVIEW_URL: ${{ steps.generate-docs.outputs.preview_url }}
         run: |
           BODY=":herb: **Preview your docs:** <${PREVIEW_URL}>"
