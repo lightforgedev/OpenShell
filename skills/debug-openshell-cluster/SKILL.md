@@ -443,6 +443,13 @@ the release. Look for failed installs, unexpected values, missing namespace, wro
 image tag, TLS settings that do not match the registered endpoint, and
 scheduling failures.
 
+When checking a Helm values migration, compare the rendered `gateway.toml`
+with the intended `gatewayConfig` tables. Explicit resource-admission settings
+and the Kubernetes Secrets credential namespace take precedence over deprecated
+aliases. Confirm the credential driver's namespace matches its Role and
+RoleBinding. An unset workload `image_pull_policy` uses Kubernetes defaults;
+the global Helm pull policy applies to runtime and supervisor images.
+
 The chart mounts the `gateway.toml` ConfigMap key directly at
 `/etc/openshell/gateway.toml` as a read-only `subPath` file. This avoids the
 atomic-writer symlink exposed by a ConfigMap directory mount because the gateway
@@ -466,8 +473,9 @@ retained Kubernetes Secret for the shared KEK, injects it into gateway pods, and
 stores encrypted credential envelopes in the OpenShell database. For
 `workload.kind=deployment` or multi-replica gateways, confirm
 `server.externalDbSecret` points at a shared database. A render/install error
-mentioning `server.credentialDrivers` means the values selected multiple
-external credential backends.
+mentioning multiple credential drivers means the
+`gatewayConfig.openshell.gateway.credential_drivers` list selected more than
+one external credential backend.
 
 For HA or PostgreSQL-backed installs, also check the external database Secret
 referenced by `server.externalDbSecret` and the PostgreSQL workload when it is
@@ -642,8 +650,9 @@ kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec
 # Should show items filter for ca.crt from openshell-server-tls
 ```
 
-If `server.providerTokenGrants.spiffe.enabled=true`, the gateway should still
-render `[openshell.gateway.gateway_jwt]` and mount the `sandbox-jwt` Secret.
+If `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
+is set, the gateway should still render `[openshell.gateway.gateway_jwt]` and
+mount the `sandbox-jwt` Secret.
 SPIRE is used by both the gateway and sandbox supervisors for dynamic provider
 token grants. The gateway pod must mount the `spiffe-workload-api` CSI volume
 and set `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`; supervisor Pods must
@@ -654,7 +663,7 @@ Verify that SPIRE is installed, the CSI driver is available, and the Kubernetes
 driver config includes `provider_spiffe_workload_api_socket_path`:
 
 ```bash
-helm -n openshell get values openshell | grep -E 'providerTokenGrants|workloadApiSocketPath'
+helm -n openshell get values openshell | grep provider_spiffe_workload_api_socket_path
 kubectl get pods -A | grep -E 'spire|spiffe'
 kubectl -n openshell get configmap openshell-config -o yaml | grep provider_spiffe_workload_api_socket_path
 kubectl -n openshell get pod -l app.kubernetes.io/name=helm-chart -o jsonpath="{.items[*].spec.containers[*].env[?(@.name==\"OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET\")].value}{\"\n\"}"
