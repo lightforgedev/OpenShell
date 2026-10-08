@@ -180,7 +180,6 @@ jobs:
           triple: aarch64-unknown-linux-gnu
           cargo-version: 0.0.0
           artifact-name: connect-openshell-gateway-linux-arm64
-          extra-cargo-flags: --features bundled-z3
 
   build-runtime-supervisor-binary:
     name: Build Linux runtime supervisor
