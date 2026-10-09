@@ -1648,6 +1648,8 @@ pub async fn provider_profile_export(
     let rendered = provider_profile_export_text(server, id, output, workspace, tls).await?;
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
+    // Profiles contain credential metadata, never stored credential values.
+    // codeql[rust/cleartext-logging]
     stdout.write_all(rendered.as_bytes()).into_diagnostic()?;
     if output == "json" {
         stdout.write_all(b"\n").into_diagnostic()?;
