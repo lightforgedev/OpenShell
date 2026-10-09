@@ -86,6 +86,54 @@ pub(crate) async fn parse_jsonrpc_http_request<C: AsyncRead + AsyncWrite + Unpin
     Ok(Some(JsonRpcHttpRequest { request, info }))
 }
 
+/// Reinspect a fully buffered JSON-RPC-family HTTP request after middleware.
+///
+/// Initial inspection normalizes chunked bodies to `Content-Length` and keeps
+/// the complete body after the raw header block. Middleware rebuilding keeps
+/// that representation, so a final pre-forward check can use the exact header
+/// and body bytes that the upstream will receive without reading the client
+/// stream again.
+pub(crate) fn inspect_buffered_jsonrpc_http_request(
+    request: &L7Request,
+    inspection_options: JsonRpcInspectionOptions,
+) -> Result<JsonRpcRequestInfo> {
+    if jsonrpc_receive_stream_request(request) {
+        return Ok(JsonRpcRequestInfo::receive_stream());
+    }
+
+    let header_end = request
+        .raw_header
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| miette::miette!("HTTP request headers are missing the CRLF terminator"))?
+        + 4;
+    let body = &request.raw_header[header_end..];
+    match request.body_length {
+        crate::l7::provider::BodyLength::None if body.is_empty() => {}
+        crate::l7::provider::BodyLength::ContentLength(length) => {
+            let length = usize::try_from(length)
+                .map_err(|_| miette::miette!("HTTP request body length exceeds platform limit"))?;
+            if body.len() != length {
+                return Err(miette::miette!(
+                    "buffered HTTP request body length does not match Content-Length"
+                ));
+            }
+        }
+        crate::l7::provider::BodyLength::None => {
+            return Err(miette::miette!(
+                "buffered HTTP request has bytes without body framing"
+            ));
+        }
+        crate::l7::provider::BodyLength::Chunked => {
+            return Err(miette::miette!(
+                "buffered JSON-RPC request retained chunked framing"
+            ));
+        }
+    }
+
+    Ok(parse_jsonrpc_body_with_options(body, inspection_options))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonRpcRequestInfo {
     /// Calls found in the request body. Responses and receive-stream GETs have
@@ -94,8 +142,69 @@ pub struct JsonRpcRequestInfo {
     pub is_batch: bool,
     pub receive_stream: bool,
     pub has_response: bool,
-    pub error: Option<String>,
+    /// Typed inspection failure discovered before policy evaluation.
+    pub error: Option<JsonRpcInspectionError>,
 }
+
+/// Stable kind of failure found while inspecting a JSON-RPC-family message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum JsonRpcInspectionErrorKind {
+    /// The request body is not valid JSON.
+    InvalidJson,
+    /// The decoded JSON fails JSON-RPC or protocol-specific message validation.
+    InvalidMessage,
+}
+
+/// Typed JSON-RPC inspection failure with an inseparable kind and diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonRpcInspectionError {
+    kind: JsonRpcInspectionErrorKind,
+    detail: String,
+}
+
+impl JsonRpcInspectionError {
+    fn invalid_json() -> Self {
+        Self {
+            kind: JsonRpcInspectionErrorKind::InvalidJson,
+            detail: "invalid JSON".to_string(),
+        }
+    }
+
+    fn invalid_message(detail: impl Into<String>) -> Self {
+        Self {
+            kind: JsonRpcInspectionErrorKind::InvalidMessage,
+            detail: detail.into(),
+        }
+    }
+
+    /// Return the stable failure kind used by typed control flow.
+    #[must_use]
+    pub const fn kind(&self) -> JsonRpcInspectionErrorKind {
+        self.kind
+    }
+
+    /// Return the existing policy-visible and human-readable diagnostic.
+    ///
+    /// Callers must use [`Self::kind`] instead of parsing this text for control flow.
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+
+    /// Render the existing proxy denial reason for an inspection failure.
+    pub(crate) fn rejection_reason(&self) -> String {
+        format!("JSON-RPC request rejected: {self}")
+    }
+}
+
+impl std::fmt::Display for JsonRpcInspectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for JsonRpcInspectionError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonRpcCallInfo {
@@ -108,9 +217,25 @@ pub struct JsonRpcCallInfo {
     /// MCP `tools/call` tool name when known. Generic JSON-RPC leaves this
     /// unset because params are not inspected.
     pub tool: Option<String>,
+    /// Whether this call is a JSON-RPC notification without an `id`.
+    ///
+    /// MCP initialization is a request, so transport code uses this bit to
+    /// avoid treating an extension notification named `initialize` as the
+    /// header-exempt initialization exchange.
+    pub is_notification: bool,
 }
 
 impl JsonRpcRequestInfo {
+    fn rejected(is_batch: bool, error: JsonRpcInspectionError) -> Self {
+        Self {
+            calls: Vec::new(),
+            is_batch,
+            receive_stream: false,
+            has_response: false,
+            error: Some(error),
+        }
+    }
+
     /// MCP streamable HTTP uses an empty GET to receive server messages. It has
     /// no request body to inspect, but it must still pass through MCP endpoints.
     pub(crate) fn receive_stream() -> Self {
@@ -167,39 +292,45 @@ pub fn parse_jsonrpc_body_with_options(
     inspection_options: JsonRpcInspectionOptions,
 ) -> JsonRpcRequestInfo {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return JsonRpcRequestInfo {
-            calls: Vec::new(),
-            is_batch: false,
-            receive_stream: false,
-            has_response: false,
-            error: Some("invalid JSON".to_string()),
-        };
+        return JsonRpcRequestInfo::rejected(false, JsonRpcInspectionError::invalid_json());
     };
 
     if let serde_json::Value::Array(items) = value {
         if items.is_empty() {
-            return JsonRpcRequestInfo {
-                calls: Vec::new(),
-                is_batch: true,
-                receive_stream: false,
-                has_response: false,
-                error: Some("empty batch".to_string()),
-            };
+            return JsonRpcRequestInfo::rejected(
+                true,
+                JsonRpcInspectionError::invalid_message("empty batch"),
+            );
         }
         let mut calls = Vec::new();
         let mut has_response = false;
         for item in &items {
             match parse_jsonrpc_message(item, inspection_options) {
-                Ok(JsonRpcMessageInfo::Call(call)) => calls.push(call),
+                Ok(JsonRpcMessageInfo::Call(call)) => {
+                    // Initialization establishes the MCP exchange before any
+                    // profile-specific request rules apply. A batch has no
+                    // single bootstrap exchange, so fail closed before policy
+                    // evaluation can forward any member.
+                    if inspection_options.mode == JsonRpcInspectionMode::Mcp
+                        && call.method == "initialize"
+                    {
+                        return JsonRpcRequestInfo::rejected(
+                            true,
+                            JsonRpcInspectionError::invalid_message(
+                                "MCP initialize must not appear in a batch",
+                            ),
+                        );
+                    }
+                    calls.push(call);
+                }
                 Ok(JsonRpcMessageInfo::Response) => has_response = true,
                 Err(error) => {
-                    return JsonRpcRequestInfo {
-                        calls: Vec::new(),
-                        is_batch: true,
-                        receive_stream: false,
-                        has_response: false,
-                        error: Some(format!("batch item invalid: {error}")),
-                    };
+                    return JsonRpcRequestInfo::rejected(
+                        true,
+                        JsonRpcInspectionError::invalid_message(format!(
+                            "batch item invalid: {error}"
+                        )),
+                    );
                 }
             }
         }
@@ -227,13 +358,9 @@ pub fn parse_jsonrpc_body_with_options(
             has_response: true,
             error: None,
         },
-        Err(error) => JsonRpcRequestInfo {
-            calls: Vec::new(),
-            is_batch: false,
-            receive_stream: false,
-            has_response: false,
-            error: Some(error),
-        },
+        Err(error) => {
+            JsonRpcRequestInfo::rejected(false, JsonRpcInspectionError::invalid_message(error))
+        }
     }
 }
 
@@ -292,6 +419,7 @@ fn parse_jsonrpc_call(
         method: method.to_string(),
         params: HashMap::new(),
         tool: None,
+        is_notification: value.get("id").is_none(),
     })
 }
 
@@ -348,6 +476,7 @@ fn parse_mcp_call(
             method: mcp_request.method_name().to_string(),
             params,
             tool,
+            is_notification: false,
         });
     }
 
@@ -368,6 +497,7 @@ fn parse_mcp_call(
         method: notification.method,
         params: HashMap::new(),
         tool: None,
+        is_notification: true,
     })
 }
 
@@ -445,6 +575,47 @@ mod tests {
     }
 
     #[test]
+    fn inspection_error_kinds_distinguish_invalid_json_and_messages() {
+        fn assert_inspection_error(
+            body: &[u8],
+            mode: JsonRpcInspectionMode,
+            expected_kind: JsonRpcInspectionErrorKind,
+            expected_detail: &str,
+        ) {
+            let info = parse_jsonrpc_body(body, mode);
+            let error = info.error.as_ref().expect("inspection failure");
+
+            assert_eq!(error.kind(), expected_kind);
+            assert_eq!(error.detail(), expected_detail);
+        }
+
+        assert_inspection_error(
+            b"{",
+            JsonRpcInspectionMode::JsonRpc,
+            JsonRpcInspectionErrorKind::InvalidJson,
+            "invalid JSON",
+        );
+        assert_inspection_error(
+            br"[]",
+            JsonRpcInspectionMode::JsonRpc,
+            JsonRpcInspectionErrorKind::InvalidMessage,
+            "empty batch",
+        );
+        assert_inspection_error(
+            br"null",
+            JsonRpcInspectionMode::JsonRpc,
+            JsonRpcInspectionErrorKind::InvalidMessage,
+            "missing or non-string 'jsonrpc' field",
+        );
+        assert_inspection_error(
+            br#"[{"jsonrpc":"2.0","id":1,"method":"reports.list"},{"id":2,"method":"reports.search"}]"#,
+            JsonRpcInspectionMode::JsonRpc,
+            JsonRpcInspectionErrorKind::InvalidMessage,
+            "batch item invalid: missing or non-string 'jsonrpc' field",
+        );
+    }
+
+    #[test]
     fn ignores_params_when_extracting_method() {
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"reports.search","params":{"query":"quarterly","filters":{"scope":"workspace/main"}}}"#;
         let info = parse_jsonrpc_body(body, JsonRpcInspectionMode::JsonRpc);
@@ -499,7 +670,8 @@ mod tests {
         assert!(info.calls.is_empty());
         assert!(
             info.error
-                .as_deref()
+                .as_ref()
+                .map(JsonRpcInspectionError::detail)
                 .is_some_and(|error| error.contains("strict_tool_names")),
             "expected strict tool-name error, got {info:?}"
         );
@@ -534,9 +706,14 @@ mod tests {
         let info = parse_jsonrpc_body(body, JsonRpcInspectionMode::Mcp);
 
         assert!(info.calls.is_empty());
+        assert_eq!(
+            info.error.as_ref().map(JsonRpcInspectionError::kind),
+            Some(JsonRpcInspectionErrorKind::InvalidMessage)
+        );
         assert!(
             info.error
-                .as_deref()
+                .as_ref()
+                .map(JsonRpcInspectionError::detail)
                 .is_some_and(|error| error.contains("invalid MCP request params")),
             "expected MCP params validation error, got {info:?}"
         );
@@ -636,7 +813,7 @@ mod tests {
 
         assert!(info.calls.is_empty());
         assert_eq!(
-            info.error.as_deref(),
+            info.error.as_ref().map(JsonRpcInspectionError::detail),
             Some("missing or non-string 'jsonrpc' field")
         );
     }
@@ -652,7 +829,7 @@ mod tests {
         assert!(info.calls.is_empty());
         assert!(info.is_batch);
         assert_eq!(
-            info.error.as_deref(),
+            info.error.as_ref().map(JsonRpcInspectionError::detail),
             Some("batch item invalid: missing or non-string 'jsonrpc' field")
         );
     }
@@ -664,7 +841,7 @@ mod tests {
 
         assert!(info.calls.is_empty());
         assert_eq!(
-            info.error.as_deref(),
+            info.error.as_ref().map(JsonRpcInspectionError::detail),
             Some("unsupported JSON-RPC version '1.0'")
         );
     }
@@ -682,6 +859,57 @@ mod tests {
         assert_eq!(info.calls.len(), 2);
         assert_eq!(info.calls[0].method, "reports.list");
         assert_eq!(info.calls[1].method, "reports.search");
+    }
+
+    #[test]
+    fn preserves_current_mcp_batch_acceptance() {
+        let body = br#"[
+            {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_status","arguments":{}}},
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_web","arguments":{"query":"openshell"}}}
+        ]"#;
+        let info = parse_jsonrpc_body(body, JsonRpcInspectionMode::Mcp);
+
+        assert!(
+            info.error.is_none(),
+            "MCP batch should remain valid: {info:?}"
+        );
+        assert!(info.is_batch);
+        assert_eq!(info.calls.len(), 2);
+        assert_eq!(info.calls[0].tool.as_deref(), Some("read_status"));
+        assert_eq!(info.calls[1].tool.as_deref(), Some("search_web"));
+    }
+
+    #[test]
+    fn mcp_initialize_is_not_valid_in_a_batch() {
+        let body = br#"[
+            {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}},
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_status","arguments":{}}}
+        ]"#;
+        let info = parse_jsonrpc_body(body, JsonRpcInspectionMode::Mcp);
+
+        assert!(info.is_batch);
+        assert!(info.calls.is_empty());
+        assert!(!info.has_response);
+        assert_eq!(
+            info.error.as_ref().map(JsonRpcInspectionError::detail),
+            Some("MCP initialize must not appear in a batch")
+        );
+    }
+
+    #[test]
+    fn generic_jsonrpc_keeps_batch_initialize_behavior() {
+        let body = br#"[
+            {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}},
+            {"jsonrpc":"2.0","id":2,"method":"reports.list","params":{}}
+        ]"#;
+        let info = parse_jsonrpc_body(body, JsonRpcInspectionMode::JsonRpc);
+
+        assert!(
+            info.error.is_none(),
+            "generic batch should remain valid: {info:?}"
+        );
+        assert!(info.is_batch);
+        assert_eq!(info.calls.len(), 2);
     }
 
     #[test]
@@ -708,7 +936,7 @@ mod tests {
         assert!(info.calls.is_empty());
         assert!(!info.has_response);
         assert_eq!(
-            info.error.as_deref(),
+            info.error.as_ref().map(JsonRpcInspectionError::detail),
             Some("JSON-RPC response includes both result and error")
         );
     }
@@ -719,7 +947,10 @@ mod tests {
         let result_info = parse_jsonrpc_body(result_body, JsonRpcInspectionMode::JsonRpc);
         assert!(result_info.calls.is_empty());
         assert_eq!(
-            result_info.error.as_deref(),
+            result_info
+                .error
+                .as_ref()
+                .map(JsonRpcInspectionError::detail),
             Some("JSON-RPC message includes both method and result/error")
         );
 
@@ -727,7 +958,10 @@ mod tests {
         let error_info = parse_jsonrpc_body(error_body, JsonRpcInspectionMode::JsonRpc);
         assert!(error_info.calls.is_empty());
         assert_eq!(
-            error_info.error.as_deref(),
+            error_info
+                .error
+                .as_ref()
+                .map(JsonRpcInspectionError::detail),
             Some("JSON-RPC message includes both method and result/error")
         );
     }
@@ -743,7 +977,7 @@ mod tests {
         assert!(info.calls.is_empty());
         assert!(info.is_batch);
         assert_eq!(
-            info.error.as_deref(),
+            info.error.as_ref().map(JsonRpcInspectionError::detail),
             Some("batch item invalid: JSON-RPC message includes both method and result/error")
         );
     }

@@ -1,14 +1,6 @@
 name: Build CI Image
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'deploy/docker/Dockerfile.ci'
-      - 'mise.toml'
-      - 'mise.lock'
-      - 'tasks/**'
-      - '.github/workflows/ci-image.yml'
   workflow_dispatch:
 
 env:
@@ -17,7 +9,6 @@ env:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   build-ci-image:
@@ -34,11 +25,14 @@ jobs:
             runner: linux-arm64-cpu8
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -89,9 +83,12 @@ jobs:
     needs: build-ci-image
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}

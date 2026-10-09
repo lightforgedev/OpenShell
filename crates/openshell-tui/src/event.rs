@@ -20,8 +20,12 @@ pub enum Event {
     Resize(u16, u16),
     /// A batch of log lines from the streaming log task.
     LogLines(Vec<LogLine>),
-    /// Result of a create sandbox request: `Ok(name)` or `Err(message)`.
-    CreateResult(Result<String, String>),
+    /// Completed workspace/provider/sandbox list refresh from a background task.
+    ListRefreshCompleted(crate::ListRefreshResult),
+    /// Completed per-sandbox draft-count refresh from a background task.
+    DraftCountsRefreshCompleted(crate::DraftCountsRefreshResult),
+    /// Result of a create sandbox request: `Ok((name, workspace))` or `Err(message)`.
+    CreateResult(Result<(String, String), String>),
     /// Result of creating a provider on the gateway: `Ok(name)` or `Err(message)`.
     ProviderCreateResult(Result<String, String>),
     /// Provider detail fetched from gateway.
@@ -51,6 +55,8 @@ pub enum Event {
     SandboxSettingSetResult(Result<u64, String>),
     /// Sandbox setting delete result: `Ok(revision)` or `Err(message)`.
     SandboxSettingDeleteResult(Result<u64, String>),
+    /// Non-fatal warnings from port-forward setup after sandbox creation.
+    ForwardWarnings(Vec<String>),
 }
 
 pub struct EventHandler {
@@ -114,6 +120,15 @@ impl EventHandler {
 
     pub async fn next(&mut self) -> Option<Event> {
         self.rx.recv().await
+    }
+
+    /// Discard events queued before or while the TUI was suspended.
+    ///
+    /// The input reader is paused before this is called, so terminal input
+    /// remains in the TTY for the resumed reader. This primarily removes stale
+    /// tick events that would otherwise run refresh work before new key input.
+    pub fn discard_pending(&mut self) {
+        while self.rx.try_recv().is_ok() {}
     }
 
     /// Get a sender handle for dispatching events from background tasks.
