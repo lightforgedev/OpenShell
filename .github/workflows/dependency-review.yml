@@ -62,7 +62,7 @@ jobs:
               core.setOutput("available", "true");
             } catch (error) {
               const status = error.status;
-              if (status === 403 || status === 404) {
+              if (status === 403 || status === 404 || (status >= 500 && status <= 599)) {
                 core.setOutput("available", "false");
                 core.warning(
                   `GitHub Dependency Graph is unavailable (HTTP ${status}); Dependency Review is skipped.`,
