@@ -245,7 +245,7 @@ pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";
 
 /// Landlock ABI observed while preparing a hard-requirement filesystem policy.
 ///
-/// This is injected only after OpenShell has prepared a real ruleset for the
+/// This is injected only after `OpenShell` has prepared a real ruleset for the
 /// child process; best-effort policies never export it as enforcement evidence.
 pub const LANDLOCK_ABI: &str = "OPENSHELL_LANDLOCK_ABI";
 
