@@ -36,7 +36,7 @@ use openshell_providers::{
     parse_profile_yaml, profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use tonic::{Code, Status};
 
@@ -1646,10 +1646,11 @@ pub async fn provider_profile_export(
     tls: &TlsOptions,
 ) -> Result<()> {
     let rendered = provider_profile_export_text(server, id, output, workspace, tls).await?;
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    stdout.write_all(rendered.as_bytes()).into_diagnostic()?;
     if output == "json" {
-        println!("{rendered}");
-    } else {
-        print!("{rendered}");
+        stdout.write_all(b"\n").into_diagnostic()?;
     }
     Ok(())
 }
@@ -3173,7 +3174,10 @@ binaries: [/usr/bin/curl]
             "internal",
             "123",
         ] {
-            assert!(!serialized.contains(secret), "leaked {secret}");
+            assert!(
+                !serialized.contains(secret),
+                "serialized provider leaked secret material"
+            );
         }
     }
 

@@ -1088,7 +1088,7 @@ async fn login_identity(identity: IdentityScenario) -> LoginSession {
     let login_page = curl_get(&authorization_url, &cookie_jar).await;
     let login_action = extract_login_action(&login_page);
     let password = std::env::var(identity.password_env)
-        .unwrap_or_else(|_| panic!("OIDC E2E requires {}", identity.password_env));
+        .expect("OIDC E2E password environment variable is missing");
     let callback_page = curl_login(&login_action, &cookie_jar, identity.username, &password).await;
     assert!(
         callback_page.contains("Authentication successful"),

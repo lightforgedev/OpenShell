@@ -752,10 +752,7 @@ async fn podman_corporate_proxy_routes_approved_tls_egress() {
     assert_eq!(
         new_secrets.len(),
         1,
-        "exactly one proxy-auth secret should exist for the running sandbox. \
-         Before count: {}, now count: {}",
-        secrets_before.len(),
-        secrets_live.len()
+        "exactly one proxy-auth secret should exist for the running sandbox"
     );
     let sandbox_secret = new_secrets[0].clone();
 

@@ -598,12 +598,13 @@ mod tests {
 
     #[test]
     fn render_connect_page_contains_token_and_code() {
+        let nonce = uuid::Uuid::new_v4().to_string();
         let html = render_connect_page(
             "gateway.example.com:8080",
             12345,
             "test-jwt-token",
             "ABC-1234",
-            "test-nonce",
+            &nonce,
         );
         assert!(html.contains("test-jwt-token"));
         assert!(html.contains("12345"));
@@ -617,17 +618,18 @@ mod tests {
         assert!(html.contains("method: 'POST'"));
         assert!(html.contains("JSON.stringify"));
         // CSP nonce should be on the script tag
-        assert!(html.contains("nonce=\"test-nonce\""));
+        assert!(html.contains(&format!("nonce=\"{nonce}\"")));
     }
 
     #[test]
     fn render_connect_page_escapes_special_chars() {
+        let nonce = uuid::Uuid::new_v4().to_string();
         let html = render_connect_page(
             "gw",
             1234,
             "token<script>alert('xss')</script>",
             "ABC-1234",
-            "nonce",
+            &nonce,
         );
         // < and > should be escaped via JSON encoding (\u003c)
         assert!(!html.contains("<script>alert"));
@@ -635,7 +637,8 @@ mod tests {
 
     #[test]
     fn render_connect_page_includes_code_in_js_payload() {
-        let html = render_connect_page("gw", 1234, "jwt", "XY7-9KLM", "nonce");
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let html = render_connect_page("gw", 1234, "jwt", "XY7-9KLM", &nonce);
         // The JS should send the code in the JSON payload (now JSON-encoded)
         assert!(html.contains(r#"var code = "XY7-9KLM""#));
         assert!(html.contains("code: code"));

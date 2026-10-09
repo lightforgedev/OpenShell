@@ -2534,7 +2534,7 @@ mod tests {
                 return;
             }
         }
-        assert!(result.is_ok(), "drop_privileges failed: {result:?}");
+        assert!(result.is_ok(), "drop_privileges failed");
     }
 
     #[test]

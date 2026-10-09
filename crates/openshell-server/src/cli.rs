@@ -1775,6 +1775,20 @@ mod tests {
     }
 
     #[test]
+    fn generate_certs_rejects_private_material_stdout_mode() {
+        let err = Cli::try_parse_from([
+            "openshell-gateway",
+            "generate-certs",
+            "--output-dir",
+            "/tmp/openshell-certgen",
+            "--dry-run",
+        ])
+        .expect_err("certificate private material must not be printable to stdout");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
     fn generate_certs_jwt_only_parses_without_tls_secret_names() {
         let _lock = ENV_LOCK
             .lock()

@@ -74,11 +74,6 @@ pub struct CertgenArgs {
     #[arg(long = "server-san", value_name = "SAN")]
     server_sans: Vec<String>,
 
-    /// Print the generated PEM materials to stdout instead of writing them.
-    /// For local debugging.
-    #[arg(long)]
-    dry_run: bool,
-
     /// Name of a `ConfigMap` to create containing the CA certificate (key: ca.crt)
     /// for `BackendTLSPolicy` backend validation. The CA is always read from the
     /// authoritative server Secret: --server-secret-name in full PKI mode,
@@ -113,12 +108,6 @@ pub async fn run(args: CertgenArgs) -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
-
-    if args.dry_run {
-        let bundle = generate_pki(&args.server_sans)?;
-        print_bundle(&bundle);
-        return Ok(());
-    }
 
     if let Some(dir) = args.output_dir.as_deref() {
         run_local(dir, &args.server_sans)
@@ -964,16 +953,6 @@ fn write_pem(path: &Path, contents: &str, owner_only: bool) -> Result<()> {
 fn staging_temp_dir(dir: &Path) -> PathBuf {
     // Place temp inside dir so rename stays on the same filesystem as the destination.
     dir.join(".certgen.tmp")
-}
-
-// ────────────────────────────── Shared utility ─────────────────────────────
-
-fn print_bundle(bundle: &PkiBundle) {
-    println!("# CA certificate\n{}", bundle.ca_cert_pem);
-    println!("# Server certificate\n{}", bundle.server_cert_pem);
-    println!("# Server key\n{}", bundle.server_key_pem);
-    println!("# Client certificate\n{}", bundle.client_cert_pem);
-    println!("# Client key\n{}", bundle.client_key_pem);
 }
 
 #[cfg(test)]
