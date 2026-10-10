@@ -76,6 +76,14 @@ proxy and for destination certificates re-signed by a TLS-intercepting proxy.
 It also includes the corporate root in the generated combined trust bundle
 used by workload processes.
 
+## Direct Upstream Trust
+
+`additional_ca_bundle` adds an operator-owned PEM root for direct private
+upstream endpoints without requiring a corporate proxy. The driver validates
+it at gateway startup and combines its contents with any `proxy_ca_bundle` in
+the same immutable supervisor-volume file. Sandbox image contents and
+per-sandbox driver configuration cannot select or override this trust input.
+
 ## Identity and Workspace
 
 Before creating the workload, the driver pins the image ID and reads its
