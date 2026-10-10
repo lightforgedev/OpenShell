@@ -205,6 +205,18 @@ impl LocalBoundaryExec {
             .map_err(|error| BackendError::Process(error.to_string()))
     }
 
+    #[cfg(target_os = "linux")]
+    fn inject_landlock_evidence(
+        command: &mut Command,
+        prepared: Option<&crate::sandbox::linux::PreparedSandbox>,
+    ) {
+        if let Some(prepared) = prepared
+            && let Some(environment) = crate::sandbox::linux::landlock_evidence_env(prepared)
+        {
+            command.envs(environment);
+        }
+    }
+
     fn spawn_piped(&self, spec: &ExecSpec) -> Result<SpawnedExec, BackendError> {
         self.runtime.ensure_active()?;
         let mut command = self.command(spec)?;
@@ -215,6 +227,8 @@ impl LocalBoundaryExec {
         let effective_workdir = spec.workdir.as_deref().or(self.base_workdir.as_deref());
         #[cfg(target_os = "linux")]
         let prepared = self.prepare_sandbox(effective_workdir)?;
+        #[cfg(target_os = "linux")]
+        Self::inject_landlock_evidence(&mut command, prepared.as_ref());
         #[cfg(target_os = "linux")]
         let child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
             .map_err(|error| BackendError::Process(error.to_string()))?;
@@ -326,6 +340,8 @@ impl LocalBoundaryExec {
         let effective_workdir = spec.workdir.as_deref().or(self.base_workdir.as_deref());
         #[cfg(target_os = "linux")]
         let prepared = self.prepare_sandbox(effective_workdir)?;
+        #[cfg(target_os = "linux")]
+        Self::inject_landlock_evidence(&mut command, prepared.as_ref());
         #[cfg(target_os = "linux")]
         let child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
             .map_err(|error| BackendError::Process(error.to_string()))?;
@@ -812,6 +828,46 @@ mod tests {
         );
         assert_eq!(stdout, "out:value");
         assert_eq!(stderr, "err:value");
+    }
+
+    #[test]
+    fn hard_landlock_exec_command_exports_actual_enforcement_evidence() {
+        let mut executor = executor();
+        executor.policy.filesystem.read_only = vec![std::path::PathBuf::from("/tmp")];
+        executor.policy.landlock.compatibility =
+            openshell_core::policy::LandlockCompatibility::HardRequirement;
+        let mut command = executor
+            .command(&ExecSpec {
+                program: "/usr/bin/env".to_string(),
+                args: Vec::new(),
+                shell: None,
+                runtime_helper: None,
+                env: vec![],
+                workdir: None,
+                pty: false,
+            })
+            .expect("build hard-Landlock exec command");
+        let prepared = executor
+            .prepare_sandbox(None)
+            .expect("prepare hard-Landlock exec")
+            .expect("configured filesystem policy should produce a ruleset");
+        LocalBoundaryExec::inject_landlock_evidence(&mut command, Some(&prepared));
+        let environment: HashMap<_, _> = command
+            .get_envs()
+            .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
+            .collect();
+        assert!(
+            environment
+                .get(openshell_core::sandbox_env::LANDLOCK_ABI)
+                .and_then(|value| value.parse::<i32>().ok())
+                .is_some_and(|value| value > 0)
+        );
+        assert!(
+            environment
+                .get(openshell_core::sandbox_env::LANDLOCK_RULES_APPLIED)
+                .and_then(|value| value.parse::<usize>().ok())
+                .is_some_and(|value| value > 0)
+        );
     }
 
     #[tokio::test]
