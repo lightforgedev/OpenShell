@@ -356,6 +356,9 @@ pub struct UpstreamProxyArgs {
     /// sandbox trust bundle and upstream verification too (folded in by
     /// `run.rs`).
     pub proxy_ca_bundle: Option<String>,
+    /// Path to operator-owned roots trusted for direct upstream TLS. This is
+    /// deliberately independent of corporate-proxy configuration.
+    pub additional_ca_bundle: Option<String>,
 }
 
 // Supervisor CLI flag names for the corporate-proxy settings, used as the
@@ -367,6 +370,7 @@ const ARG_PROXY_AUTH_FILE: &str = "--upstream-proxy-auth-file";
 const ARG_PROXY_AUTH_ALLOW_INSECURE: &str = "--upstream-proxy-auth-allow-insecure";
 const ARG_PROXY_CONNECT_BY_HOSTNAME: &str = "--upstream-proxy-connect-by-hostname";
 pub(crate) const ARG_PROXY_CA_BUNDLE: &str = "--upstream-proxy-ca-bundle";
+pub(crate) const ARG_ADDITIONAL_CA_BUNDLE: &str = "--additional-ca-bundle";
 
 impl UpstreamProxyConfig {
     /// Build the corporate proxy configuration from the driver-supplied
@@ -1177,6 +1181,14 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+
+        // Direct private-upstream trust is consumed by the TLS runtime, not
+        // corporate-proxy validation. It must not manufacture a proxy.
+        let args = UpstreamProxyArgs {
+            additional_ca_bundle: Some("/etc/openshell/platform-ca.pem".to_string()),
+            ..UpstreamProxyArgs::default()
+        };
+        assert!(UpstreamProxyConfig::from_args(&args).unwrap().is_none());
     }
 
     #[test]

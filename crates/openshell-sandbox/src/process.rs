@@ -548,6 +548,14 @@ impl ProcessHandle {
         let prepared_sandbox = prepare_child_sandbox(policy, workspace.root(), &runtime_read_only)
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
         #[cfg(target_os = "linux")]
+        if let Some(prepared) = prepared_sandbox.as_ref()
+            && let Some(env_vars) = sandbox::linux::landlock_evidence_env(prepared)
+        {
+            for (key, value) in env_vars {
+                cmd.env(key, value);
+            }
+        }
+        #[cfg(target_os = "linux")]
         let mut child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
             .map_err(|error| miette::miette!("prepare child self-protection filter: {error}"))?;
         // Set up process group for signal handling (non-interactive mode only).
