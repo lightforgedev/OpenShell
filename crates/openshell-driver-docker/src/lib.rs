@@ -110,6 +110,8 @@ const SUPERVISOR_STATE_MOUNT_PATH: &str = "/.openshell/supervisor";
 const SUPERVISOR_PROXY_AUTH_MOUNT_PATH: &str = "/.openshell/supervisor/upstream-proxy-auth";
 const SUPERVISOR_PROXY_CA_BUNDLE_MOUNT_PATH: &str =
     "/.openshell/supervisor/upstream-proxy-ca-bundle.pem";
+const SUPERVISOR_ADDITIONAL_CA_BUNDLE_MOUNT_PATH: &str =
+    "/.openshell/supervisor/additional-ca-bundle.pem";
 const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
     openshell_core::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
 const DRIVER_ADMITTED_BACKEND: &str = openshell_sandbox_backend::BACKEND_NAME;
@@ -4741,13 +4743,17 @@ fn append_docker_ca_bundles(
     proxy_path: Option<&Path>,
     additional_path: Option<&Path>,
 ) -> Result<(), Status> {
-    if proxy_path.is_none() && additional_path.is_none() {
-        return Ok(());
-    }
-    let mut contents = String::new();
-    for (path, label) in [
-        (proxy_path, "proxy_ca_bundle"),
-        (additional_path, "additional_ca_bundle"),
+    for (path, label, archive_path) in [
+        (
+            proxy_path,
+            "proxy_ca_bundle",
+            "upstream-proxy-ca-bundle.pem",
+        ),
+        (
+            additional_path,
+            "additional_ca_bundle",
+            "additional-ca-bundle.pem",
+        ),
     ] {
         let Some(path) = path else { continue };
         let path = path
@@ -4755,19 +4761,16 @@ fn append_docker_ca_bundles(
             .ok_or_else(|| Status::failed_precondition(format!("{label} must be valid UTF-8")))?;
         let pem = openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(path, label)
             .map_err(Status::failed_precondition)?;
-        if !contents.is_empty() && !contents.ends_with('\n') {
-            contents.push('\n');
-        }
-        contents.push_str(&pem);
+        append_docker_archive_file(
+            archive,
+            archive_path,
+            0o644,
+            SUPERVISOR_UID,
+            SUPERVISOR_GID,
+            pem.as_bytes(),
+        )?;
     }
-    append_docker_archive_file(
-        archive,
-        "upstream-proxy-ca-bundle.pem",
-        0o644,
-        SUPERVISOR_UID,
-        SUPERVISOR_GID,
-        contents.as_bytes(),
-    )
+    Ok(())
 }
 
 async fn refresh_docker_boundary_authentication(
@@ -5165,7 +5168,8 @@ async fn spawn_docker_control_process(
     ];
     command.extend(docker_upstream_proxy_cli_args(
         &config.upstream_proxy,
-        config.proxy_ca_bundle.is_some() || config.additional_ca_bundle.is_some(),
+        config.proxy_ca_bundle.is_some(),
+        config.additional_ca_bundle.is_some(),
     ));
     let mut supervisor_mounts = vec![
         Mount {
@@ -5956,6 +5960,7 @@ fn validate_docker_ca_bundle(path: Option<&Path>, label: &str) -> CoreResult<()>
 fn docker_upstream_proxy_cli_args(
     config: &UpstreamProxyConfig,
     proxy_ca_bundle_configured: bool,
+    additional_ca_bundle_configured: bool,
 ) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(url) = config.https_proxy.as_ref() {
@@ -5980,6 +5985,12 @@ fn docker_upstream_proxy_cli_args(
         args.extend([
             "--upstream-proxy-ca-bundle".to_string(),
             SUPERVISOR_PROXY_CA_BUNDLE_MOUNT_PATH.to_string(),
+        ]);
+    }
+    if additional_ca_bundle_configured {
+        args.extend([
+            "--additional-ca-bundle".to_string(),
+            SUPERVISOR_ADDITIONAL_CA_BUNDLE_MOUNT_PATH.to_string(),
         ]);
     }
     args

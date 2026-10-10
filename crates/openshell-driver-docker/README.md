@@ -80,9 +80,12 @@ used by workload processes.
 
 `additional_ca_bundle` adds an operator-owned PEM root for direct private
 upstream endpoints without requiring a corporate proxy. The driver validates
-it at gateway startup and combines its contents with any `proxy_ca_bundle` in
-the same immutable supervisor-volume file. Sandbox image contents and
-per-sandbox driver configuration cannot select or override this trust input.
+it at gateway startup and copies it into a separate immutable
+`/.openshell/supervisor/additional-ca-bundle.pem` supervisor-volume file. The
+supervisor merges that root into its generated workload and upstream trust
+bundle without enabling or requiring corporate-proxy configuration. Sandbox
+image contents and per-sandbox driver configuration cannot select or override
+this trust input.
 
 ## Identity and Workspace
 

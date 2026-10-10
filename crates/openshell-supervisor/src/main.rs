@@ -118,6 +118,10 @@ struct Args {
     #[arg(long)]
     upstream_proxy_ca_bundle: Option<String>,
 
+    /// Operator-owned PEM roots trusted for direct upstream TLS.
+    #[arg(long)]
+    additional_ca_bundle: Option<String>,
+
     #[arg(long)]
     backend_descriptor_file: Option<PathBuf>,
 
@@ -403,6 +407,7 @@ fn main() -> Result<()> {
             proxy_auth_allow_insecure: args.upstream_proxy_auth_allow_insecure,
             proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname,
             proxy_ca_bundle: args.upstream_proxy_ca_bundle,
+            additional_ca_bundle: args.additional_ca_bundle,
         };
         match args.role {
             SupervisorRole::IsolationBackend => {

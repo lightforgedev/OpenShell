@@ -368,7 +368,7 @@ fn docker_proxy_ca_bundle_uses_fixed_supervisor_path() {
         ..UpstreamProxyConfig::default()
     };
 
-    let args = docker_upstream_proxy_cli_args(&proxy, true);
+    let args = docker_upstream_proxy_cli_args(&proxy, true, false);
     let option = args
         .iter()
         .position(|arg| arg == "--upstream-proxy-ca-bundle")
@@ -382,7 +382,21 @@ fn docker_proxy_ca_bundle_uses_fixed_supervisor_path() {
         "gateway-host paths must not appear in supervisor argv: {args:?}"
     );
 
-    let args = docker_upstream_proxy_cli_args(&proxy, false);
+    let args = docker_upstream_proxy_cli_args(&proxy, false, false);
+    assert!(!args.iter().any(|arg| arg == "--upstream-proxy-ca-bundle"));
+}
+
+#[test]
+fn docker_additional_ca_bundle_uses_its_own_supervisor_argument() {
+    let args = docker_upstream_proxy_cli_args(&UpstreamProxyConfig::default(), false, true);
+    let option = args
+        .iter()
+        .position(|arg| arg == "--additional-ca-bundle")
+        .expect("additional CA option");
+    assert_eq!(
+        args.get(option + 1).map(String::as_str),
+        Some(SUPERVISOR_ADDITIONAL_CA_BUNDLE_MOUNT_PATH)
+    );
     assert!(!args.iter().any(|arg| arg == "--upstream-proxy-ca-bundle"));
 }
 
@@ -413,28 +427,27 @@ fn docker_proxy_ca_bundle_is_staged_in_supervisor_archive() {
 }
 
 #[test]
-fn docker_ca_bundles_are_combined_for_the_supervisor() {
+fn docker_ca_bundles_are_staged_separately_for_the_supervisor() {
     let directory = TempDir::new().expect("create CA directory");
     let proxy = write_test_proxy_ca_bundle(&directory);
     let additional = directory.path().join("platform-ca.pem");
     fs::copy(&proxy, &additional).unwrap();
-    let expected_certificate_count = fs::read_to_string(&proxy)
-        .unwrap()
-        .matches("-----BEGIN CERTIFICATE-----")
-        .count()
-        * 2;
     let mut builder = tar::Builder::new(Vec::new());
 
     append_docker_ca_bundles(&mut builder, Some(&proxy), Some(&additional)).unwrap();
     let archive = builder.into_inner().unwrap();
     let mut archive = tar::Archive::new(archive.as_slice());
-    let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
-    let mut actual = String::new();
-    entry.read_to_string(&mut actual).unwrap();
-
+    let paths = archive
+        .entries()
+        .unwrap()
+        .map(|entry| entry.unwrap().path().unwrap().into_owned())
+        .collect::<Vec<_>>();
     assert_eq!(
-        actual.matches("-----BEGIN CERTIFICATE-----").count(),
-        expected_certificate_count
+        paths,
+        [
+            PathBuf::from("upstream-proxy-ca-bundle.pem"),
+            PathBuf::from("additional-ca-bundle.pem"),
+        ]
     );
 }
 

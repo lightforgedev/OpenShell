@@ -359,12 +359,19 @@ pub async fn run_networking(
                 // https:// proxy listener. Fail closed on an unreadable or
                 // certificate-free bundle, matching the rest of the
                 // operator-owned proxy configuration.
-                if let Some(path) = upstream_proxy_args.proxy_ca_bundle.as_deref() {
-                    let pem = crate::upstream_proxy::read_proxy_ca_bundle(
-                        path,
+                for (path, label) in [
+                    (
+                        upstream_proxy_args.proxy_ca_bundle.as_deref(),
                         crate::upstream_proxy::ARG_PROXY_CA_BUNDLE,
-                    )
-                    .map_err(|err| miette::miette!("{err}"))?;
+                    ),
+                    (
+                        upstream_proxy_args.additional_ca_bundle.as_deref(),
+                        crate::upstream_proxy::ARG_ADDITIONAL_CA_BUNDLE,
+                    ),
+                ] {
+                    let Some(path) = path else { continue };
+                    let pem = crate::upstream_proxy::read_proxy_ca_bundle(path, label)
+                        .map_err(|err| miette::miette!("{err}"))?;
                     if !system_ca_bundle.is_empty() && !system_ca_bundle.ends_with('\n') {
                         system_ca_bundle.push('\n');
                     }
