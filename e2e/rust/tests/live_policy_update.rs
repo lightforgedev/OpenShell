@@ -37,7 +37,8 @@ use tempfile::NamedTempFile;
 // ---------------------------------------------------------------------------
 
 /// Build a policy YAML that allows any binary to reach the given hosts on
-/// port 443.
+/// port 443. Keep its filesystem paths aligned with the empty-network policy
+/// so live network updates do not remove startup filesystem access.
 ///
 /// NOTE: The indentation in the format string is load-bearing YAML structure.
 fn write_policy(hosts: &[&str]) -> Result<NamedTempFile, String> {
@@ -64,6 +65,7 @@ fn write_policy(hosts: &[&str]) -> Result<NamedTempFile, String> {
 filesystem_policy:
   include_workdir: true
   read_only:
+    - /bin
     - /usr
     - /lib
     - /proc
@@ -78,10 +80,6 @@ filesystem_policy:
 
 landlock:
   compatibility: best_effort
-
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
 
 network_policies:
 {network_rules}"
@@ -94,7 +92,8 @@ network_policies:
     Ok(file)
 }
 
-/// Build a minimal policy YAML with no network rules.
+/// Build a minimal policy YAML with no network rules. Both /bin and /usr
+/// are readable so shell entrypoints work on merged and unmerged images.
 fn write_empty_network_policy() -> Result<NamedTempFile, String> {
     let mut file = NamedTempFile::new().map_err(|e| format!("create temp policy file: {e}"))?;
 
@@ -103,6 +102,7 @@ fn write_empty_network_policy() -> Result<NamedTempFile, String> {
 filesystem_policy:
   include_workdir: true
   read_only:
+    - /bin
     - /usr
     - /lib
     - /proc
@@ -117,10 +117,6 @@ filesystem_policy:
 
 landlock:
   compatibility: best_effort
-
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
 ";
 
     file.write_all(policy.as_bytes())
@@ -169,8 +165,7 @@ fn extract_version(output: &str) -> Option<u32> {
 
 /// Extract the policy hash from `policy get` output.
 fn extract_hash(output: &str) -> Option<String> {
-    extract_field(output, "Hash")
-        .or_else(|| extract_field(output, "Policy hash"))
+    extract_field(output, "Hash").or_else(|| extract_field(output, "Policy hash"))
 }
 
 /// Check that a version number appears in `policy list` output as a
@@ -190,10 +185,176 @@ fn list_output_contains_version(output: &str, version: u32) -> bool {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Read the effective policy through the same CLI boundary used by operators.
+async fn l7_scope_snapshot(name: &str) -> serde_json::Value {
+    let result = run_cli(&["policy", "get", name, "--full", "--output", "json"]).await;
+    assert!(result.success, "policy snapshot failed: {}", result.output);
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&result.output).expect("policy get returns JSON");
+    assert!(snapshot["version"].as_u64().is_some());
+    assert!(
+        snapshot["hash"]
+            .as_str()
+            .is_some_and(|hash| !hash.is_empty())
+    );
+    assert!(snapshot["policy"]["network_policies"].is_object());
+    snapshot
+}
+
+/// Incomplete declarations reject without a revision; an explicit target
+/// changes only its endpoint even when another rule shares the host and ports.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn l7_append_target_scope_round_trip() {
+    let mut policy = write_empty_network_policy().expect("write base policy");
+    policy
+        .write_all(
+            br"
+network_policies:
+  internal_api:
+    name: internal_api
+    binaries:
+      - path: /usr/bin/curl
+      - path: /usr/bin/python3
+    endpoints:
+      - host: api.example.com
+        ports: [443, 8443]
+        protocol: rest
+        access: read-only
+      - host: other.example.com
+        port: 443
+        protocol: rest
+        access: read-only
+  sibling:
+    name: sibling
+    binaries:
+      - path: /usr/bin/wget
+    endpoints:
+      - host: api.example.com
+        ports: [443, 8443]
+        protocol: rest
+        access: read-only
+",
+        )
+        .expect("write scoped policy");
+    policy.flush().expect("flush scoped policy");
+    let path = policy.path().to_str().expect("UTF-8 policy path");
+    let mut guard = SandboxGuard::create_keep_with_args(
+        &["--policy", path, "--no-tty"],
+        &["sh", "-c", "echo Ready && sleep infinity"],
+        "Ready",
+    )
+    .await
+    .expect("create scoped-policy sandbox");
+    let before = l7_scope_snapshot(&guard.name).await;
+
+    // Check each independent axis with the other fully declared, so a guard
+    // requiring both mismatches at once cannot satisfy this regression.
+    for (ports, binaries) in [
+        (
+            "api.example.com:443:POST:/admin",
+            vec!["/usr/bin/curl", "/usr/bin/python3"],
+        ),
+        (
+            "api.example.com:443,8443:POST:/admin",
+            vec!["/usr/bin/curl"],
+        ),
+    ] {
+        let mut args = vec![
+            "policy",
+            "update",
+            &guard.name,
+            "--rule-name",
+            "internal_api",
+            "--add-allow",
+            ports,
+        ];
+        for binary in binaries {
+            args.extend(["--binary", binary]);
+        }
+        let rejected = run_cli(&args).await;
+        assert!(
+            !rejected.success,
+            "partial scope was accepted: {}",
+            rejected.output
+        );
+        let unchanged = l7_scope_snapshot(&guard.name).await;
+        for field in ["version", "hash", "policy"] {
+            assert_eq!(unchanged[field], before[field], "rejection changed {field}");
+        }
+    }
+
+    let common = [
+        "policy",
+        "update",
+        &guard.name,
+        "--rule-name",
+        "internal_api",
+        "--binary",
+        "/usr/bin/curl",
+        "--binary",
+        "/usr/bin/python3",
+    ];
+    let mut allow_args = common.to_vec();
+    allow_args.extend([
+        "--add-allow",
+        "api.example.com:443,8443:POST:/admin",
+        "--wait",
+    ]);
+    let accepted = run_cli(&allow_args).await;
+    assert!(
+        accepted.success,
+        "explicit allow failed: {}",
+        accepted.output
+    );
+    let after_allow = l7_scope_snapshot(&guard.name).await;
+    assert!(after_allow["version"].as_u64() > before["version"].as_u64());
+    assert_ne!(after_allow["hash"], before["hash"]);
+    let rules = &after_allow["policy"]["network_policies"];
+    assert_eq!(
+        rules["sibling"],
+        before["policy"]["network_policies"]["sibling"]
+    );
+    assert_eq!(
+        rules["internal_api"]["endpoints"][1],
+        before["policy"]["network_policies"]["internal_api"]["endpoints"][1]
+    );
+    assert!(
+        rules["internal_api"]["endpoints"][0]["rules"]
+            .as_array()
+            .expect("allow rules")
+            .iter()
+            .any(|rule| rule["allow"]["method"] == "POST" && rule["allow"]["path"] == "/admin")
+    );
+
+    let mut deny_args = common.to_vec();
+    deny_args.extend([
+        "--add-deny",
+        "api.example.com:443,8443:POST:/admin/private",
+        "--wait",
+    ]);
+    let denied = run_cli(&deny_args).await;
+    assert!(denied.success, "explicit deny failed: {}", denied.output);
+    let after_deny = l7_scope_snapshot(&guard.name).await;
+    assert!(after_deny["version"].as_u64() > after_allow["version"].as_u64());
+    assert_eq!(
+        after_deny["policy"]["network_policies"]["sibling"],
+        before["policy"]["network_policies"]["sibling"]
+    );
+    assert!(
+        after_deny["policy"]["network_policies"]["internal_api"]["endpoints"][0]["deny_rules"]
+            .as_array()
+            .expect("deny rules")
+            .iter()
+            .any(|rule| rule["method"] == "POST" && rule["path"] == "/admin/private")
+    );
+    guard.cleanup().await;
+}
+
 /// Test the full live policy update lifecycle:
 ///
-/// 1. Create sandbox with `--keep`
-/// 2. Set policy A, verify initial version >= 1
+/// 1. Create sandbox with policy A and `--keep`
+/// 2. Verify initial version >= 1
 /// 3. Push same policy A -> version unchanged (idempotent)
 /// 4. Push policy B (adds example.com) with `--wait` -> new version
 /// 5. Push policy B again -> idempotent
@@ -203,8 +364,7 @@ fn list_output_contains_version(output: &str, version: u32) -> bool {
 async fn live_policy_update_round_trip() {
     // --- Write two distinct policy files ---
     let policy_a = write_policy(&["api.anthropic.com"]).expect("write policy A");
-    let policy_b =
-        write_policy(&["api.anthropic.com", "example.com"]).expect("write policy B");
+    let policy_b = write_policy(&["api.anthropic.com", "example.com"]).expect("write policy B");
 
     let policy_a_path = policy_a
         .path()
@@ -217,24 +377,14 @@ async fn live_policy_update_round_trip() {
         .expect("policy B path should be utf-8")
         .to_string();
 
-    // --- Create a long-running sandbox ---
-    let mut guard = SandboxGuard::create_keep(
+    // --- Create a long-running sandbox with its startup-only policy fields ---
+    let mut guard = SandboxGuard::create_keep_with_args(
+        &["--policy", &policy_a_path, "--no-tty"],
         &["sh", "-c", "echo Ready && sleep infinity"],
         "Ready",
     )
     .await
-    .expect("create keep sandbox");
-
-    // --- Set initial policy A ---
-    let r = run_cli(&[
-        "policy", "set", &guard.name, "--policy", &policy_a_path, "--wait", "--timeout", "120",
-    ])
-    .await;
-    assert!(
-        r.success,
-        "policy set A should succeed (exit {:?}):\n{}",
-        r.exit_code, r.output
-    );
+    .expect("create keep sandbox with policy A");
 
     // --- Verify initial policy version ---
     let r = run_cli(&["policy", "get", &guard.name]).await;
@@ -244,8 +394,12 @@ async fn live_policy_update_round_trip() {
         r.exit_code, r.output
     );
 
-    let initial_version = extract_version(&r.output)
-        .unwrap_or_else(|| panic!("could not parse version from policy get output:\n{}", r.output));
+    let initial_version = extract_version(&r.output).unwrap_or_else(|| {
+        panic!(
+            "could not parse version from policy get output:\n{}",
+            r.output
+        )
+    });
     assert!(
         initial_version >= 1,
         "initial policy version should be >= 1, got {initial_version}"
@@ -255,7 +409,14 @@ async fn live_policy_update_round_trip() {
 
     // --- Push same policy A again -> should be idempotent ---
     let r = run_cli(&[
-        "policy", "set", &guard.name, "--policy", &policy_a_path, "--wait", "--timeout", "120",
+        "policy",
+        "set",
+        &guard.name,
+        "--policy",
+        &policy_a_path,
+        "--wait",
+        "--timeout",
+        "120",
     ])
     .await;
     assert!(
@@ -265,7 +426,11 @@ async fn live_policy_update_round_trip() {
     );
 
     let r = run_cli(&["policy", "get", &guard.name]).await;
-    assert!(r.success, "policy get after repeat should succeed:\n{}", r.output);
+    assert!(
+        r.success,
+        "policy get after repeat should succeed:\n{}",
+        r.output
+    );
 
     let repeat_version = extract_version(&r.output)
         .unwrap_or_else(|| panic!("could not parse version after repeat:\n{}", r.output));
@@ -280,7 +445,14 @@ async fn live_policy_update_round_trip() {
 
     // --- Push policy B -> should create new version ---
     let r = run_cli(&[
-        "policy", "set", &guard.name, "--policy", &policy_b_path, "--wait", "--timeout", "120",
+        "policy",
+        "set",
+        &guard.name,
+        "--policy",
+        &policy_b_path,
+        "--wait",
+        "--timeout",
+        "120",
     ])
     .await;
     assert!(
@@ -290,7 +462,11 @@ async fn live_policy_update_round_trip() {
     );
 
     let r = run_cli(&["policy", "get", &guard.name]).await;
-    assert!(r.success, "policy get after B should succeed:\n{}", r.output);
+    assert!(
+        r.success,
+        "policy get after B should succeed:\n{}",
+        r.output
+    );
 
     let new_version = extract_version(&r.output)
         .unwrap_or_else(|| panic!("could not parse version after B:\n{}", r.output));
@@ -305,7 +481,14 @@ async fn live_policy_update_round_trip() {
 
     // --- Push policy B again -> idempotent ---
     let r = run_cli(&[
-        "policy", "set", &guard.name, "--policy", &policy_b_path, "--wait", "--timeout", "120",
+        "policy",
+        "set",
+        &guard.name,
+        "--policy",
+        &policy_b_path,
+        "--wait",
+        "--timeout",
+        "120",
     ])
     .await;
     assert!(
@@ -315,7 +498,11 @@ async fn live_policy_update_round_trip() {
     );
 
     let r = run_cli(&["policy", "get", &guard.name]).await;
-    assert!(r.success, "policy get after B repeat should succeed:\n{}", r.output);
+    assert!(
+        r.success,
+        "policy get after B repeat should succeed:\n{}",
+        r.output
+    );
 
     let repeat_b_version = extract_version(&r.output)
         .unwrap_or_else(|| panic!("could not parse version after B repeat:\n{}", r.output));
@@ -349,10 +536,9 @@ async fn live_policy_update_round_trip() {
 
 /// Test live policy update from an initially empty network policy:
 ///
-/// 1. Create sandbox with `--keep`
-/// 2. Set policy with no network rules
-/// 3. Push policy with a network rule using `--wait`
-/// 4. Verify the version bumped
+/// 1. Create sandbox with no network rules and `--keep`
+/// 2. Push policy with a network rule using `--wait`
+/// 3. Verify the version bumped
 #[tokio::test]
 async fn live_policy_update_from_empty_network_policies() {
     let empty_policy = write_empty_network_policy().expect("write empty network policy");
@@ -369,34 +555,37 @@ async fn live_policy_update_from_empty_network_policies() {
         .expect("full policy path should be utf-8")
         .to_string();
 
-    // Create sandbox with empty network policy.
-    let mut guard = SandboxGuard::create_keep(
+    // Create the sandbox with the empty network policy so subsequent live
+    // updates retain the same startup-only filesystem, landlock, and process
+    // fields.
+    let mut guard = SandboxGuard::create_keep_with_args(
+        &["--policy", &empty_path, "--no-tty"],
         &["sh", "-c", "echo Ready && sleep infinity"],
         "Ready",
     )
     .await
-    .expect("create keep sandbox");
-
-    // Set initial empty policy.
-    let r = run_cli(&[
-        "policy", "set", &guard.name, "--policy", &empty_path, "--wait", "--timeout", "120",
-    ])
-    .await;
-    assert!(
-        r.success,
-        "policy set (empty) should succeed (exit {:?}):\n{}",
-        r.exit_code, r.output
-    );
+    .expect("create keep sandbox with empty network policy");
 
     let r = run_cli(&["policy", "get", &guard.name]).await;
-    assert!(r.success, "policy get (empty) should succeed:\n{}", r.output);
+    assert!(
+        r.success,
+        "policy get (empty) should succeed:\n{}",
+        r.output
+    );
 
     let initial_version = extract_version(&r.output)
         .unwrap_or_else(|| panic!("could not parse version from empty policy:\n{}", r.output));
 
     // Push policy with network rules.
     let r = run_cli(&[
-        "policy", "set", &guard.name, "--policy", &full_path, "--wait", "--timeout", "120",
+        "policy",
+        "set",
+        &guard.name,
+        "--policy",
+        &full_path,
+        "--wait",
+        "--timeout",
+        "120",
     ])
     .await;
     assert!(
@@ -417,6 +606,84 @@ async fn live_policy_update_from_empty_network_policies() {
     assert!(
         new_version > initial_version,
         "adding network rules should create new version > {initial_version}, got {new_version}"
+    );
+
+    guard.cleanup().await;
+}
+
+/// Regression for #2159: a sparse initial policy that the supervisor enriches
+/// with baseline filesystem paths during startup must have its resulting
+/// revision acknowledged as loaded, not left `Pending`.
+///
+/// Reproduction (matches the maintainer's triage): create a sandbox with the
+/// network-only `examples/policy-advisor/sandbox-policy.yaml`. The supervisor
+/// adds baseline filesystem paths, syncs the enriched policy back to the
+/// gateway (creating revision 2, superseding revision 1), builds the OPA engine
+/// and then acknowledges revision 2 as loaded. Before the fix, revision 2
+/// stayed `Pending` even though the sandbox was `Ready` and the policy was
+/// effective.
+///
+/// NOTE: This exercises the Docker-backed supervisor built from this branch.
+/// The exact `policy list` status wording ("Loaded"/"Superseded") may differ by
+/// CLI version; the assertions below key on the effective version reaching 2 and
+/// no revision remaining `Pending` once the acknowledgement lands.
+#[tokio::test]
+async fn initial_sparse_policy_is_acknowledged_as_loaded() {
+    // Repo-relative path to the sparse network-only policy fixture.
+    let sparse_policy = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/policy-advisor/sandbox-policy.yaml"
+    );
+
+    let mut guard = SandboxGuard::create_keep_with_args(
+        &[
+            "--name",
+            "e2e-sparse-enrich",
+            "--policy",
+            sparse_policy,
+            "--no-tty",
+        ],
+        &["sh", "-c", "echo Ready && sleep infinity"],
+        "Ready",
+    )
+    .await
+    .expect("create keep sandbox with sparse policy");
+
+    // The enriched revision (2) is synced during startup; the acknowledgement
+    // (LOADED) is delivered by the supervisor's poll loop shortly after Ready.
+    // Poll until the effective policy is version 2 and no revision is Pending.
+    let mut acknowledged = false;
+    let mut last_list = String::new();
+    for _ in 0..30 {
+        let get = run_cli(&["policy", "get", &guard.name]).await;
+        let version = get.success.then(|| extract_version(&get.output)).flatten();
+
+        let list = run_cli(&["policy", "list", &guard.name]).await;
+        last_list = list.output.clone();
+        let pending = list.output.to_lowercase().contains("pending");
+
+        if version == Some(2) && list.success && !pending {
+            acknowledged = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+
+    assert!(
+        acknowledged,
+        "enriched initial policy should reach revision 2 with no Pending revision.\n\
+         last `policy list` output:\n{last_list}"
+    );
+
+    // Both the superseded original (1) and the loaded enriched revision (2)
+    // must appear in the revision history.
+    assert!(
+        list_output_contains_version(&last_list, 2),
+        "policy list should contain revision 2:\n{last_list}"
+    );
+    assert!(
+        list_output_contains_version(&last_list, 1),
+        "policy list should contain revision 1:\n{last_list}"
     );
 
     guard.cleanup().await;
