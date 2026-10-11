@@ -246,6 +246,16 @@ pub const SANDBOX_UID: &str = "OPENSHELL_SANDBOX_UID";
 /// supervisor drops privileges to a group other than the UID's primary group.
 pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";
 
+/// Landlock ABI observed while preparing a hard-requirement filesystem policy.
+///
+/// This is injected only after OpenShell has prepared a real ruleset for the
+/// child process; best-effort policies never export it as enforcement evidence.
+pub const LANDLOCK_ABI: &str = "OPENSHELL_LANDLOCK_ABI";
+
+/// Number of Landlock path rules prepared for a hard-requirement filesystem
+/// policy. See [`LANDLOCK_ABI`] for the export boundary.
+pub const LANDLOCK_RULES_APPLIED: &str = "OPENSHELL_LANDLOCK_RULES_APPLIED";
+
 /// Default numeric UID assigned to a sandbox when the image declares no OCI
 /// `USER` (for example, a minimal base image).
 ///

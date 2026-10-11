@@ -67,6 +67,15 @@ pub fn prepare_capability_free(
     })
 }
 
+/// Export evidence only from a policy that required real Landlock enforcement.
+/// A capability-free baseline alone is not evidence for an optional user policy.
+pub fn landlock_evidence_env(prepared: &PreparedSandbox) -> Option<[(String, String); 2]> {
+    prepared
+        .landlock
+        .iter()
+        .find_map(landlock::PreparedRuleset::evidence_env)
+}
+
 /// Phase 2: Enforce prepared sandbox restrictions in the child before exec.
 ///
 /// Calls `restrict_self()` for Landlock and applies seccomp filters.

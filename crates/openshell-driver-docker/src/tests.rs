@@ -224,6 +224,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         enable_bind_mounts: false,
         upstream_proxy: UpstreamProxyConfig::default(),
         proxy_ca_bundle: None,
+        additional_ca_bundle: None,
         provider_spiffe_workload_api_socket: None,
         app_armor_profile: Some(AppArmorProfile::Unconfined),
     }
@@ -251,6 +252,48 @@ proxy_ca_bundle = "/etc/openshell/tls/proxy-ca.pem"
         config.proxy_ca_bundle,
         Some(PathBuf::from("/etc/openshell/tls/proxy-ca.pem"))
     );
+}
+
+#[test]
+fn docker_additional_ca_bundle_is_accepted_without_proxy() {
+    let directory = TempDir::new().expect("create CA directory");
+    let ca_bundle = write_test_proxy_ca_bundle(&directory);
+    let config = DockerComputeConfig {
+        additional_ca_bundle: Some(ca_bundle),
+        ..DockerComputeConfig::default()
+    };
+
+    config
+        .validate_configuration("127.0.0.1:17670".parse().unwrap())
+        .expect("direct-upstream CA bundle must not require a proxy");
+}
+
+#[test]
+fn docker_additional_ca_bundle_validation_is_fail_closed() {
+    let directory = TempDir::new().expect("create CA directory");
+    let mut config = DockerComputeConfig {
+        additional_ca_bundle: Some(directory.path().join("missing.pem")),
+        ..DockerComputeConfig::default()
+    };
+    let error = config
+        .validate_configuration("127.0.0.1:17670".parse().unwrap())
+        .expect_err("missing direct-upstream CA bundle must fail at startup");
+    assert!(
+        error.to_string().contains("additional_ca_bundle"),
+        "{error}"
+    );
+
+    let malformed = directory.path().join("malformed.pem");
+    fs::write(&malformed, "not a certificate\n").unwrap();
+    config.additional_ca_bundle = Some(malformed);
+    let error = config
+        .validate_configuration("127.0.0.1:17670".parse().unwrap())
+        .expect_err("certificate-free direct-upstream CA bundle must fail at startup");
+    assert!(
+        error.to_string().contains("additional_ca_bundle"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("no PEM certificate"), "{error}");
 }
 
 #[test]
@@ -325,7 +368,7 @@ fn docker_proxy_ca_bundle_uses_fixed_supervisor_path() {
         ..UpstreamProxyConfig::default()
     };
 
-    let args = docker_upstream_proxy_cli_args(&proxy, true);
+    let args = docker_upstream_proxy_cli_args(&proxy, true, false);
     let option = args
         .iter()
         .position(|arg| arg == "--upstream-proxy-ca-bundle")
@@ -339,7 +382,21 @@ fn docker_proxy_ca_bundle_uses_fixed_supervisor_path() {
         "gateway-host paths must not appear in supervisor argv: {args:?}"
     );
 
-    let args = docker_upstream_proxy_cli_args(&proxy, false);
+    let args = docker_upstream_proxy_cli_args(&proxy, false, false);
+    assert!(!args.iter().any(|arg| arg == "--upstream-proxy-ca-bundle"));
+}
+
+#[test]
+fn docker_additional_ca_bundle_uses_its_own_supervisor_argument() {
+    let args = docker_upstream_proxy_cli_args(&UpstreamProxyConfig::default(), false, true);
+    let option = args
+        .iter()
+        .position(|arg| arg == "--additional-ca-bundle")
+        .expect("additional CA option");
+    assert_eq!(
+        args.get(option + 1).map(String::as_str),
+        Some(SUPERVISOR_ADDITIONAL_CA_BUNDLE_MOUNT_PATH)
+    );
     assert!(!args.iter().any(|arg| arg == "--upstream-proxy-ca-bundle"));
 }
 
@@ -350,7 +407,7 @@ fn docker_proxy_ca_bundle_is_staged_in_supervisor_archive() {
     let expected = fs::read_to_string(&ca_bundle).unwrap();
     let mut builder = tar::Builder::new(Vec::new());
 
-    append_docker_proxy_ca_bundle(&mut builder, Some(&ca_bundle)).expect("append proxy CA bundle");
+    append_docker_ca_bundles(&mut builder, Some(&ca_bundle), None).expect("append proxy CA bundle");
     let archive = builder.into_inner().expect("finish proxy CA archive");
     let mut archive = tar::Archive::new(archive.as_slice());
     let mut entries = archive.entries().unwrap();
@@ -367,6 +424,31 @@ fn docker_proxy_ca_bundle_is_staged_in_supervisor_archive() {
     entry.read_to_string(&mut actual).unwrap();
     assert_eq!(actual, expected);
     assert!(entries.next().is_none());
+}
+
+#[test]
+fn docker_ca_bundles_are_staged_separately_for_the_supervisor() {
+    let directory = TempDir::new().expect("create CA directory");
+    let proxy = write_test_proxy_ca_bundle(&directory);
+    let additional = directory.path().join("platform-ca.pem");
+    fs::copy(&proxy, &additional).unwrap();
+    let mut builder = tar::Builder::new(Vec::new());
+
+    append_docker_ca_bundles(&mut builder, Some(&proxy), Some(&additional)).unwrap();
+    let archive = builder.into_inner().unwrap();
+    let mut archive = tar::Archive::new(archive.as_slice());
+    let paths = archive
+        .entries()
+        .unwrap()
+        .map(|entry| entry.unwrap().path().unwrap().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        [
+            PathBuf::from("upstream-proxy-ca-bundle.pem"),
+            PathBuf::from("additional-ca-bundle.pem"),
+        ]
+    );
 }
 
 #[test]
@@ -389,6 +471,28 @@ fn sandbox_driver_config_cannot_override_proxy_ca_bundle() {
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
     assert!(error.message().contains("unknown field"), "{error}");
     assert!(error.message().contains("proxy_ca_bundle"), "{error}");
+}
+
+#[test]
+fn sandbox_driver_config_cannot_override_additional_ca_bundle() {
+    let config = runtime_config();
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "additional_ca_bundle": "/workload/controlled-ca.pem"
+    })));
+
+    let error = DockerComputeDriver::validate_sandbox(&sandbox, &config)
+        .expect_err("sandbox driver config must not accept additional_ca_bundle");
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(error.message().contains("unknown field"), "{error}");
+    assert!(error.message().contains("additional_ca_bundle"), "{error}");
 }
 
 fn test_workload_identity() -> ResolvedWorkloadIdentity {
