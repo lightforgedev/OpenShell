@@ -6,10 +6,11 @@
 use clap::parser::ValueSource;
 use clap::{ArgAction, ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
-use openshell_core::ComputeDriverKind;
 use openshell_core::config::DEFAULT_SERVER_PORT;
+use openshell_core::{ComputeDriverKind, Error as CoreError};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -425,7 +426,19 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
     })
 }
 
-async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
+static STARTUP_FAILURE_EMITTED: AtomicBool = AtomicBool::new(false);
+
+async fn run_from_args(args: RunArgs, matches: ArgMatches) -> Result<()> {
+    let result = run_from_args_inner(args, matches).await;
+
+    if result.is_err() {
+        emit_startup_failure("startup_failed");
+    }
+
+    result
+}
+
+async fn run_from_args_inner(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
     let prepared = prepare_server_config(&mut args, &matches)?;
 
     let tracing_log_bus = TracingLogBus::new();
@@ -476,9 +489,49 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
 
     info!(bind = %prepared.config.bind_address, "Starting OpenShell server");
 
-    Box::pin(run_server(prepared, tracing_log_bus))
-        .await
-        .into_diagnostic()
+    match Box::pin(run_server(prepared, tracing_log_bus)).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            emit_startup_failure(startup_failure_code(&error));
+            Err(error).into_diagnostic()
+        }
+    }
+}
+
+fn emit_startup_failure(code: &'static str) {
+    if STARTUP_FAILURE_EMITTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        println!("CK_gateway_startup_failed code={code}");
+    }
+}
+
+fn startup_failure_code(error: &CoreError) -> &'static str {
+    match error {
+        CoreError::Config { message } | CoreError::Execution { message }
+            if message.contains("TLS materials require an https:// endpoint")
+                || message.contains("TLS materials are configured") =>
+        {
+            "tls_config_invalid"
+        }
+        CoreError::Execution { message }
+            if message.contains("Docker client") || message.contains("Docker daemon") =>
+        {
+            "docker_unavailable"
+        }
+        CoreError::Transport { message } if message.contains("Address already in use") => {
+            "bind_conflict"
+        }
+        CoreError::Execution { message }
+            if message.contains("database")
+                || message.contains("SQLite")
+                || message.contains("sqlite") =>
+        {
+            "db_open_failed"
+        }
+        _ => "startup_failed",
+    }
 }
 
 fn parse_compute_driver(value: &str) -> std::result::Result<String, String> {
@@ -812,6 +865,40 @@ mod tests {
         let cmd = command();
         let version = cmd.get_version().unwrap();
         assert_eq!(version.to_string(), openshell_core::VERSION);
+    }
+
+    #[test]
+    fn startup_failure_codes_are_content_free_and_bounded() {
+        let cases = [
+            (
+                openshell_core::Error::execution(
+                    "failed to create compute runtime: configuration error: guest_tls_ca was provided but grpc_endpoint is plaintext; TLS materials require an https:// endpoint",
+                ),
+                "tls_config_invalid",
+            ),
+            (
+                openshell_core::Error::execution("failed to query Docker daemon version"),
+                "docker_unavailable",
+            ),
+            (
+                openshell_core::Error::transport(
+                    "failed to bind to 127.0.0.1:8080: Address already in use",
+                ),
+                "bind_conflict",
+            ),
+            (
+                openshell_core::Error::execution("failed to open SQLite database"),
+                "db_open_failed",
+            ),
+            (
+                openshell_core::Error::process("customer-controlled details"),
+                "startup_failed",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(super::startup_failure_code(&error), expected);
+        }
     }
 
     #[test]
