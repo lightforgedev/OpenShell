@@ -261,29 +261,6 @@ jobs:
           cargo-version: 0.0.0
           artifact-name: connect-host-openshell-gateway-darwin-arm64
 
-  build-host-supervisor:
-    name: Build Darwin host supervisor
-    needs: merge-ci
-    runs-on: macos-15-xlarge
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: ./.github/actions/setup-nix
-        with:
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
-
-      - uses: ./.github/actions/build-rust-binary
-        with:
-          package: openshell-supervisor
-          binary: openshell-supervisor
-          triple: aarch64-apple-darwin
-          cargo-version: 0.0.0
-          artifact-name: connect-host-openshell-supervisor-darwin-arm64
-
   publish-gateway:
     name: Publish Gateway image
     needs: build-gateway-binary
@@ -418,7 +395,6 @@ jobs:
       - build-supervisor-binary
       - build-host-cli
       - build-host-gateway
-      - build-host-supervisor
       - publish-gateway
       - publish-sandbox
       - publish-supervisor
@@ -460,12 +436,6 @@ jobs:
           name: connect-host-openshell-gateway-darwin-arm64
           path: downloads/host-gateway
 
-      - name: Download Darwin host supervisor
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: connect-host-openshell-supervisor-darwin-arm64
-          path: downloads/host-supervisor
-
       - name: Verify artifacts and bind image digests
         run: |
           set -euo pipefail
@@ -475,12 +445,10 @@ jobs:
           install -D -m 0755 downloads/sandbox/openshell-sandbox artifacts/openshell-sandbox
           install -D -m 0755 downloads/host-cli/openshell artifacts/host-openshell-cli
           install -D -m 0755 downloads/host-gateway/openshell-gateway artifacts/openshell-gateway
-          install -D -m 0755 downloads/host-supervisor/openshell-supervisor artifacts/openshell-supervisor
           file artifacts/agent-openshell-cli | grep -Eq 'ELF 64-bit.*ARM aarch64'
           file artifacts/openshell-sandbox | grep -Eq 'ELF 64-bit.*ARM aarch64'
           file artifacts/host-openshell-cli | grep -q 'Mach-O.*arm64'
           file artifacts/openshell-gateway | grep -q 'Mach-O.*arm64'
-          file artifacts/openshell-supervisor | grep -q 'Mach-O.*arm64'
           resolve_digest() {
             docker buildx imagetools inspect "$1" --format '{{json .}}' | jq -er '.manifest.digest'
           }
@@ -506,7 +474,6 @@ jobs:
               ("host-openshell-cli", "darwin-arm64"),
               ("openshell-gateway", "darwin-arm64"),
               ("openshell-sandbox", "linux-arm64"),
-              ("openshell-supervisor", "darwin-arm64"),
           )
           artifacts = []
           inventory = hashlib.sha256()
@@ -548,7 +515,6 @@ jobs:
             artifacts/host-openshell-cli
             artifacts/openshell-gateway
             artifacts/openshell-sandbox
-            artifacts/openshell-supervisor
             artifacts/openshell-connect-closure-receipt.json
 
       - name: Upload source-bound closure payload
