@@ -19,6 +19,10 @@ rg -q 'package: openshell-sandbox' "$workflow"
 rg -q 'artifact-name: connect-openshell-supervisor-linux-arm64' "$workflow"
 rg -q 'package: openshell-gateway' "$workflow"
 rg -q 'package: openshell-supervisor' "$workflow"
+rg -q 'artifact-name: connect-host-openshell-gateway-darwin-arm64' "$workflow"
+rg -q 'artifact-name: connect-host-openshell-supervisor-darwin-arm64' "$workflow"
+rg -Fq '("openshell-gateway", "darwin-arm64")' "$workflow"
+rg -Fq '("openshell-supervisor", "darwin-arm64")' "$workflow"
 
 if rg -q 'rust-native-build\.yml|docker-build\.yml' "$workflow"; then
   echo 'Connect closure must use the maintained build actions, not removed workflows.' >&2
