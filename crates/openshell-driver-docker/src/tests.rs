@@ -1565,6 +1565,7 @@ fn build_container_create_body_includes_driver_config_mounts() {
                 "source": "work-nfs",
                 "target": "/sandbox/work",
                 "read_only": true,
+                "no_copy": true,
                 "subpath": "project-a"
             },
             {
@@ -1589,6 +1590,13 @@ fn build_container_create_body_includes_driver_config_mounts() {
     assert_eq!(mounts[0].source.as_deref(), Some("work-nfs"));
     assert_eq!(mounts[0].target.as_deref(), Some("/sandbox/work"));
     assert_eq!(mounts[0].read_only, Some(true));
+    assert_eq!(
+        mounts[0]
+            .volume_options
+            .as_ref()
+            .and_then(|options| options.no_copy),
+        Some(true)
+    );
     assert_eq!(
         mounts[0]
             .volume_options
@@ -1636,6 +1644,7 @@ fn driver_config_defaults_volume_mounts_to_read_only() {
         .expect("driver config mounts should be set");
 
     assert_eq!(mounts[0].read_only, Some(true));
+    assert_eq!(mounts[0].volume_options, None);
 }
 
 #[test]
