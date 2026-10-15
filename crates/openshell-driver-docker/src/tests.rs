@@ -139,6 +139,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
         enable_bind_mounts: false,
         upstream_proxy: UpstreamProxyConfig::default(),
+        additional_ca_bundle: None,
         provider_spiffe_workload_api_socket: None,
         app_armor_profile: Some(AppArmorProfile::Unconfined),
     }
@@ -1023,6 +1024,29 @@ fn docker_pids_limit_uses_driver_default_and_allows_runtime_inherit() {
 fn docker_compute_config_disables_bind_mounts_by_default() {
     let cfg = DockerComputeConfig::default();
     assert!(!cfg.enable_bind_mounts);
+}
+
+#[test]
+fn docker_additional_ca_bundle_uses_fixed_supervisor_argument() {
+    let args = docker_upstream_proxy_cli_args(&UpstreamProxyConfig::default(), true);
+    let option = args
+        .iter()
+        .position(|arg| arg == "--additional-ca-bundle")
+        .expect("additional CA option");
+    assert_eq!(
+        args.get(option + 1).map(String::as_str),
+        Some(SUPERVISOR_ADDITIONAL_CA_BUNDLE_MOUNT_PATH)
+    );
+}
+
+#[test]
+fn docker_config_accepts_operator_owned_additional_ca_bundle() {
+    let config: DockerComputeConfig =
+        toml::from_str("additional_ca_bundle = '/tmp/platform-ca.pem'").unwrap();
+    assert_eq!(
+        config.additional_ca_bundle.as_deref(),
+        Some(Path::new("/tmp/platform-ca.pem"))
+    );
 }
 
 #[test]

@@ -44,6 +44,12 @@ through the Docker archive API. No workload launch depends on a host bind
 mount or a tool supplied by the workload image, so the same path works with
 local, remote, and VM-backed Docker daemons.
 
+`additional_ca_bundle` adds gateway-host PEM roots for direct private upstream
+TLS. The driver validates the operator-owned file at startup, stages it in the
+private supervisor volume, and the supervisor folds it into generated workload
+and upstream trust. Sandbox config and image contents cannot select or replace
+this trust input.
+
 ## Identity and Workspace
 
 Before creating the workload, the driver pins the image ID and reads its

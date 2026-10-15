@@ -107,6 +107,8 @@ const BOUNDARY_CERTIFICATE_MOUNT_PATH: &str = "/.openshell/channel/sandbox/serve
 const BOUNDARY_PRIVATE_KEY_MOUNT_PATH: &str = "/.openshell/channel/sandbox/server.key";
 const SUPERVISOR_STATE_MOUNT_PATH: &str = "/.openshell/supervisor";
 const SUPERVISOR_PROXY_AUTH_MOUNT_PATH: &str = "/.openshell/supervisor/upstream-proxy-auth";
+const SUPERVISOR_ADDITIONAL_CA_BUNDLE_MOUNT_PATH: &str =
+    "/.openshell/supervisor/additional-ca-bundle.pem";
 const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
     openshell_core::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
 const DRIVER_ADMITTED_BACKEND: &str = openshell_sandbox_backend::BACKEND_NAME;
@@ -214,6 +216,10 @@ pub struct DockerComputeConfig {
     #[serde(flatten)]
     pub upstream_proxy: UpstreamProxyConfig,
 
+    /// Gateway-host PEM roots trusted for direct private upstream endpoints.
+    /// This operator-owned input cannot be supplied by a sandbox.
+    pub additional_ca_bundle: Option<PathBuf>,
+
     /// Host UNIX socket projected into the supervisor for provider identity.
     pub provider_spiffe_workload_api_socket: Option<PathBuf>,
 
@@ -237,6 +243,7 @@ impl DockerComputeConfig {
         validate_image_pull_policy(self.image_pull_policy)?;
         self.upstream_proxy.validate().map_err(Error::config)?;
         validate_docker_proxy_auth_file(&self.upstream_proxy)?;
+        validate_docker_ca_bundle(self.additional_ca_bundle.as_deref(), "additional_ca_bundle")?;
         if let Some(socket) = self.provider_spiffe_workload_api_socket.as_deref() {
             openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
                 .map_err(Error::config)?;
@@ -268,6 +275,7 @@ impl Default for DockerComputeConfig {
             sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
             enable_bind_mounts: false,
             upstream_proxy: UpstreamProxyConfig::default(),
+            additional_ca_bundle: None,
             provider_spiffe_workload_api_socket: None,
             app_armor_profile: None,
         }
@@ -297,6 +305,7 @@ struct DockerDriverRuntimeConfig {
     sandbox_pids_limit: Option<std::num::NonZeroI64>,
     enable_bind_mounts: bool,
     upstream_proxy: UpstreamProxyConfig,
+    additional_ca_bundle: Option<PathBuf>,
     provider_spiffe_workload_api_socket: Option<PathBuf>,
     app_armor_profile: Option<AppArmorProfile>,
 }
@@ -931,6 +940,7 @@ impl DockerComputeDriver {
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
                 enable_bind_mounts: docker_config.enable_bind_mounts,
                 upstream_proxy: docker_config.upstream_proxy.clone(),
+                additional_ca_bundle: docker_config.additional_ca_bundle.clone(),
                 provider_spiffe_workload_api_socket: docker_config
                     .provider_spiffe_workload_api_socket
                     .clone(),
@@ -4513,6 +4523,24 @@ async fn docker_supervisor_bundle_archive(
             &contents,
         )?;
     }
+    if let Some(path) = config.additional_ca_bundle.as_deref() {
+        let path = path.to_str().ok_or_else(|| {
+            Status::failed_precondition("additional_ca_bundle must be valid UTF-8")
+        })?;
+        let contents = openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(
+            path,
+            "additional_ca_bundle",
+        )
+        .map_err(Status::failed_precondition)?;
+        append_docker_archive_file(
+            &mut archive,
+            "additional-ca-bundle.pem",
+            0o644,
+            SUPERVISOR_UID,
+            SUPERVISOR_GID,
+            contents.as_bytes(),
+        )?;
+    }
     archive
         .into_inner()
         .map_err(|error| Status::internal(format!("finish Docker supervisor archive: {error}")))
@@ -4920,7 +4948,10 @@ async fn spawn_docker_control_process(
         workspace_root,
         format!("--health-socket-path={SUPERVISOR_HEALTH_SOCKET_PATH}"),
     ];
-    command.extend(docker_upstream_proxy_cli_args(&config.upstream_proxy));
+    command.extend(docker_upstream_proxy_cli_args(
+        &config.upstream_proxy,
+        config.additional_ca_bundle.is_some(),
+    ));
     let mut supervisor_mounts = vec![
         Mount {
             target: Some(BOUNDARY_MOUNT_PATH.to_string()),
@@ -5654,7 +5685,10 @@ fn validate_docker_proxy_auth_file(config: &UpstreamProxyConfig) -> CoreResult<(
     Ok(())
 }
 
-fn docker_upstream_proxy_cli_args(config: &UpstreamProxyConfig) -> Vec<String> {
+fn docker_upstream_proxy_cli_args(
+    config: &UpstreamProxyConfig,
+    additional_ca_bundle_configured: bool,
+) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(url) = config.https_proxy.as_ref() {
         args.extend(["--upstream-proxy".to_string(), url.clone()]);
@@ -5674,7 +5708,26 @@ fn docker_upstream_proxy_cli_args(config: &UpstreamProxyConfig) -> Vec<String> {
     if config.proxy_connect_by_hostname == Some(true) {
         args.push("--upstream-proxy-connect-by-hostname".to_string());
     }
+    if additional_ca_bundle_configured {
+        args.extend([
+            "--additional-ca-bundle".to_string(),
+            SUPERVISOR_ADDITIONAL_CA_BUNDLE_MOUNT_PATH.to_string(),
+        ]);
+    }
     args
+}
+
+fn validate_docker_ca_bundle(path: Option<&Path>, label: &str) -> CoreResult<()> {
+    let Some(path) = path else { return Ok(()) };
+    if path.as_os_str().is_empty() {
+        return Err(Error::config(format!("{label} must not be empty when set")));
+    }
+    let path = path
+        .to_str()
+        .ok_or_else(|| Error::config(format!("{label} must be valid UTF-8")))?;
+    openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(path, label)
+        .map_err(Error::config)?;
+    Ok(())
 }
 
 fn validate_sandbox_pids_limit(value: Option<std::num::NonZeroI64>) -> CoreResult<()> {
