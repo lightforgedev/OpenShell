@@ -2611,6 +2611,7 @@ pub async fn sandbox_get(
     server: &str,
     name: &str,
     policy_only: bool,
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
@@ -2625,6 +2626,10 @@ pub async fn sandbox_get(
         .into_inner()
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
+
+    if !policy_only && crate::output::print_output_single(output, &sandbox, sandbox_to_json)? {
+        return Ok(());
+    }
 
     let sandbox_id = if sandbox.object_id().is_empty() {
         return Err(miette::miette!("sandbox missing metadata"));
