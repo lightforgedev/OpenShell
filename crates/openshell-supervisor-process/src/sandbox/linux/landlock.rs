@@ -4,11 +4,13 @@
 //! Landlock filesystem sandboxing.
 
 use landlock::{
-    ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, PathFdError, Ruleset,
-    RulesetAttr, RulesetCreatedAttr,
+    ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd, PathFdError,
+    Ruleset, RulesetAttr, RulesetCreatedAttr,
 };
 use miette::{IntoDiagnostic, Result};
+use nix::sys::stat::{SFlag, fstat};
 use openshell_core::policy::{LandlockCompatibility, SandboxPolicy};
+use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
@@ -190,8 +192,9 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
         for path in &read_only {
             if let Some(path_fd) = try_open_path(path, compatibility)? {
                 debug!(path = %path.display(), "Landlock allow read-only");
+                let access = access_for_path(&path_fd, access_read, abi)?;
                 ruleset = ruleset
-                    .add_rule(PathBeneath::new(path_fd, access_read))
+                    .add_rule(PathBeneath::new(path_fd, access))
                     .into_diagnostic()?;
                 rules_applied += 1;
             }
@@ -200,8 +203,9 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
         for path in &read_write {
             if let Some(path_fd) = try_open_path(path, compatibility)? {
                 debug!(path = %path.display(), "Landlock allow read-write");
+                let access = access_for_path(&path_fd, access_all, abi)?;
                 ruleset = ruleset
-                    .add_rule(PathBeneath::new(path_fd, access_all))
+                    .add_rule(PathBeneath::new(path_fd, access))
                     .into_diagnostic()?;
                 rules_applied += 1;
             }
@@ -261,6 +265,19 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
                 Err(err)
             }
         }
+    }
+}
+
+fn access_for_path(
+    path_fd: &PathFd,
+    access: BitFlags<AccessFs>,
+    abi: ABI,
+) -> Result<BitFlags<AccessFs>> {
+    let metadata = fstat(path_fd.as_fd().as_raw_fd()).into_diagnostic()?;
+    if SFlag::from_bits_truncate(metadata.st_mode).contains(SFlag::S_IFDIR) {
+        Ok(access)
+    } else {
+        Ok(access & AccessFs::from_file(abi))
     }
 }
 
@@ -450,6 +467,27 @@ mod tests {
         let result = try_open_path(dir.path(), &LandlockCompatibility::BestEffort);
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn access_for_path_preserves_directory_rights() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_fd = PathFd::new(dir.path()).unwrap();
+        let access = AccessFs::from_all(ABI::V2);
+
+        assert_eq!(access_for_path(&path_fd, access, ABI::V2).unwrap(), access);
+    }
+
+    #[test]
+    fn access_for_path_removes_directory_only_file_rights() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path_fd = PathFd::new(file.path()).unwrap();
+        let access = AccessFs::from_all(ABI::V2);
+
+        assert_eq!(
+            access_for_path(&path_fd, access, ABI::V2).unwrap(),
+            access & AccessFs::from_file(ABI::V2)
+        );
     }
 
     #[test]
