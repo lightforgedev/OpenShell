@@ -86,3 +86,9 @@ pub const SANDBOX_UID: &str = "OPENSHELL_SANDBOX_UID";
 /// Used alongside UID for PVC init container `chown` operations and when the
 /// supervisor drops privileges to a group other than the UID's primary group.
 pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";
+
+/// Landlock ABI observed while preparing a hard-requirement filesystem policy.
+pub const LANDLOCK_ABI: &str = "OPENSHELL_LANDLOCK_ABI";
+
+/// Number of path rules prepared for a hard-requirement Landlock policy.
+pub const LANDLOCK_RULES_APPLIED: &str = "OPENSHELL_LANDLOCK_RULES_APPLIED";

@@ -560,6 +560,9 @@ impl ProcessHandle {
         #[cfg(target_os = "linux")]
         let prepared_sandbox = sandbox::linux::prepare(policy, workdir)
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
+        if let Some(environment) = sandbox::linux::landlock_evidence_env(&prepared_sandbox) {
+            cmd.envs(environment);
+        }
         #[cfg(target_os = "linux")]
         let supervisor_identity_mount = supervisor_identity_mount_from_env().map_err(|err| {
             miette::miette!("Failed to prepare supervisor identity isolation: {err}")

@@ -95,6 +95,30 @@ pub fn probe_availability() -> LandlockAvailability {
 pub struct PreparedRuleset {
     ruleset: landlock::RulesetCreated,
     compatibility: LandlockCompatibility,
+    evidence: Option<LandlockEvidence>,
+}
+
+#[derive(Clone, Copy)]
+struct LandlockEvidence {
+    abi: i32,
+    rules_applied: usize,
+}
+
+impl PreparedRuleset {
+    pub fn evidence_env(&self) -> Option<[(String, String); 2]> {
+        let evidence = self.evidence?;
+
+        Some([
+            (
+                openshell_core::sandbox_env::LANDLOCK_ABI.to_string(),
+                evidence.abi.to_string(),
+            ),
+            (
+                openshell_core::sandbox_env::LANDLOCK_RULES_APPLIED.to_string(),
+                evidence.rules_applied.to_string(),
+            ),
+        ])
+    }
 }
 
 /// Phase 1: Open `PathFds` and build the Landlock ruleset **as root**.
@@ -125,9 +149,9 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
 
     // Probe first: kernels without Landlock (e.g. gVisor's sentry returns
     // ENOSYS) would otherwise log misleading "Applying"+"Built" events.
-    let availability = probe_availability();
-    if !matches!(availability, LandlockAvailability::Available { .. }) {
-        match compatibility {
+    let landlock_abi = match probe_availability() {
+        LandlockAvailability::Available { abi } => abi,
+        availability => match compatibility {
             LandlockCompatibility::BestEffort => {
                 openshell_ocsf::ocsf_emit!(
                     openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
@@ -157,8 +181,8 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
                     "Landlock unavailable in hard_requirement mode: {availability}"
                 ));
             }
-        }
-    }
+        },
+    };
 
     let total_paths = read_only.len() + read_write.len();
     let abi = ABI::V2;
@@ -234,6 +258,12 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
         Ok(PreparedRuleset {
             ruleset,
             compatibility: compatibility.clone(),
+            evidence: matches!(compatibility, LandlockCompatibility::HardRequirement).then_some(
+                LandlockEvidence {
+                    abi: landlock_abi,
+                    rules_applied,
+                },
+            ),
         })
     })();
 

@@ -30,6 +30,11 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Prepared
     })
 }
 
+/// Export evidence only when policy preparation required real Landlock enforcement.
+pub fn landlock_evidence_env(prepared: &PreparedSandbox) -> Option<[(String, String); 2]> {
+    prepared.landlock.as_ref()?.evidence_env()
+}
+
 /// Phase 2: Enforce prepared sandbox restrictions (after `drop_privileges`).
 ///
 /// Calls `restrict_self()` for Landlock and applies seccomp filters.
