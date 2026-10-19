@@ -27,6 +27,7 @@ pub struct PkiBundle {
 /// Default SANs always included on the server certificate.
 ///
 /// Covers the host aliases used by every supported runtime: Kubernetes service DNS,
+/// `host.openshell.internal` for the driver-owned stable alias,
 /// `host.docker.internal` for Docker Desktop and rootless Docker on Linux,
 /// and `host.containers.internal` for Podman containers reaching their host.
 pub const DEFAULT_SERVER_SANS: &[&str] = &[
@@ -36,6 +37,7 @@ pub const DEFAULT_SERVER_SANS: &[&str] = &[
     "localhost",
     "openshell.localhost",
     "*.openshell.localhost",
+    "host.openshell.internal",
     "host.docker.internal",
     "host.containers.internal",
     "127.0.0.1",
@@ -188,6 +190,7 @@ mod tests {
 
     #[test]
     fn default_server_sans_include_local_container_hostnames() {
+        assert!(DEFAULT_SERVER_SANS.contains(&"host.openshell.internal"));
         assert!(DEFAULT_SERVER_SANS.contains(&"host.docker.internal"));
         assert!(DEFAULT_SERVER_SANS.contains(&"host.containers.internal"));
     }
