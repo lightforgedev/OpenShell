@@ -21,7 +21,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, LazyLock, Mutex};
 use tempfile::TempDir;
 
-const TLS_MOUNT_DIR: &str = "/etc/openshell/tls/client";
 static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[test]
@@ -710,20 +709,48 @@ fn build_environment_keeps_telemetry_toggle_driver_controlled() {
 }
 
 #[test]
-fn build_binds_uses_docker_tls_directory() {
-    let binds = build_binds(&test_sandbox(), &runtime_config()).unwrap();
-    let targets = binds
-        .iter()
-        .filter_map(|bind| bind.split(':').nth(1).map(String::from))
+fn control_archive_uses_fixed_paths_and_private_modes() {
+    let tempdir = TempDir::new().unwrap();
+    let mut config = runtime_config();
+    config.supervisor_bin = tempdir.path().join("openshell-sandbox");
+    let tls = DockerGuestTlsPaths {
+        ca: tempdir.path().join("ca.crt"),
+        cert: tempdir.path().join("tls.crt"),
+        key: tempdir.path().join("tls.key"),
+    };
+    fs::write(&config.supervisor_bin, b"supervisor").unwrap();
+    fs::write(&tls.ca, b"ca").unwrap();
+    fs::write(&tls.cert, b"cert").unwrap();
+    fs::write(&tls.key, b"key").unwrap();
+    config.guest_tls = Some(tls);
+
+    let bytes = build_control_archive(&test_sandbox(), &config).unwrap();
+    let mut entries = tar::Archive::new(bytes.as_slice())
+        .entries()
+        .unwrap()
+        .map(|entry| {
+            let mut entry = entry.unwrap();
+            let path = format!("/{}", entry.path().unwrap().display());
+            let mode = entry.header().mode().unwrap();
+            let mut content = Vec::new();
+            entry.read_to_end(&mut content).unwrap();
+            (path, mode, content)
+        })
         .collect::<Vec<_>>();
-    assert!(targets.contains(&SUPERVISOR_MOUNT_PATH.to_string()));
-    assert!(targets.contains(&TLS_CA_MOUNT_PATH.to_string()));
-    assert!(targets.contains(&TLS_CERT_MOUNT_PATH.to_string()));
-    assert!(targets.contains(&TLS_KEY_MOUNT_PATH.to_string()));
-    assert!(
-        targets
-            .iter()
-            .all(|target| target.starts_with(TLS_MOUNT_DIR) || target == SUPERVISOR_MOUNT_PATH)
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    assert_eq!(
+        entries,
+        vec![
+            (TLS_CA_MOUNT_PATH.to_string(), 0o444, b"ca".to_vec()),
+            (TLS_CERT_MOUNT_PATH.to_string(), 0o444, b"cert".to_vec()),
+            (TLS_KEY_MOUNT_PATH.to_string(), 0o400, b"key".to_vec()),
+            (
+                SUPERVISOR_MOUNT_PATH.to_string(),
+                0o555,
+                b"supervisor".to_vec(),
+            ),
+        ]
     );
 }
 
@@ -1273,6 +1300,7 @@ fn build_container_create_body_clears_inherited_cmd() {
         Some(&"default".to_string())
     );
     let host_config = create_body.host_config.as_ref().unwrap();
+    assert_eq!(host_config.binds, Some(Vec::new()));
     assert!(
         host_config.device_requests.as_ref().is_none(),
         "non-GPU containers should not request Docker devices"

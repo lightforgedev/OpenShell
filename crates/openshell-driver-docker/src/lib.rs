@@ -5,7 +5,6 @@
 
 #![allow(clippy::result_large_err)]
 
-use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, CreateImageInfo,
@@ -16,7 +15,9 @@ use bollard::models::{
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
     ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, StopContainerOptionsBuilder,
+    UploadToContainerOptionsBuilder,
 };
+use bollard::{Docker, body_full};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use openshell_core::config::{
@@ -50,7 +51,7 @@ use openshell_core::proto_struct::{
 };
 use openshell_core::{Config, Error, Result as CoreResult};
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -745,7 +746,7 @@ impl DockerComputeDriver {
             .map_err(|status| {
                 DockerProvisioningFailure::new("ImagePullFailed", status.message())
             })?;
-        let token_file_created = write_sandbox_token_file(sandbox, &self.config)
+        let mut token_file_created = write_sandbox_token_file(sandbox, &self.config)
             .await
             .map_err(|status| {
                 DockerProvisioningFailure::new("SandboxTokenWriteFailed", status.message())
@@ -777,6 +778,12 @@ impl DockerComputeDriver {
             }
             DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
         })?;
+        let control_archive = build_control_archive(sandbox, &self.config).map_err(|status| {
+            if token_file_created {
+                cleanup_sandbox_token_file(sandbox, &self.config);
+            }
+            DockerProvisioningFailure::new("ControlFilesPrepareFailed", status.message())
+        })?;
         self.docker
             .create_container(
                 Some(
@@ -802,6 +809,39 @@ impl DockerComputeDriver {
             format!("Created Docker container \"{container_name}\""),
             HashMap::from([("container_name".to_string(), container_name.clone())]),
         );
+
+        // Materialize driver-owned control files through the Docker API. Host
+        // binds couple sandbox startup to the daemon's ability to traverse the
+        // Gateway user's private state directory, which is not true for remote
+        // daemons or Docker Desktop running under another host identity.
+        if let Err(err) = self
+            .docker
+            .upload_to_container(
+                &container_name,
+                Some(UploadToContainerOptionsBuilder::default().path("/").build()),
+                body_full(control_archive.into()),
+            )
+            .await
+        {
+            let _ = self
+                .docker
+                .remove_container(
+                    &container_name,
+                    Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+                )
+                .await;
+            if token_file_created {
+                cleanup_sandbox_token_file(sandbox, &self.config);
+            }
+            return Err(DockerProvisioningFailure::from_status(
+                "ControlFilesUploadFailed",
+                create_status_from_docker_error("upload docker sandbox control files", err),
+            ));
+        }
+        if token_file_created {
+            cleanup_sandbox_token_file(sandbox, &self.config);
+            token_file_created = false;
+        }
 
         if let Err(err) = self.docker.start_container(&container_name, None).await {
             let cleanup = self
@@ -2037,36 +2077,67 @@ fn docker_volume_is_bind_backed(volume: &bollard::models::Volume) -> bool {
         })
 }
 
-fn build_binds(
+fn append_control_file(
+    archive: &mut tar::Builder<Vec<u8>>,
+    source: &Path,
+    destination: &str,
+    mode: u32,
+) -> Result<(), Status> {
+    let bytes = std::fs::read(source).map_err(|err| {
+        Status::internal(format!(
+            "read sandbox control file '{}' failed: {err}",
+            source.display()
+        ))
+    })?;
+    let mut header = tar::Header::new_gnu();
+    header
+        .set_path(destination.trim_start_matches('/'))
+        .map_err(|err| {
+            Status::internal(format!("prepare sandbox control file path failed: {err}"))
+        })?;
+    header.set_size(bytes.len() as u64);
+    header.set_mode(mode);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_cksum();
+    archive
+        .append(&header, Cursor::new(bytes))
+        .map_err(|err| Status::internal(format!("archive sandbox control file failed: {err}")))
+}
+
+fn build_control_archive(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
-) -> Result<Vec<String>, Status> {
-    let mut binds = vec![format!(
-        "{}:{}:ro,z",
-        config.supervisor_bin.display(),
-        SUPERVISOR_MOUNT_PATH
-    )];
+) -> Result<Vec<u8>, Status> {
+    // Destinations are driver-owned reserved paths; workload mounts cannot
+    // shadow them. The container is stopped while Docker extracts this archive.
+    let mut archive = tar::Builder::new(Vec::new());
+    append_control_file(
+        &mut archive,
+        &config.supervisor_bin,
+        SUPERVISOR_MOUNT_PATH,
+        0o555,
+    )?;
     if let Some(tls) = &config.guest_tls {
-        binds.push(format!("{}:{}:ro,z", tls.ca.display(), TLS_CA_MOUNT_PATH));
-        binds.push(format!(
-            "{}:{}:ro,z",
-            tls.cert.display(),
-            TLS_CERT_MOUNT_PATH
-        ));
-        binds.push(format!("{}:{}:ro,z", tls.key.display(), TLS_KEY_MOUNT_PATH));
+        append_control_file(&mut archive, &tls.ca, TLS_CA_MOUNT_PATH, 0o444)?;
+        append_control_file(&mut archive, &tls.cert, TLS_CERT_MOUNT_PATH, 0o444)?;
+        append_control_file(&mut archive, &tls.key, TLS_KEY_MOUNT_PATH, 0o400)?;
     }
     if sandbox
         .spec
         .as_ref()
         .is_some_and(|spec| !spec.sandbox_token.is_empty())
     {
-        binds.push(format!(
-            "{}:{}:ro,z",
-            sandbox_token_host_path(sandbox, config)?.display(),
-            SANDBOX_TOKEN_MOUNT_PATH
-        ));
+        append_control_file(
+            &mut archive,
+            &sandbox_token_host_path(sandbox, config)?,
+            SANDBOX_TOKEN_MOUNT_PATH,
+            0o400,
+        )?;
     }
-    Ok(binds)
+    archive
+        .into_inner()
+        .map_err(|err| Status::internal(format!("finish sandbox control archive failed: {err}")))
 }
 
 fn sandbox_token_host_path(
@@ -2368,11 +2439,7 @@ fn build_container_create_body_with_gpu_devices(
             memory: resource_limits.memory_bytes,
             pids_limit: docker_pids_limit(config.sandbox_pids_limit)?,
             device_requests,
-            binds: {
-                let mut binds = build_binds(sandbox, config)?;
-                binds.extend(user_bind_strings);
-                Some(binds)
-            },
+            binds: Some(user_bind_strings),
             mounts: Some(user_mounts),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
@@ -3305,7 +3372,7 @@ async fn download_binary_from_container(
 /// Docker's `/containers/<id>/archive` endpoint returns a single-file tar
 /// when `path` points to a file, so we only need the first entry.
 fn extract_first_tar_entry(tar_bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+    let mut archive = tar::Archive::new(Cursor::new(tar_bytes));
     let mut entries = archive
         .entries()
         .map_err(|err| format!("open tar archive: {err}"))?;
