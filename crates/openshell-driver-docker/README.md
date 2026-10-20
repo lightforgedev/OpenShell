@@ -100,8 +100,9 @@ mount types are:
 - `bind`: an absolute daemon-host path, allowed only when
   `[openshell.drivers.docker].enable_bind_mounts = true`.
 - `volume`: an existing named volume. The driver never creates or removes a
-  user-supplied volume. Bind-backed local volumes require
-  `enable_bind_mounts = true`.
+  user-supplied volume. Set `no_copy: true` to prevent Docker from copying
+  image-owned target contents into a new volume. Bind-backed local volumes
+  require `enable_bind_mounts = true`.
 - `tmpfs`: an in-memory filesystem with optional size and mode.
 
 Host bind mounts are disabled by default because they expose daemon-host paths

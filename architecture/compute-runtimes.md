@@ -313,6 +313,8 @@ active local driver table of `gateway.toml`. Host bind mounts are an unsafe
 operator override because they place gateway-host filesystem state inside the
 sandbox and can negate OpenShell workspace isolation and filesystem-policy
 controls. Driver-owned supervisor, token, and TLS bind mounts stay reserved.
+Docker volume mounts can request `no_copy` so a durable sandbox volume starts
+without Docker copying image-owned target contents into it.
 
 Network features follow the driver/substrate split. Drivers own only the outer
 fence and protected channel. The sandbox owns seccomp notification, local DNS,

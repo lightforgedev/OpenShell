@@ -735,6 +735,8 @@ enum DockerDriverMountConfig {
         #[serde(default = "default_true")]
         read_only: bool,
         #[serde(default)]
+        no_copy: bool,
+        #[serde(default)]
         subpath: Option<String>,
     },
     Tmpfs {
@@ -3603,14 +3605,16 @@ fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Option<M
             source,
             target,
             read_only,
+            no_copy,
             subpath,
         } => Ok(Some(Mount {
             typ: Some(MountTypeEnum::VOLUME),
             source: Some(source.clone()),
             target: Some(target.clone()),
             read_only: Some(*read_only),
-            volume_options: subpath.as_ref().map(|subpath| MountVolumeOptions {
-                subpath: Some(subpath.clone()),
+            volume_options: Some(MountVolumeOptions {
+                no_copy: Some(*no_copy),
+                subpath: subpath.clone(),
                 ..Default::default()
             }),
             ..Default::default()
