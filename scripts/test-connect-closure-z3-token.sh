@@ -20,9 +20,12 @@ rg -q 'artifact-name: connect-openshell-supervisor-linux-arm64' "$workflow"
 rg -q 'package: openshell-gateway' "$workflow"
 rg -q 'package: openshell-supervisor' "$workflow"
 rg -q 'artifact-name: connect-host-openshell-gateway-darwin-arm64' "$workflow"
-rg -q 'artifact-name: connect-host-openshell-supervisor-darwin-arm64' "$workflow"
 rg -Fq '("openshell-gateway", "darwin-arm64")' "$workflow"
-rg -Fq '("openshell-supervisor", "darwin-arm64")' "$workflow"
+
+if rg -q 'connect-host-openshell-supervisor-darwin-arm64|\("openshell-supervisor", "darwin-arm64"\)' "$workflow"; then
+  echo 'Connect closure must not publish the Linux sandbox supervisor as a Darwin host artifact.' >&2
+  exit 1
+fi
 
 if rg -q 'rust-native-build\.yml|docker-build\.yml' "$workflow"; then
   echo 'Connect closure must use the maintained build actions, not removed workflows.' >&2
