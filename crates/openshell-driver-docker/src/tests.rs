@@ -47,6 +47,88 @@ fn test_launch_authentication() -> Vec<u8> {
     .unwrap()
 }
 
+#[test]
+#[ignore = "requires a local Docker daemon"]
+fn docker_volume_no_copy_prevents_seed_and_survives_recreate() {
+    use std::process::Command;
+
+    fn docker(args: &[&str]) -> std::process::Output {
+        let mut command = if std::env::var_os("OPENSHELL_DOCKER_SUDO").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            let mut command = Command::new("sudo");
+            command.args(["-n", "docker"]);
+            command
+        } else {
+            Command::new("docker")
+        };
+        command.args(args).output().expect("run docker")
+    }
+
+    let suffix = format!("{}", std::process::id());
+    let no_copy = format!("openshell-nocopy-{suffix}");
+    let copy_up = format!("openshell-copyup-{suffix}");
+    let image = "alpine:3.20";
+    assert!(
+        docker(&["pull", image]).status.success(),
+        "pull fixture image"
+    );
+    for volume in [&no_copy, &copy_up] {
+        assert!(docker(&["volume", "create", volume]).status.success());
+    }
+
+    let no_copy_mount = format!("type=volume,src={no_copy},dst=/etc,volume-nocopy");
+    let first = docker(&[
+        "run",
+        "--rm",
+        "--mount",
+        &no_copy_mount,
+        image,
+        "sh",
+        "-c",
+        "test ! -e /etc/alpine-release && printf kept >/etc/customer",
+    ]);
+    assert!(
+        first.status.success(),
+        "no-copy volume must start empty: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let recreated = docker(&[
+        "run",
+        "--rm",
+        "--mount",
+        &no_copy_mount,
+        image,
+        "sh",
+        "-c",
+        "test \"$(cat /etc/customer)\" = kept && test ! -e /etc/alpine-release",
+    ]);
+    assert!(
+        recreated.status.success(),
+        "workload write must survive recreate"
+    );
+
+    let copy_mount = format!("type=volume,src={copy_up},dst=/etc");
+    let copied = docker(&[
+        "run",
+        "--rm",
+        "--mount",
+        &copy_mount,
+        image,
+        "sh",
+        "-c",
+        "test -f /etc/alpine-release",
+    ]);
+    assert!(
+        copied.status.success(),
+        "ordinary volume mount must demonstrate image copy-up"
+    );
+
+    for volume in [&no_copy, &copy_up] {
+        assert!(docker(&["volume", "rm", volume]).status.success());
+    }
+}
+
 fn test_sandbox() -> DriverSandbox {
     // Mirrors the gateway-supplied request: the public `Sandbox` API no
     // longer carries `namespace`, so the gateway elides the field and the
@@ -1565,6 +1647,7 @@ fn build_container_create_body_includes_driver_config_mounts() {
                 "source": "work-nfs",
                 "target": "/sandbox/work",
                 "read_only": true,
+                "no_copy": true,
                 "subpath": "project-a"
             },
             {
@@ -1589,6 +1672,13 @@ fn build_container_create_body_includes_driver_config_mounts() {
     assert_eq!(mounts[0].source.as_deref(), Some("work-nfs"));
     assert_eq!(mounts[0].target.as_deref(), Some("/sandbox/work"));
     assert_eq!(mounts[0].read_only, Some(true));
+    assert_eq!(
+        mounts[0]
+            .volume_options
+            .as_ref()
+            .and_then(|options| options.no_copy),
+        Some(true)
+    );
     assert_eq!(
         mounts[0]
             .volume_options
@@ -1636,6 +1726,7 @@ fn driver_config_defaults_volume_mounts_to_read_only() {
         .expect("driver config mounts should be set");
 
     assert_eq!(mounts[0].read_only, Some(true));
+    assert_eq!(mounts[0].volume_options, None);
 }
 
 #[test]

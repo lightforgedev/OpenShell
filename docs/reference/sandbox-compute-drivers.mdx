@@ -210,7 +210,7 @@ Use a `volume` mount for existing Docker named volumes:
 docker volume create openshell-work
 
 openshell sandbox create \
-  --driver-config-json '{"docker":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work","read_only":false}]}}' \
+  --driver-config-json '{"docker":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work","read_only":false,"no_copy":true}]}}' \
   -- claude
 ```
 
@@ -239,7 +239,7 @@ Docker mount schema:
 | Type | Fields |
 |---|---|
 | `bind` | `source`, `target`, optional `read_only` (`true` by default), optional `selinux_label` (`shared` for `:z` or `private` for `:Z`). `source` must be an absolute host path. Requires `enable_bind_mounts = true`. |
-| `volume` | `source`, `target`, optional `read_only` (`true` by default), optional `subpath`. The named volume must already exist. Docker local-driver bind-backed volumes require `enable_bind_mounts = true`. |
+| `volume` | `source`, `target`, optional `read_only` (`true` by default), optional `no_copy` (`false` by default), optional `subpath`. The named volume must already exist. Set `no_copy` to prevent Docker from populating an empty volume from the image target. Docker local-driver bind-backed volumes require `enable_bind_mounts = true`. |
 | `tmpfs` | `target`, optional `options`, optional `size_bytes`, optional `mode`. |
 
 OpenShell rejects mount `source`, `target`, and Docker volume `subpath` values
