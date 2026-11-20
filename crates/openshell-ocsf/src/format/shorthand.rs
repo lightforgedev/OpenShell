@@ -5,6 +5,7 @@
 //!
 //! Pattern: `<HH:MM:SS.mmm> <severity> <CLASS:ACTIVITY> <action> <key fields> [context]`
 
+use crate::enums::StatusId;
 use crate::events::OcsfEvent;
 use crate::events::base_event::BaseEventData;
 use crate::objects::Url;
@@ -247,7 +248,12 @@ impl OcsfEvent {
                 // policy-DNS mapping in the human-readable audit log.
                 let show_correlation_message =
                     e.base.status_detail.as_deref() == Some("transparent_tcp_allowed");
+                // A failed dial's message carries the bounded OS/network cause.
+                // Without it, a structured destination turns the event into
+                // only `NET:FAIL <endpoint>`, which is not actionable.
+                let show_failure_message = e.base.status == Some(StatusId::Failure);
                 let message_ctx = if show_correlation_message
+                    || show_failure_message
                     || (detail.is_empty() && rule_ctx.is_empty() && reason_ctx.is_empty())
                 {
                     message_tag(&e.base)
@@ -848,6 +854,33 @@ mod tests {
     }
 
     #[test]
+    fn test_network_activity_shorthand_failure_keeps_bounded_cause_with_destination() {
+        let event = OcsfEvent::NetworkActivity(NetworkActivityEvent {
+            base: {
+                let mut b = base(4001, "Network Activity", 4, "Network Activity", 6, "Fail");
+                b.status = Some(StatusId::Failure);
+                b.set_message("Proxy connection error: Connection refused (os error 111)");
+                b
+            },
+            src_endpoint: None,
+            dst_endpoint: Some(Endpoint::from_domain("host.docker.internal", 28_917)),
+            proxy_endpoint: None,
+            actor: None,
+            firewall_rule: None,
+            connection_info: None,
+            action: None,
+            disposition: None,
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        assert_eq!(
+            event.format_shorthand(),
+            "NET:FAIL [INFO] host.docker.internal:28917 [msg:Proxy connection error: Connection refused (os error 111)]"
+        );
+    }
+
+    #[test]
     fn test_http_activity_shorthand_denied_shows_reason() {
         let mut b = base(4002, "HTTP Activity", 4, "Network Activity", 99, "Other");
         b.severity = crate::enums::SeverityId::Medium;
@@ -1162,7 +1195,7 @@ mod tests {
             3,
             "Start",
         );
-        b.set_status(crate::enums::StatusId::Success);
+        b.set_status(StatusId::Success);
         let event = OcsfEvent::ApplicationLifecycle(ApplicationLifecycleEvent {
             base: b,
             app: Product {
