@@ -1670,7 +1670,7 @@ pub fn mint_persisted_authentication(
     let identity =
         crate::auth::sandbox_session::PersistedSandboxIdentity::read(&metadata.annotations)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
-    authority.mint_persisted_launch(sandbox.object_id(), &identity)
+    authority.mint_fresh_persisted_launch(sandbox.object_id(), &identity)
 }
 
 async fn providers_for_sandbox(

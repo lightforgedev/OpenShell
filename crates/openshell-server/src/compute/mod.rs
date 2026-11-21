@@ -1468,7 +1468,7 @@ impl ComputeRuntime {
                 phase,
                 SandboxPhase::Stopped | SandboxPhase::Completed | SandboxPhase::Starting
             ) && !is_failed_main_process_result(&current)
-                && !is_recoverable_control_supervisor_error(&current)
+                && !is_recoverable_start_error(&current)
                 && !provisioning_timeout
             {
                 return Err(Status::failed_precondition(format!(
@@ -1478,7 +1478,7 @@ impl ComputeRuntime {
 
             if phase == SandboxPhase::Completed
                 || is_failed_main_process_result(&current)
-                || is_recoverable_control_supervisor_error(&current)
+                || is_recoverable_start_error(&current)
             {
                 self.cleanup_stopped_sandbox_sessions(&current)
                     .await
@@ -4715,13 +4715,16 @@ fn is_failed_main_process_result(sandbox: &Sandbox) -> bool {
         })
 }
 
-fn is_recoverable_control_supervisor_error(sandbox: &Sandbox) -> bool {
+fn is_recoverable_start_error(sandbox: &Sandbox) -> bool {
     sandbox.phase() == SandboxPhase::Error as i32
         && sandbox.status.as_ref().is_some_and(|status| {
             status.conditions.iter().any(|condition| {
                 condition.r#type == "Ready"
                     && condition.status.eq_ignore_ascii_case("false")
-                    && condition.reason == "ControlSupervisorExited"
+                    && matches!(
+                        condition.reason.as_str(),
+                        "ControlSupervisorExited" | "StartFailed"
+                    )
             })
         })
 }
@@ -9130,6 +9133,37 @@ mod tests {
                 .is_none(),
             "retry revokes sessions owned by the failed supervisor"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_gateway_start_can_be_retried_explicitly() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox = sandbox_record(
+            "sb-gateway-start-failed",
+            "sandbox-gateway-start-failed",
+            SandboxPhase::Error,
+        );
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Error as i32,
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: "StartFailed".to_string(),
+                message: "gateway restart used an expired launch credential".to_string(),
+                transition_time: None,
+            }],
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let starting = runtime
+            .start_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap();
+
+        assert_eq!(starting.phase(), SandboxPhase::Starting as i32);
+        assert_eq!(driver.start_calls(), 1);
     }
 
     #[tokio::test]
