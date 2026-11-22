@@ -194,6 +194,22 @@ impl SandboxSessionJwtAuthority {
         )
     }
 
+    /// Mint restart credentials for the current durable identity without
+    /// replaying the issue time of a previously completed refresh.
+    #[allow(clippy::result_large_err)]
+    pub fn mint_fresh_persisted_launch(
+        &self,
+        sandbox_id: &str,
+        identity: &crate::auth::sandbox_session::PersistedSandboxIdentity,
+    ) -> Result<SandboxLaunchAuthentication, Status> {
+        self.mint_launch(
+            sandbox_id,
+            identity.runtime_generation.clone(),
+            identity.auth_epoch,
+            identity.gateway_token_id,
+        )
+    }
+
     #[allow(clippy::result_large_err)]
     pub fn mint_launch(
         &self,
@@ -684,6 +700,18 @@ mod tests {
         (issuer, auth)
     }
 
+    fn session_authority(ttl: Duration) -> SandboxSessionJwtAuthority {
+        let mat = generate_jwt_key().expect("jwt key");
+        SandboxSessionJwtAuthority::from_pem(
+            mat.signing_key_pem.as_bytes(),
+            mat.public_key_pem.as_bytes(),
+            mat.kid,
+            "test-gateway",
+            ttl,
+        )
+        .expect("session authority")
+    }
+
     fn extension_audience(value: &str) -> ExtensionAudience {
         ExtensionAudience::new(value).expect("valid extension audience")
     }
@@ -710,6 +738,29 @@ mod tests {
             }
             _ => panic!("expected Sandbox principal"),
         }
+    }
+
+    #[test]
+    fn restart_launch_does_not_replay_expired_refresh_time() {
+        let authority = session_authority(Duration::from_hours(1));
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new()
+            .expect("persisted identity")
+            .next_gateway_token(
+                crate::auth::sandbox_session::RefreshRequestHash::from_extension_services(&[]),
+                1,
+                30,
+            );
+
+        let replayed = authority
+            .mint_persisted_launch("sandbox-a", &identity)
+            .expect("replayed launch");
+        let restarted = authority
+            .mint_fresh_persisted_launch("sandbox-a", &identity)
+            .expect("restart launch");
+
+        assert!(replayed.supervisor.gateway_expires_at < now_secs());
+        assert!(restarted.supervisor.gateway_expires_at > now_secs());
+        assert_eq!(restarted.supervisor.auth_epoch, identity.auth_epoch);
     }
 
     #[tokio::test]
