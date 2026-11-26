@@ -150,10 +150,33 @@ pub struct OpaEngine {
     engine: Mutex<regorus::Engine>,
     binary_identity_required: bool,
     generation: Arc<AtomicU64>,
+    /// Provider credential epoch, advanced by credential activations that
+    /// leave policy and middleware untouched. Only guards captured with
+    /// [`CredentialDependency::Dependent`] observe it.
+    credential_epoch: Arc<AtomicU64>,
     middleware_runner: RwLock<ChainRunner>,
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
+    /// Wakes pinned relays on every runtime transition (policy generation or
+    /// credential epoch). The value is the policy generation; receivers
+    /// recheck their own staleness after each notification.
     generation_tx: watch::Sender<u64>,
     fail_closed_reason: RwLock<Option<String>>,
+}
+
+/// Whether a pinned relay can resolve, inject, or carry provider credentials.
+///
+/// Every pinned relay is invalidated by a policy generation change. Only
+/// credential-dependent relays are additionally invalidated by a
+/// credential-only activation, so a raw tunnel that never touches provider
+/// credentials survives a provider-environment refresh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialDependency {
+    /// The relay never resolves or injects provider credentials and the
+    /// endpoint carries no provider credential binding.
+    Independent,
+    /// The relay can resolve or inject provider credentials (or the endpoint
+    /// is credential-bound). This is the fail-closed choice.
+    Dependent,
 }
 
 #[cfg(test)]
@@ -174,11 +197,60 @@ pub(crate) fn test_opa_query_count() -> u64 {
     TEST_OPA_QUERY_COUNT.load(Ordering::SeqCst)
 }
 
+/// Typed cause of a stale [`PolicyGenerationGuard`].
+///
+/// Policy staleness and credential-epoch staleness are distinct evidence:
+/// close events must report the counter pair that actually changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, miette::Diagnostic)]
+pub enum GuardStaleness {
+    #[error(
+        "policy generation is stale [captured_generation:{captured} current_generation:{current}]"
+    )]
+    PolicyGeneration { captured: u64, current: u64 },
+    #[error(
+        "provider credential epoch is stale [captured_credential_epoch:{captured} current_credential_epoch:{current}]"
+    )]
+    CredentialEpoch { captured: u64, current: u64 },
+}
+
+impl GuardStaleness {
+    /// Stable machine-readable cause carried in close evidence.
+    pub const fn cause(self) -> &'static str {
+        match self {
+            Self::PolicyGeneration { .. } => "policy_generation_stale",
+            Self::CredentialEpoch { .. } => "credential_epoch_stale",
+        }
+    }
+
+    /// Allow-listed activity deny group for this cause.
+    pub const fn activity_group(self) -> &'static str {
+        match self {
+            Self::PolicyGeneration { .. } => "policy_stale",
+            Self::CredentialEpoch { .. } => "credential_stale",
+        }
+    }
+}
+
+/// The guard's generation channel closed (engine teardown) while a relay was
+/// waiting for staleness. Distinct from a policy or credential change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, miette::Diagnostic)]
+#[error("policy generation channel closed [captured_generation:{captured_generation}]")]
+pub struct GenerationChannelClosed {
+    pub captured_generation: u64,
+}
+
 /// Generation guard captured when an HTTP tunnel or request path starts.
 #[derive(Clone, Debug)]
+///
+/// The guard is stale when the policy generation changes. A guard captured
+/// with [`CredentialDependency::Dependent`] is also stale when the provider
+/// credential epoch changes.
 pub struct PolicyGenerationGuard {
     captured_generation: u64,
     current_generation: Arc<AtomicU64>,
+    /// `Some(epoch)` for credential-dependent guards.
+    captured_credential_epoch: Option<u64>,
+    current_credential_epoch: Arc<AtomicU64>,
     generation_rx: watch::Receiver<u64>,
 }
 
@@ -191,19 +263,45 @@ impl PolicyGenerationGuard {
         self.current_generation.load(Ordering::Acquire)
     }
 
+    /// Credential epoch captured by a credential-dependent guard.
+    pub fn captured_credential_epoch(&self) -> Option<u64> {
+        self.captured_credential_epoch
+    }
+
+    pub fn current_credential_epoch(&self) -> u64 {
+        self.current_credential_epoch.load(Ordering::Acquire)
+    }
+
+    pub fn credential_dependency(&self) -> CredentialDependency {
+        if self.captured_credential_epoch.is_some() {
+            CredentialDependency::Dependent
+        } else {
+            CredentialDependency::Independent
+        }
+    }
+
     pub fn is_stale(&self) -> bool {
-        self.current_generation() != self.captured_generation
+        self.staleness().is_some()
+    }
+
+    /// Typed staleness, policy first: a policy change subsumes a credential
+    /// rotation published in the same activation.
+    pub fn staleness(&self) -> Option<GuardStaleness> {
+        let current = self.current_generation();
+        if current != self.captured_generation {
+            return Some(GuardStaleness::PolicyGeneration {
+                captured: self.captured_generation,
+                current,
+            });
+        }
+        let captured = self.captured_credential_epoch?;
+        let current = self.current_credential_epoch();
+        (captured != current).then_some(GuardStaleness::CredentialEpoch { captured, current })
     }
 
     pub fn ensure_current(&self) -> Result<()> {
-        if self.is_stale() {
-            return Err(miette::miette!(
-                "policy generation is stale [captured_generation:{} current_generation:{}]",
-                self.captured_generation(),
-                self.current_generation(),
-            ));
-        }
-        Ok(())
+        self.staleness()
+            .map_or(Ok(()), |staleness| Err(miette::Report::new(staleness)))
     }
 
     /// Wait until the policy generation changes.
@@ -246,6 +344,14 @@ impl TunnelPolicyEngine {
         &self.generation_guard
     }
 
+    pub fn captured_credential_epoch(&self) -> Option<u64> {
+        self.generation_guard.captured_credential_epoch()
+    }
+
+    pub fn current_credential_epoch(&self) -> u64 {
+        self.generation_guard.current_credential_epoch()
+    }
+
     pub(crate) fn engine(&self) -> &Mutex<regorus::Engine> {
         &self.engine
     }
@@ -284,6 +390,7 @@ impl OpaEngine {
             engine: Mutex::new(engine),
             binary_identity_required,
             generation,
+            credential_epoch: Arc::new(AtomicU64::new(0)),
             middleware_runner: RwLock::new(ChainRunner::default()),
             websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
             generation_tx,
@@ -300,6 +407,14 @@ impl OpaEngine {
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.generation_tx.send_replace(generation);
         generation
+    }
+
+    /// Advance only the credential epoch and wake pinned relays so the
+    /// credential-dependent ones close. The policy generation is unchanged.
+    fn advance_credential_epoch(&self) -> u64 {
+        let epoch = self.credential_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.generation_tx.send_replace(self.current_generation());
+        epoch
     }
 
     /// Load policy from a `.rego` rules file and data from a YAML file.
@@ -784,6 +899,37 @@ impl OpaEngine {
         self.generation_guard(generation)
     }
 
+    /// Activate a provider credential change that leaves the compiled policy,
+    /// the middleware registry, and any fail-closed quarantine untouched.
+    ///
+    /// The credential epoch advances before `commit_credentials` runs, so
+    /// every credential-dependent guard is stale before credential material
+    /// changes, and credential-dependent relays pinned afterwards (which
+    /// capture under the same engine lock) observe only the new material.
+    /// Credential-independent guards and the policy generation are unchanged.
+    /// On a lock failure nothing is published and `commit_credentials` is
+    /// never invoked.
+    ///
+    /// The callback must be infallible and must not call back into this engine.
+    /// Returns the (unchanged) policy generation evidence and the new epoch.
+    pub fn activate_credentials(
+        &self,
+        commit_credentials: impl FnOnce(),
+    ) -> Result<(PolicyGenerationGuard, u64)> {
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let epoch = self.advance_credential_epoch();
+        commit_credentials();
+        Ok((self.generation_guard(self.current_generation())?, epoch))
+    }
+
+    /// Current provider credential epoch.
+    pub fn current_credential_epoch(&self) -> u64 {
+        self.credential_epoch.load(Ordering::Acquire)
+    }
+
     /// Publish a deny-all quarantine generation without activating any part
     /// of the invalid candidate policy.
     ///
@@ -895,8 +1041,50 @@ impl OpaEngine {
             .expect("middleware runner lock") = runner;
     }
 
-    /// Return a guard for a previously captured policy generation.
+    /// Return a policy-only guard for a previously captured policy generation.
+    ///
+    /// The guard ignores credential-only activations. Use it for policy
+    /// evidence and for relays that never resolve or inject provider
+    /// credentials; use [`Self::credential_bound_generation_guard`] otherwise.
     pub fn generation_guard(&self, expected_generation: u64) -> Result<PolicyGenerationGuard> {
+        self.generation_guard_with_epoch(expected_generation, None)
+    }
+
+    /// Return a guard that is also invalidated by credential-only activations.
+    ///
+    /// The epoch is captured under the engine lock, which serializes with
+    /// [`Self::activate_credentials`]: the guard either predates an activation
+    /// (and is stale afterwards) or follows its credential commit.
+    pub fn credential_bound_generation_guard(
+        &self,
+        expected_generation: u64,
+    ) -> Result<PolicyGenerationGuard> {
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        self.generation_guard_with_epoch(expected_generation, Some(self.current_credential_epoch()))
+    }
+
+    /// Return a guard with the given credential dependency.
+    pub fn generation_guard_for(
+        &self,
+        expected_generation: u64,
+        dependency: CredentialDependency,
+    ) -> Result<PolicyGenerationGuard> {
+        match dependency {
+            CredentialDependency::Independent => self.generation_guard(expected_generation),
+            CredentialDependency::Dependent => {
+                self.credential_bound_generation_guard(expected_generation)
+            }
+        }
+    }
+
+    fn generation_guard_with_epoch(
+        &self,
+        expected_generation: u64,
+        captured_credential_epoch: Option<u64>,
+    ) -> Result<PolicyGenerationGuard> {
         let generation = self.current_generation();
         if generation != expected_generation {
             return Err(miette::miette!(
@@ -906,6 +1094,8 @@ impl OpaEngine {
         Ok(PolicyGenerationGuard {
             captured_generation: generation,
             current_generation: Arc::clone(&self.generation),
+            captured_credential_epoch,
+            current_credential_epoch: Arc::clone(&self.credential_epoch),
             generation_rx: self.generation_tx.subscribe(),
         })
     }
@@ -1095,11 +1285,15 @@ impl OpaEngine {
                 "policy changed before L7 tunnel started [expected_generation:{expected_generation} current_generation:{generation}]"
             ));
         }
+        // L7 tunnels can resolve and inject provider credentials, so they are
+        // always credential-dependent.
         Ok(TunnelPolicyEngine {
             engine: Mutex::new(engine.clone()),
             generation_guard: PolicyGenerationGuard {
                 captured_generation: generation,
                 current_generation: Arc::clone(&self.generation),
+                captured_credential_epoch: Some(self.current_credential_epoch()),
+                current_credential_epoch: Arc::clone(&self.credential_epoch),
                 generation_rx: self.generation_tx.subscribe(),
             },
             middleware_runner: self.middleware_runner()?,
@@ -11565,5 +11759,179 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
         }
+    }
+}
+
+/// Dependency-aware invalidation: a credential-only activation advances the
+/// credential epoch but not the policy generation.
+#[cfg(test)]
+mod credential_epoch_tests {
+    use super::*;
+
+    const TEST_POLICY: &str = include_str!("../data/sandbox-policy.rego");
+    const TEST_DATA_YAML: &str = include_str!("../testdata/sandbox-policy.yaml");
+
+    fn engine() -> OpaEngine {
+        OpaEngine::from_strings(TEST_POLICY, TEST_DATA_YAML).unwrap()
+    }
+
+    #[test]
+    fn credential_only_activation_keeps_policy_only_guards_current() {
+        let engine = engine();
+        let generation = engine.current_generation();
+        let raw = engine
+            .generation_guard_for(generation, CredentialDependency::Independent)
+            .unwrap();
+
+        let (evidence, epoch) = engine.activate_credentials(|| {}).unwrap();
+
+        assert_eq!(engine.current_generation(), generation);
+        assert_eq!(epoch, 1);
+        assert_eq!(engine.current_credential_epoch(), 1);
+        assert!(!raw.is_stale(), "a raw tunnel has no credential dependency");
+        raw.ensure_current().unwrap();
+        assert_eq!(evidence.captured_generation(), generation);
+        assert!(!evidence.is_stale(), "policy evidence must stay current");
+        assert_eq!(
+            evidence.credential_dependency(),
+            CredentialDependency::Independent
+        );
+    }
+
+    #[test]
+    fn credential_bound_guards_are_stale_before_new_credentials_commit() {
+        let engine = engine();
+        let generation = engine.current_generation();
+        let passthrough = engine
+            .credential_bound_generation_guard(generation)
+            .unwrap();
+        let tunnel = engine.clone_engine_for_tunnel(generation).unwrap();
+        assert_eq!(passthrough.captured_credential_epoch(), Some(0));
+        assert_eq!(tunnel.captured_credential_epoch(), Some(0));
+
+        let mut observed_at_commit = None;
+        engine
+            .activate_credentials(|| {
+                observed_at_commit = Some((passthrough.is_stale(), tunnel.is_stale()));
+            })
+            .unwrap();
+
+        assert_eq!(
+            observed_at_commit,
+            Some((true, true)),
+            "credential-dependent guards must be stale before new material is visible"
+        );
+        let error = passthrough.ensure_current().unwrap_err().to_string();
+        assert!(
+            error.contains("provider credential epoch is stale")
+                && error.contains("captured_credential_epoch:0")
+                && error.contains("current_credential_epoch:1"),
+            "{error}"
+        );
+        assert_eq!(engine.current_generation(), generation);
+
+        // A credential-dependent relay pinned after activation binds the new epoch.
+        let rebound = engine
+            .credential_bound_generation_guard(generation)
+            .unwrap();
+        assert_eq!(rebound.captured_credential_epoch(), Some(1));
+        assert!(!rebound.is_stale());
+        let rebound_tunnel = engine.clone_engine_for_tunnel(generation).unwrap();
+        assert_eq!(rebound_tunnel.captured_credential_epoch(), Some(1));
+        assert!(!rebound_tunnel.is_stale());
+    }
+
+    #[test]
+    fn policy_middleware_and_quarantine_transitions_invalidate_every_guard() {
+        type Transition = fn(&OpaEngine);
+        let transitions: [(&str, Transition); 3] = [
+            ("policy reload", |engine| {
+                engine.reload(TEST_POLICY, TEST_DATA_YAML).unwrap();
+            }),
+            ("middleware registry replacement", |engine| {
+                engine
+                    .replace_middleware_registry(MiddlewareRegistry::default())
+                    .unwrap();
+            }),
+            ("fail-closed quarantine", |engine| {
+                engine.enter_fail_closed("test quarantine").unwrap();
+            }),
+        ];
+        for (name, transition) in transitions {
+            let engine = engine();
+            let generation = engine.current_generation();
+            let raw = engine.generation_guard(generation).unwrap();
+            let credentialed = engine
+                .credential_bound_generation_guard(generation)
+                .unwrap();
+            let tunnel = engine.clone_engine_for_tunnel(generation).unwrap();
+
+            transition(&engine);
+
+            assert_eq!(engine.current_credential_epoch(), 0, "{name}");
+            assert!(raw.is_stale(), "{name} must invalidate a raw tunnel");
+            assert!(credentialed.is_stale(), "{name}");
+            assert!(tunnel.is_stale(), "{name}");
+            assert!(
+                raw.ensure_current()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("policy generation is stale"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_credential_activation_publishes_nothing() {
+        let engine = engine();
+        let generation = engine.current_generation();
+        let credentialed = engine
+            .credential_bound_generation_guard(generation)
+            .unwrap();
+        let raw = engine.generation_guard(generation).unwrap();
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _locked = engine.engine.lock().unwrap();
+            panic!("poison the OPA engine lock");
+        }));
+        assert!(poison.is_err());
+
+        let mut committed = false;
+        let result = engine.activate_credentials(|| committed = true);
+
+        assert!(result.is_err(), "a poisoned engine must fail activation");
+        assert!(!committed, "credentials must never commit on failure");
+        assert_eq!(engine.current_credential_epoch(), 0);
+        assert_eq!(engine.current_generation(), generation);
+        assert!(!credentialed.is_stale() && !raw.is_stale());
+        assert!(
+            engine
+                .credential_bound_generation_guard(generation)
+                .is_err(),
+            "no credential-dependent relay can start on a poisoned engine"
+        );
+        assert!(engine.clone_engine_for_tunnel(generation).is_err());
+    }
+
+    #[tokio::test]
+    async fn wait_until_stale_wakes_only_credential_dependent_guards() {
+        let engine = engine();
+        let generation = engine.current_generation();
+        let raw = engine.generation_guard(generation).unwrap();
+        let credentialed = engine
+            .credential_bound_generation_guard(generation)
+            .unwrap();
+        let mut raw_wait = Box::pin(raw.wait_until_stale());
+
+        engine.activate_credentials(|| {}).unwrap();
+
+        // Resolves immediately: the epoch already advanced.
+        credentialed.wait_until_stale().await;
+        assert!(
+            futures::poll!(raw_wait.as_mut()).is_pending(),
+            "a credential-only activation must not wake a raw tunnel closed"
+        );
+        engine.reload(TEST_POLICY, TEST_DATA_YAML).unwrap();
+        raw_wait.await;
     }
 }

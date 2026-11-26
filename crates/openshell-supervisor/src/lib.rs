@@ -4187,11 +4187,12 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
         let recovering_rejected_policy = reloads_gateway_policy
             && rejected_policy_generation.is_some()
             && result.configuration_admitted;
-        let policy_runtime_changed = (reloads_gateway_policy
-            && (provider_env_changed
-                || current_policy_generation
-                    .as_ref()
-                    .is_some_and(PolicyGenerationGuard::is_stale)))
+        // Changes that require recompiling policy or rebuilding middleware.
+        // These advance the policy generation and invalidate every tunnel.
+        let policy_configuration_changed = (reloads_gateway_policy
+            && current_policy_generation
+                .as_ref()
+                .is_some_and(PolicyGenerationGuard::is_stale))
             || recovering_rejected_policy
             || extension_authentication_changed
             || gateway_policy_runtime_needs_reconciliation(
@@ -4202,6 +4203,17 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 &result.supervisor_middleware_services,
                 middleware_registry_status,
             );
+        let policy_runtime_changed =
+            policy_configuration_changed || (reloads_gateway_policy && provider_env_changed);
+        // A provider-environment change against the installed, unquarantined
+        // policy activates credentials alone. Only credential-dependent
+        // tunnels observe it; tunnels that never resolve or inject provider
+        // credentials (raw / `tls: skip` passthrough) keep their policy
+        // generation. Anything else takes the full runtime reload below.
+        let credential_only_activation = policy_runtime_changed
+            && !policy_configuration_changed
+            && rejected_policy_generation.is_none()
+            && current_policy_generation.is_some();
         // Recovery already has its own acknowledgement path below. Giving it
         // precedence here prevents a restored last-known-good policy from
         // also being acknowledged as an ordinary same-hash revision.
@@ -4399,7 +4411,63 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             None
         };
 
-        if policy_runtime_changed {
+        if credential_only_activation {
+            // Policy-only tunnels keep their generation; credential-dependent
+            // tunnels are invalidated before the new material is committed.
+            match ctx.opa_engine.activate_credentials(|| {
+                if let Some(prepared) = prepared_provider.as_ref() {
+                    ctx.provider_credentials.install_prepared(prepared);
+                }
+            }) {
+                Ok((generation, credential_epoch)) => {
+                    policy_runtime_reconciled = true;
+                    if let Some((identity, expires_at_ms)) = prepared_identity.as_ref() {
+                        ctx.provider_readiness.credentials_installed(
+                            identity.clone(),
+                            &ctx.provider_credentials,
+                            *expires_at_ms,
+                        );
+                    }
+                    ctx.provider_readiness.policy_activated(
+                        &desired_identity,
+                        result.config_revision,
+                        generation.clone(),
+                    );
+                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .state(StateId::Enabled, "credentials_activated")
+                        .unmapped("policy_generation", serde_json::json!(generation.captured_generation()))
+                        .unmapped("credential_epoch", serde_json::json!(credential_epoch))
+                        .unmapped("provider_env_revision", serde_json::json!(result.provider_env_revision))
+                        .message(format!(
+                            "Provider credentials activated without a policy change [policy_generation:{} credential_epoch:{credential_epoch} provider_env_revision:{}]",
+                            generation.captured_generation(),
+                            result.provider_env_revision
+                        ))
+                        .build());
+                    current_policy_generation = Some(generation);
+                    last_failed_runtime_revision = None;
+                }
+                Err(error) => {
+                    // Nothing was installed and no epoch was published.
+                    // Revoke static material exactly as a failed refresh does.
+                    ctx.provider_readiness.credentials_failed(
+                        desired_identity.clone(),
+                        ProviderReadinessReason::CredentialInstallFailed,
+                    );
+                    ctx.provider_credentials
+                        .revoke_static_provider_environment(result.provider_env_revision);
+                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::High)
+                        .status(StatusId::Failure)
+                        .state(StateId::Disabled, "fail_closed")
+                        .unmapped("error", serde_json::json!(error.to_string()))
+                        .message("Provider credential activation failed; static credentials were revoked and previous dynamic grants remain active")
+                        .build());
+                }
+            }
+        } else if policy_runtime_changed {
             let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
             let runtime_result = reload_gateway_configuration_runtime(
                 &ctx.opa_engine,
@@ -6358,6 +6426,299 @@ network_policies:
                 assert!(state.resolver().is_none());
             }
         }
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// Poll loop running on an acknowledged initial gateway policy, with the
+    /// handles the provider-environment activation tests drive.
+    struct ProviderActivationHarness {
+        engine: Arc<OpaEngine>,
+        initial: openshell_core::grpc_client::SettingsPollResult,
+        credentials: ProviderCredentialState,
+        tracker: ProviderReadinessTracker,
+        polls: UnboundedSender<openshell_core::grpc_client::SettingsPollResult>,
+        reports: tokio::sync::mpsc::UnboundedReceiver<(u32, bool, String)>,
+        received: tokio::sync::mpsc::UnboundedReceiver<ProviderFetchRequest>,
+        task: tokio::task::JoinHandle<Result<()>>,
+    }
+
+    async fn start_provider_activation_loop() -> ProviderActivationHarness {
+        let engine = Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).unwrap());
+        let initial = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let ctx = policy_poll_test_context(
+            engine.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let credentials = ctx.provider_credentials.clone();
+        let tracker = ctx.provider_readiness.clone();
+        let (policy, polls, mut reports) = scripted_policy_gateway();
+        let (requests, received) = tokio::sync::mpsc::unbounded_channel();
+        polls.send(initial.clone()).unwrap();
+        let task = tokio::spawn(run_policy_poll_loop_with_client(
+            ctx,
+            ScriptedProviderGateway { policy, requests },
+        ));
+        expect_policy_report(&mut reports, 1).await;
+        ProviderActivationHarness {
+            engine,
+            initial,
+            credentials,
+            tracker,
+            polls,
+            reports,
+            received,
+            task,
+        }
+    }
+
+    async fn wait_for_provider_install(
+        credentials: &ProviderCredentialState,
+        tracker: &ProviderReadinessTracker,
+        revision: u64,
+    ) {
+        timeout(Duration::from_secs(5), async {
+            while credentials.revision() != revision
+                || !tracker.observation(credentials).credentials_installed
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider environment installed");
+    }
+
+    /// Regression for WP-6 H5: a provider-env-only revision (same policy hash,
+    /// same config revision) must not advance the policy generation, so a
+    /// TLS-passthrough tunnel captured before the poll keeps running.
+    #[tokio::test]
+    async fn provider_env_only_revision_keeps_policy_generation_for_passthrough_tunnels() {
+        let ProviderActivationHarness {
+            engine,
+            initial,
+            credentials,
+            tracker,
+            polls,
+            mut received,
+            task,
+            ..
+        } = start_provider_activation_loop().await;
+        let generation = engine.current_generation();
+        let passthrough = engine.generation_guard(generation).unwrap();
+
+        let mut poll = initial.clone();
+        poll.provider_env_revision = 1;
+        polls.send(poll).unwrap();
+        let response = timeout(Duration::from_secs(5), received.recv())
+            .await
+            .expect("provider refresh requested")
+            .expect("poll loop active");
+        assert!(
+            response
+                .send(Ok(static_provider_environment(1, Some("initial"))))
+                .is_ok()
+        );
+        wait_for_provider_install(&credentials, &tracker, 1).await;
+
+        assert_eq!(engine.current_generation(), generation);
+        assert_eq!(engine.current_credential_epoch(), 1);
+        assert!(!passthrough.is_stale(), "passthrough tunnel must survive");
+        assert!(
+            tracker.observation(&credentials).policy_active,
+            "policy evidence is retained across a credential-only activation"
+        );
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn provider_env_only_revision_rebinds_credentialed_tunnels_to_new_epoch() {
+        let ProviderActivationHarness {
+            engine,
+            initial,
+            credentials,
+            tracker,
+            polls,
+            mut received,
+            task,
+            ..
+        } = start_provider_activation_loop().await;
+        let generation = engine.current_generation();
+        let reference = |revision: u64| format!("openshell:resolve:env:v{revision}_EXTERNAL_TOKEN");
+        let resolve = |revision: u64| {
+            credentials
+                .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
+                .and_then(|resolver| {
+                    resolver
+                        .resolve_placeholder(&reference(revision))
+                        .map(str::to_owned)
+                })
+        };
+
+        for (revision, value) in [(1, "initial"), (2, "rotated")] {
+            let credentialed = engine
+                .credential_bound_generation_guard(generation)
+                .unwrap();
+            let epoch_before = engine.current_credential_epoch();
+            let mut poll = initial.clone();
+            poll.provider_env_revision = revision;
+            polls.send(poll).unwrap();
+            let response = timeout(Duration::from_secs(5), received.recv())
+                .await
+                .expect("provider refresh requested")
+                .expect("poll loop active");
+            assert!(
+                response
+                    .send(Ok(static_provider_environment(revision, Some(value))))
+                    .is_ok()
+            );
+            wait_for_provider_install(&credentials, &tracker, revision).await;
+
+            assert_eq!(engine.current_generation(), generation);
+            assert_eq!(engine.current_credential_epoch(), epoch_before + 1);
+            assert!(
+                credentialed.is_stale(),
+                "a credential-dependent tunnel must not keep stale credentials"
+            );
+            let rebound = engine
+                .credential_bound_generation_guard(generation)
+                .unwrap();
+            assert_eq!(rebound.captured_credential_epoch(), Some(epoch_before + 1));
+            assert_eq!(resolve(revision).as_deref(), Some(value));
+        }
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn policy_change_with_provider_env_still_invalidates_every_tunnel() {
+        let ProviderActivationHarness {
+            engine,
+            initial,
+            credentials,
+            polls,
+            mut reports,
+            mut received,
+            task,
+            ..
+        } = start_provider_activation_loop().await;
+        let generation = engine.current_generation();
+        let passthrough = engine.generation_guard(generation).unwrap();
+        let credentialed = engine
+            .credential_bound_generation_guard(generation)
+            .unwrap();
+
+        let mut changed = initial;
+        changed.version = 2;
+        changed.config_revision = 200;
+        changed.policy_hash = "hash-v2".to_string();
+        changed.provider_env_revision = 1;
+        polls.send(changed).unwrap();
+        let response = timeout(Duration::from_secs(5), received.recv())
+            .await
+            .expect("provider refresh requested")
+            .expect("poll loop active");
+        let mut environment = static_provider_environment(1, Some("initial"));
+        environment.policy_hash = "hash-v2".to_string();
+        assert!(response.send(Ok(environment)).is_ok());
+        expect_policy_report(&mut reports, 2).await;
+
+        assert_eq!(engine.current_generation(), generation + 1);
+        assert!(passthrough.is_stale(), "a policy change closes raw tunnels");
+        assert!(credentialed.is_stale());
+        assert_eq!(credentials.revision(), 1);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn failed_provider_env_activation_stays_fail_closed() {
+        let ProviderActivationHarness {
+            engine,
+            initial,
+            credentials,
+            tracker,
+            polls,
+            mut received,
+            task,
+            ..
+        } = start_provider_activation_loop().await;
+        let generation = engine.current_generation();
+        let passthrough = engine.generation_guard(generation).unwrap();
+
+        let mut poll = initial.clone();
+        poll.provider_env_revision = 1;
+        polls.send(poll.clone()).unwrap();
+        let response = timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            response
+                .send(Ok(static_provider_environment(1, Some("initial"))))
+                .is_ok()
+        );
+        wait_for_provider_install(&credentials, &tracker, 1).await;
+        let epoch = engine.current_credential_epoch();
+
+        poll.provider_env_revision = 2;
+        polls.send(poll.clone()).unwrap();
+        let response = timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            response
+                .send(Err(miette::miette!("provider snapshot unavailable")))
+                .is_ok()
+        );
+        timeout(Duration::from_secs(5), async {
+            while tracker.observation(&credentials).reason
+                != i32::from(ProviderReadinessReason::CredentialInstallFailed)
+                || credentials.revision() != 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed refresh is recorded");
+
+        let observed = tracker.observation(&credentials);
+        assert!(!observed.credentials_installed);
+        assert!(
+            credentials.resolver().is_none(),
+            "static credentials are revoked when activation fails"
+        );
+        assert_eq!(
+            engine.current_credential_epoch(),
+            epoch,
+            "nothing activated"
+        );
+        assert_eq!(engine.current_generation(), generation);
+        assert!(!passthrough.is_stale());
+
+        // The same revision is retried and activates through the epoch.
+        polls.send(poll).unwrap();
+        let response = timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            response
+                .send(Ok(static_provider_environment(2, Some("repaired"))))
+                .is_ok()
+        );
+        wait_for_provider_install(&credentials, &tracker, 2).await;
+        assert_eq!(engine.current_credential_epoch(), epoch + 1);
+        assert_eq!(engine.current_generation(), generation);
         task.abort();
         let _ = task.await;
     }
