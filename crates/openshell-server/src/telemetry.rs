@@ -102,6 +102,12 @@ mod tests {
     #[test]
     fn deny_group_sanitization_drops_raw_values() {
         assert_eq!(sanitize_deny_group("forward-l7-deny"), DenyGroup::L7Policy);
+        assert_eq!(sanitize_deny_group("policy_stale"), DenyGroup::PolicyStale);
+        assert_eq!(
+            sanitize_deny_group("credential_stale"),
+            DenyGroup::CredentialStale
+        );
+        assert_eq!(DenyGroup::CredentialStale.as_str(), "credential_stale");
         assert_eq!(
             sanitize_deny_group("host=/secret.example"),
             DenyGroup::Unknown
