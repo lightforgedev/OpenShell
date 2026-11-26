@@ -291,6 +291,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 host_gateway_ip: self.host_gateway_ip,
                 resource_claims,
                 outer_fence,
+                supervisor_generation: None,
             },
         })
     }

@@ -95,11 +95,17 @@ where
             // Fallback: format non-OCSF events with basic format
             let level = meta.level();
             let target = meta.target();
-            // Extract message from the event fields
+            // Extract the message and any structured fields. Dropping fields
+            // hides diagnostics such as `error`, so render them as
+            // `key=value` after the message, like the default fmt layer.
             let mut message = String::new();
-            event.record(&mut MessageVisitor(&mut message));
+            let mut fields = String::new();
+            event.record(&mut MessageVisitor {
+                message: &mut message,
+                fields: &mut fields,
+            });
             if let Ok(mut w) = self.writer.lock() {
-                let _ = writeln!(w, "{ts} {level} {target}: {message}");
+                let _ = writeln!(w, "{ts} {level} {target}: {message}{fields}");
             }
         }
     }
@@ -120,19 +126,34 @@ pub fn severity_rank(severity: SeverityId) -> u8 {
     }
 }
 
-/// Simple visitor that extracts the message field from tracing events.
-struct MessageVisitor<'a>(&'a mut String);
+/// Visitor that extracts the message field and renders every other field as
+/// ` key=value`.
+struct MessageVisitor<'a> {
+    message: &'a mut String,
+    fields: &'a mut String,
+}
+
+impl MessageVisitor<'_> {
+    fn push_field(&mut self, name: &str, value: &dyn std::fmt::Display) {
+        use std::fmt::Write as _;
+        let _ = write!(self.fields, " {name}={value}");
+    }
+}
 
 impl tracing::field::Visit for MessageVisitor<'_> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
-            *self.0 = format!("{value:?}");
+            *self.message = format!("{value:?}");
+        } else {
+            self.push_field(field.name(), &format_args!("{value:?}"));
         }
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         if field.name() == "message" {
-            *self.0 = value.to_string();
+            *self.message = value.to_string();
+        } else {
+            self.push_field(field.name(), &format_args!("{value:?}"));
         }
     }
 }
@@ -203,6 +224,30 @@ mod tests {
         assert!(
             line.contains("test message"),
             "Expected message, got: {line}"
+        );
+    }
+
+    #[test]
+    fn test_non_ocsf_fallback_includes_structured_fields() {
+        use std::sync::Arc;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = SyncWriter(buffer.clone());
+        let layer = OcsfShorthandLayer::new(writer).with_non_ocsf(true);
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = subscriber.set_default();
+
+        let error = "attach rejected";
+        tracing::warn!(%error, attempt = 3, "Boundary gRPC exchange failed");
+
+        let output = buffer.lock().unwrap();
+        let line = String::from_utf8_lossy(&output);
+        assert!(
+            line.contains("Boundary gRPC exchange failed error=attach rejected attempt=3"),
+            "Expected message followed by fields, got: {line}"
         );
     }
 

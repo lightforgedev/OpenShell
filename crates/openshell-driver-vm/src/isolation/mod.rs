@@ -130,6 +130,7 @@ impl VmBoundarySpec {
                 host_gateway_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
                 resource_claims,
                 outer_fence,
+                supervisor_generation: None,
             },
         })
     }

@@ -82,6 +82,7 @@ impl ManagedGateway {
 
         let child = Command::new(&self.bin)
             .args(args)
+            .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr))
             .spawn()
@@ -117,6 +118,32 @@ impl ManagedGateway {
         }
 
         send_signal(pid, Some("-9"))?;
+        let _ = fs::remove_file(&self.pid_file);
+        Ok(())
+    }
+
+    /// Kill the gateway with `SIGKILL`, skipping graceful shutdown.
+    ///
+    /// This models an embedded gateway whose host process dies: running
+    /// sandbox containers and their supervisor sidecars are left in place for
+    /// the next gateway start to re-adopt. Only the PID recorded by this e2e
+    /// run is signalled.
+    pub fn kill(&self) -> Result<(), String> {
+        let Some(pid) = self.current_pid()? else {
+            return Ok(());
+        };
+        if process_running(pid)? {
+            send_signal(pid, Some("-9"))?;
+            for _ in 0..60 {
+                if !process_running(pid)? {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+            if process_running(pid)? {
+                return Err(format!("gateway process {pid} survived SIGKILL"));
+            }
+        }
         let _ = fs::remove_file(&self.pid_file);
         Ok(())
     }

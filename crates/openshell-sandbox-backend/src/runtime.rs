@@ -117,6 +117,7 @@ impl IsolationBackend for OpenShellRuntimeBackend {
         let generation = runtime_descriptor.generation.clone();
         let session_id = runtime_descriptor.session_id;
         let outer_fence = runtime_descriptor.outer_fence.clone();
+        let supervisor_generation = runtime_descriptor.supervisor_generation.clone();
         let client = Arc::new(BoundaryClient::new(
             runtime_descriptor,
             self.sandbox_bearer.clone(),
@@ -126,6 +127,7 @@ impl IsolationBackend for OpenShellRuntimeBackend {
                 supervisor_instance_id: client.supervisor_instance_id,
                 policy: Box::new(SandboxPolicyWire::from(sandbox.policy.clone())),
                 resource_claims: resource_claims.clone(),
+                supervisor_generation,
             })
             .await?;
         let Response::Attached { snapshot } = response else {
@@ -181,6 +183,16 @@ fn validate_runtime_descriptor(
         ));
     }
     validate_resource_claims(&runtime_descriptor.resource_claims)?;
+    if let Some(generation) = &runtime_descriptor.supervisor_generation {
+        generation.validate().map_err(|error| {
+            BackendError::Descriptor(format!("invalid supervisor generation: {error}"))
+        })?;
+        if generation.sandbox_id != runtime_descriptor.boundary_id {
+            return Err(BackendError::Descriptor(
+                "supervisor generation was issued for a different sandbox".to_string(),
+            ));
+        }
+    }
     runtime_descriptor
         .outer_fence
         .validate(&runtime_descriptor.generation)?;
@@ -2243,6 +2255,7 @@ mod tests {
             supervisor_instance_id: client.supervisor_instance_id,
             policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
             resource_claims: std::collections::BTreeMap::new(),
+            supervisor_generation: None,
         };
         assert!(matches!(
             client.call_idempotent(attach).await.unwrap(),
@@ -2337,6 +2350,7 @@ mod tests {
             supervisor_instance_id: client.supervisor_instance_id,
             policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
             resource_claims: std::collections::BTreeMap::new(),
+            supervisor_generation: None,
         };
         assert!(matches!(
             client.call_idempotent(attach).await.unwrap(),
@@ -2500,6 +2514,7 @@ mod tests {
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
+            supervisor_generation: None,
         }
     }
 
@@ -2763,6 +2778,7 @@ mod tests {
             host_gateway_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
+            supervisor_generation: None,
         };
         let debug = format!("{runtime_descriptor:?}");
         assert!(debug.contains("<redacted>"));
@@ -2783,6 +2799,7 @@ mod tests {
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
+            supervisor_generation: None,
         };
         assert!(matches!(
             validate_runtime_descriptor(&runtime_descriptor, &sandbox()),
@@ -2805,6 +2822,7 @@ mod tests {
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
+            supervisor_generation: None,
         };
         assert!(matches!(
             validate_runtime_descriptor(&runtime_descriptor, &sandbox()),
@@ -2827,6 +2845,7 @@ mod tests {
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
+            supervisor_generation: None,
         };
         validate_runtime_descriptor(&runtime_descriptor, &sandbox())
             .expect("TCP runtime descriptor should be valid");
@@ -3024,6 +3043,7 @@ mod tests {
                 host_gateway_ip: None,
                 resource_claims: std::collections::BTreeMap::new(),
                 outer_fence: test_outer_fence(),
+                supervisor_generation: None,
             },
             test_bearer(&"a".repeat(32)),
         ));
@@ -3216,6 +3236,7 @@ mod tests {
                 host_gateway_ip: None,
                 resource_claims: std::collections::BTreeMap::new(),
                 outer_fence: test_outer_fence(),
+                supervisor_generation: None,
             },
             test_bearer(&"a".repeat(32)),
         );
