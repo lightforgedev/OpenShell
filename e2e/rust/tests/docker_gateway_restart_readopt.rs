@@ -4,7 +4,8 @@
 #![cfg(feature = "e2e")]
 
 //! E2E coverage for re-adopting a live Docker sandbox across repeated
-//! ungraceful gateway restarts.
+//! ungraceful gateway restarts, and across a graceful restart whose shutdown
+//! disposition retains running sandboxes.
 //!
 //! An embedded gateway can die without running its graceful shutdown sweep,
 //! so the sandbox container keeps running. The next gateway start removes the
@@ -25,7 +26,11 @@ use openshell_e2e::harness::cli::{
 use openshell_e2e::harness::gateway::ManagedGateway;
 use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
+use tokio::sync::Mutex;
 use tokio::time::sleep;
+
+/// Both tests restart the one wrapper-owned gateway, so they run one at a time.
+static GATEWAY_RESTARTS: Mutex<()> = Mutex::const_new(());
 
 const READY_MARKER: &str = "gateway-readopt-ready";
 const STATE_FILE: &str = "/sandbox/gateway-readopt-state";
@@ -270,6 +275,7 @@ async fn sandbox_phase(sandbox_name: &str) -> String {
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn docker_gateway_restarts_readopt_live_sandbox() {
+    let _restarts = GATEWAY_RESTARTS.lock().await;
     let Some(gateway) = ManagedGateway::from_env().expect("load managed e2e gateway metadata")
     else {
         eprintln!("Skipping gateway re-adopt test: e2e gateway is not managed by this test run");
@@ -428,6 +434,247 @@ async fn docker_gateway_restarts_readopt_live_sandbox() {
 
     // Delete owns volume cleanup. Remove leftovers only for this test's
     // sandbox id so a failed delete does not leak volumes between runs.
+    let leftovers = sandbox_volumes(&sandbox_id).unwrap_or_default();
+    for volume in &leftovers {
+        let _ = docker(&["volume", "rm", "-f", volume]);
+    }
+    assert!(
+        leftovers.is_empty(),
+        "sandbox delete should remove its volumes, found {leftovers:?}"
+    );
+}
+
+const RETAIN: &str = "retain-running-sandboxes";
+const RETAIN_MARKER: &str = "gateway-retain-ready";
+const RETAIN_STATE_FILE: &str = "/sandbox/gateway-retain-state";
+
+/// The gateway log lines carrying the shutdown disposition receipt.
+fn disposition_receipts(gateway: &ManagedGateway) -> Vec<String> {
+    std::fs::read_to_string(gateway.log_path())
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains("CK_gateway_shutdown_disposition"))
+        .map(strip_ansi)
+        .collect()
+}
+
+async fn wait_until_not_running(container_id: &str, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        match container_state(container_id) {
+            Ok(state) if !state.running => return Ok(()),
+            Ok(state) => last = format!("{state:?}"),
+            Err(err) => return Err(err),
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    Err(format!(
+        "container {container_id} still running after {}s: {last}",
+        timeout.as_secs()
+    ))
+}
+
+/// A graceful `SIGTERM` with the retain disposition leaves the sandbox
+/// running with its running intent, and the next gateway re-adopts it through
+/// a supervisor generation handover. The disposition is selected through a
+/// disposition file, read at shutdown: once the file is removed, the next
+/// graceful shutdown of the same gateway falls back to the stop sweep.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn docker_gateway_graceful_retain_restart_readopts_live_sandbox() {
+    let _restarts = GATEWAY_RESTARTS.lock().await;
+    let Some(gateway) = ManagedGateway::from_env().expect("load managed e2e gateway metadata")
+    else {
+        eprintln!("Skipping graceful retain test: e2e gateway is not managed by this test run");
+        return;
+    };
+    let Some(namespace) = std::env::var("OPENSHELL_E2E_SANDBOX_NAMESPACE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        eprintln!("Skipping graceful retain test: Docker e2e sandbox namespace is unavailable");
+        return;
+    };
+
+    let disposition_dir = tempfile::tempdir().expect("disposition dir");
+    let disposition_file = disposition_dir.path().join("shutdown-disposition");
+    std::fs::write(&disposition_file, format!("{RETAIN}\n")).expect("write disposition");
+    let disposition_path = disposition_file
+        .to_str()
+        .expect("utf-8 disposition path")
+        .to_string();
+    let retain_args = ["--shutdown-disposition-file", disposition_path.as_str()];
+
+    // Relaunch the wrapper's gateway with the disposition file. No sandbox
+    // of this test exists yet, so the default sweep of this stop is moot.
+    gateway.stop().expect("stop wrapper gateway");
+    gateway
+        .start_with_args(&retain_args)
+        .expect("start gateway with disposition file");
+    wait_for_healthy(Duration::from_secs(120))
+        .await
+        .expect("gateway with disposition file should start healthy");
+
+    let script = format!(
+        "echo before-retain > {RETAIN_STATE_FILE}; echo {RETAIN_MARKER}; while true; do sleep 1; done"
+    );
+    let mut sandbox = SandboxGuard::create_keep(&["sh", "-lc", &script], RETAIN_MARKER)
+        .await
+        .expect("create long-running sandbox");
+    wait_for_sandbox_phase(&sandbox.name, "Ready", Duration::from_secs(120))
+        .await
+        .expect("sandbox should be Ready before the graceful restart");
+    let container_id =
+        single_container(&namespace, &sandbox.name, "sandbox").expect("sandbox container");
+    let sandbox_id = sandbox_id_label(&container_id).expect("sandbox id label");
+    let initial_state = container_state(&container_id).expect("sandbox container state");
+    assert!(initial_state.running, "sandbox container should be running");
+    let initial_volumes = sandbox_volumes(&sandbox_id).expect("list sandbox volumes");
+    let supervisor_id =
+        wait_for_healthy_supervisor(&namespace, &sandbox.name, Duration::from_secs(60))
+            .await
+            .expect("initial supervisor should be healthy");
+    wait_for_sandbox_exec_contains(
+        &sandbox.name,
+        &["cat", RETAIN_STATE_FILE],
+        "before-retain",
+        Duration::from_secs(120),
+    )
+    .await
+    .expect("sandbox exec should work before the graceful restart");
+
+    // Graceful SIGTERM in retain mode.
+    let receipts_before = disposition_receipts(&gateway).len();
+    gateway
+        .terminate(Duration::from_secs(60))
+        .expect("gateway should exit gracefully on SIGTERM");
+    let receipts = disposition_receipts(&gateway);
+    let receipt = receipts
+        .get(receipts_before..)
+        .and_then(<[String]>::last)
+        .cloned()
+        .unwrap_or_else(|| panic!("no shutdown disposition receipt; receipts: {receipts:?}"));
+    eprintln!("gateway retain: shutdown receipt: {receipt}");
+    assert!(
+        receipt.contains(RETAIN) && receipt.contains("retained=1") && receipt.contains("file"),
+        "retain receipt must carry the mode, source and retained count: {receipt}"
+    );
+    sleep(Duration::from_secs(3)).await;
+    let state = container_state(&container_id).expect("sandbox state after graceful exit");
+    assert!(
+        state.running,
+        "graceful retain shutdown must leave the sandbox running"
+    );
+    assert_eq!(
+        (state.started_at.as_str(), state.restart_count.as_str()),
+        (
+            initial_state.started_at.as_str(),
+            initial_state.restart_count.as_str()
+        ),
+        "graceful retain shutdown must not restart the sandbox workload"
+    );
+
+    // The next gateway re-adopts the sandbox.
+    gateway
+        .start_with_args(&retain_args)
+        .expect("restart gateway after graceful retain");
+    wait_for_healthy(Duration::from_secs(120))
+        .await
+        .expect("gateway should be healthy after graceful retain restart");
+    let replacement =
+        wait_for_healthy_supervisor(&namespace, &sandbox.name, Duration::from_secs(120))
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "{err}\nboundary log:\n{}",
+                    boundary_log_summary(&container_id)
+                )
+            });
+    assert_ne!(
+        replacement, supervisor_id,
+        "gateway startup should replace the stale supervisor sidecar"
+    );
+    if let Err(err) = wait_for_sandbox_phase(&sandbox.name, "Ready", Duration::from_secs(120)).await
+    {
+        panic!(
+            "sandbox did not return to Ready after graceful retain (phase {}): {err}\nboundary log:\n{}",
+            sandbox_phase(&sandbox.name).await,
+            boundary_log_summary(&container_id)
+        );
+    }
+    wait_for_sandbox_exec_contains(
+        &sandbox.name,
+        &["cat", RETAIN_STATE_FILE],
+        "before-retain",
+        Duration::from_secs(120),
+    )
+    .await
+    .unwrap_or_else(|err| {
+        panic!(
+            "sandbox exec failed after graceful retain: {err}\nboundary log:\n{}",
+            boundary_log_summary(&container_id)
+        )
+    });
+    assert_eq!(
+        single_container(&namespace, &sandbox.name, "sandbox").expect("sandbox container"),
+        container_id,
+        "the same sandbox container must be retained"
+    );
+    assert_eq!(
+        sandbox_field(&sandbox.name, "id").await,
+        sandbox_id,
+        "the gateway must re-adopt the same sandbox id"
+    );
+    let state = container_state(&container_id).expect("sandbox state after re-adopt");
+    assert_eq!(
+        (
+            state.running,
+            state.started_at.as_str(),
+            state.restart_count.as_str()
+        ),
+        (
+            true,
+            initial_state.started_at.as_str(),
+            initial_state.restart_count.as_str()
+        ),
+        "re-adoption after graceful retain must not restart the sandbox workload"
+    );
+    assert_eq!(
+        sandbox_volumes(&sandbox_id).expect("list sandbox volumes"),
+        initial_volumes,
+        "sandbox volumes must be retained"
+    );
+    let handover = handover_log_line(&container_id, 2).unwrap_or_else(|err| panic!("{err}"));
+    eprintln!("gateway retain: boundary log: {handover}");
+
+    // A missing disposition file selects the stop sweep on the same gateway.
+    std::fs::remove_file(&disposition_file).expect("remove disposition file");
+    let receipts_before = disposition_receipts(&gateway).len();
+    gateway
+        .terminate(Duration::from_secs(90))
+        .expect("gateway should exit gracefully on SIGTERM");
+    let receipts = disposition_receipts(&gateway);
+    let receipt = receipts
+        .get(receipts_before..)
+        .and_then(<[String]>::last)
+        .cloned()
+        .unwrap_or_else(|| panic!("no sweep receipt; receipts: {receipts:?}"));
+    eprintln!("gateway retain: fallback receipt: {receipt}");
+    assert!(
+        receipt.contains("stop-running-sandboxes"),
+        "a missing disposition file must select the stop sweep: {receipt}"
+    );
+    wait_until_not_running(&container_id, Duration::from_secs(60))
+        .await
+        .expect("the stop sweep should stop the sandbox container");
+
+    // Back to the wrapper's own arguments for cleanup and later tests.
+    gateway.start().expect("restart wrapper gateway");
+    wait_for_healthy(Duration::from_secs(120))
+        .await
+        .expect("wrapper gateway should be healthy");
+    sandbox.cleanup().await;
     let leftovers = sandbox_volumes(&sandbox_id).unwrap_or_default();
     for volume in &leftovers {
         let _ = docker(&["volume", "rm", "-f", volume]);

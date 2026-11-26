@@ -150,6 +150,22 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     compute_driver_socket: Option<PathBuf>,
 
+    /// What graceful shutdown does with running sandboxes:
+    /// `stop-running-sandboxes` (default) or `retain-running-sandboxes`.
+    ///
+    /// Retain skips only the shutdown stop sweep so the next gateway can
+    /// re-adopt live sandboxes; all other shutdown cleanup still runs. Any
+    /// other value selects the stop sweep.
+    #[arg(long, env = "OPENSHELL_GATEWAY_SHUTDOWN_DISPOSITION")]
+    shutdown_disposition: Option<String>,
+
+    /// File holding the shutdown disposition, read when the shutdown signal
+    /// arrives so a host can choose per shutdown. When set it replaces
+    /// `--shutdown-disposition`; a missing, unreadable or unknown file
+    /// selects the stop sweep.
+    #[arg(long, env = "OPENSHELL_GATEWAY_SHUTDOWN_DISPOSITION_FILE")]
+    shutdown_disposition_file: Option<PathBuf>,
+
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
     /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
@@ -583,6 +599,10 @@ fn prepare_server_config_with_drivers(
         guest_tls,
         compute_driver,
         legacy_compute_driver_env_seen,
+        shutdown_disposition: crate::shutdown_disposition::ShutdownDispositionConfig {
+            value: args.shutdown_disposition.clone(),
+            file: args.shutdown_disposition_file.clone(),
+        },
     })
 }
 
@@ -1469,6 +1489,52 @@ mod tests {
             Cli::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
 
         assert!(!cli.run.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn command_reads_shutdown_disposition_from_flags_and_env() {
+        use crate::shutdown_disposition::ShutdownDisposition;
+
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _value = EnvVarGuard::remove("OPENSHELL_GATEWAY_SHUTDOWN_DISPOSITION");
+        let _file = EnvVarGuard::remove("OPENSHELL_GATEWAY_SHUTDOWN_DISPOSITION_FILE");
+
+        let cli =
+            Cli::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
+        assert_eq!(cli.run.shutdown_disposition, None);
+        assert_eq!(cli.run.shutdown_disposition_file, None);
+
+        // Unknown values are accepted by the parser and resolve to the sweep.
+        let cli = Cli::try_parse_from([
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--shutdown-disposition",
+            "not-a-mode",
+        ])
+        .unwrap();
+        assert_eq!(cli.run.shutdown_disposition.as_deref(), Some("not-a-mode"));
+
+        let _value = EnvVarGuard::set(
+            "OPENSHELL_GATEWAY_SHUTDOWN_DISPOSITION",
+            ShutdownDisposition::RETAIN,
+        );
+        let _file = EnvVarGuard::set(
+            "OPENSHELL_GATEWAY_SHUTDOWN_DISPOSITION_FILE",
+            "/run/openshell/disposition",
+        );
+        let cli =
+            Cli::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
+        assert_eq!(
+            cli.run.shutdown_disposition.as_deref(),
+            Some(ShutdownDisposition::RETAIN)
+        );
+        assert_eq!(
+            cli.run.shutdown_disposition_file,
+            Some(std::path::PathBuf::from("/run/openshell/disposition"))
+        );
     }
 
     #[test]
