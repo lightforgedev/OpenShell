@@ -335,13 +335,11 @@ where
 
 fn emit_stale_relay_close(request: &L7EvalContext, guard: &PolicyGenerationGuard) {
     // `wait_until_stale` also returns when the generation channel closes; that
-    // is an engine teardown, reported with the policy counters it observed.
+    // is an engine teardown with its own cause, not a policy change.
     let error = guard.ensure_current().err().unwrap_or_else(|| {
-        miette::miette!(
-            "policy generation channel closed [captured_generation:{} current_generation:{}]",
-            guard.captured_generation(),
-            guard.current_generation(),
-        )
+        miette::Report::new(crate::opa::GenerationChannelClosed {
+            captured_generation: guard.captured_generation(),
+        })
     });
     emit_l7_tunnel_close_after_stale_state(&request.host, request.port, error);
 }

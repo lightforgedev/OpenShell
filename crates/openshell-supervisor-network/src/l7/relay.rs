@@ -19,7 +19,7 @@ use crate::l7::middleware::{
 use crate::l7::provider::{L7Provider, RelayOutcome};
 use crate::l7::rest::WebSocketExtensionMode;
 use crate::l7::{EndpointObserver, EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
-use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
+use crate::opa::{GuardStaleness, PolicyGenerationGuard, TunnelPolicyEngine};
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::endpoint_status::{EndpointObservationSender, EndpointResult};
@@ -1586,7 +1586,7 @@ where
         return Ok(());
     };
     if let Err(error) = guard.ensure_current() {
-        emit_policy_reload(guard, host, port, &options.policy_name);
+        emit_l7_stale_tunnel_close(guard, host, port, &options.policy_name);
         if let Some(session) = options.middleware_session.take() {
             session
                 .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
@@ -2060,11 +2060,36 @@ fn close_if_stale(guard: &PolicyGenerationGuard, ctx: &L7EvalContext) -> bool {
         return false;
     }
 
-    emit_policy_reload(guard, &ctx.host, ctx.port, &ctx.policy_name);
+    emit_l7_stale_tunnel_close(guard, &ctx.host, ctx.port, &ctx.policy_name);
     true
 }
 
-pub(crate) fn emit_policy_reload(
+/// OCSF message for an L7 tunnel closed by a stale guard. Reports the counter
+/// pair that actually changed so a credential-epoch close is never shown as a
+/// policy reload with equal policy generations.
+pub(crate) fn stale_tunnel_close_message(
+    guard: &PolicyGenerationGuard,
+    host: &str,
+    port: u16,
+) -> String {
+    match guard.staleness() {
+        Some(staleness @ GuardStaleness::CredentialEpoch { captured, current }) => format!(
+            "L7 tunnel closed after provider credential rotation [cause:{} host:{host} port:{port} captured_credential_epoch:{captured} current_credential_epoch:{current}]",
+            staleness.cause(),
+        ),
+        Some(staleness @ GuardStaleness::PolicyGeneration { captured, current }) => format!(
+            "L7 tunnel closed after policy reload [cause:{} host:{host} port:{port} captured_generation:{captured} current_generation:{current}]",
+            staleness.cause(),
+        ),
+        None => format!(
+            "L7 tunnel closed after policy reload [cause:policy_generation_stale host:{host} port:{port} captured_generation:{} current_generation:{}]",
+            guard.captured_generation(),
+            guard.current_generation(),
+        ),
+    }
+}
+
+pub(crate) fn emit_l7_stale_tunnel_close(
     guard: &PolicyGenerationGuard,
     host: &str,
     port: u16,
@@ -2079,13 +2104,7 @@ pub(crate) fn emit_policy_reload(
             .status(StatusId::Failure)
             .dst_endpoint(Endpoint::from_domain(host, port))
             .firewall_rule(policy_name, "l7")
-            .message(format!(
-                "L7 tunnel closed after policy reload [host:{} port:{} captured_generation:{} current_generation:{}]",
-                host,
-                port,
-                guard.captured_generation(),
-                guard.current_generation(),
-            ))
+            .message(stale_tunnel_close_message(guard, host, port))
             .build()
     );
 }
@@ -2102,7 +2121,7 @@ pub(crate) async fn finalize_websocket_pre_upgrade(
         Ok(value @ RelayOutcome::Upgraded { .. }) => Ok(value),
         Ok(value) => {
             if let Err(error) = guard.ensure_current() {
-                emit_policy_reload(guard, host, port, policy_name);
+                emit_l7_stale_tunnel_close(guard, host, port, policy_name);
                 if let Some(session) = session.take() {
                     session
                         .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
@@ -2115,7 +2134,7 @@ pub(crate) async fn finalize_websocket_pre_upgrade(
         }
         Err(error) => {
             let reason = if guard.is_stale() {
-                emit_policy_reload(guard, host, port, policy_name);
+                emit_l7_stale_tunnel_close(guard, host, port, policy_name);
                 openshell_core::proto::MiddlewareSessionEndReason::PolicyReload
             } else {
                 openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure
@@ -3065,13 +3084,7 @@ fn evaluate_l7_request_once(
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
 ) -> Result<(bool, String)> {
-    if engine.is_stale() {
-        return Err(miette!(
-            "L7 tunnel policy generation is stale [captured_generation:{} current_generation:{}]",
-            engine.captured_generation(),
-            engine.current_generation(),
-        ));
-    }
+    engine.generation_guard().ensure_current()?;
 
     let input = serde_json::json!({
         "network": {
@@ -3349,6 +3362,56 @@ where
     client.write_all(response).await.into_diagnostic()?;
     client.flush().await.into_diagnostic()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod stale_close_message_tests {
+    use super::stale_tunnel_close_message;
+    use crate::opa::OpaEngine;
+
+    const POLICY: &str = include_str!("../../data/sandbox-policy.rego");
+    const DATA: &str = include_str!("../../testdata/sandbox-policy.yaml");
+
+    /// #471: an active credential-dependent L7 tunnel closed by a
+    /// credential-only activation reports the credential epoch pair, not a
+    /// policy reload with equal generations.
+    #[test]
+    fn l7_close_reports_credential_epoch_not_policy_reload() {
+        let engine = OpaEngine::from_strings(POLICY, DATA).expect("load policy");
+        let generation = engine.current_generation();
+        let tunnel = engine
+            .clone_engine_for_tunnel(generation)
+            .expect("tunnel engine");
+        engine
+            .activate_credentials(|| {})
+            .expect("activate credentials");
+
+        let message = stale_tunnel_close_message(tunnel.generation_guard(), "api.example.com", 443);
+        assert!(
+            message.contains("after provider credential rotation")
+                && message.contains("cause:credential_epoch_stale")
+                && message.contains("captured_credential_epoch:0")
+                && message.contains("current_credential_epoch:1"),
+            "{message}"
+        );
+        assert!(!message.contains("policy reload"), "{message}");
+
+        let reloaded = engine
+            .clone_engine_for_tunnel(generation)
+            .expect("rebound tunnel engine");
+        engine.reload(POLICY, DATA).expect("policy reload");
+        let current = engine.current_generation();
+        let message =
+            stale_tunnel_close_message(reloaded.generation_guard(), "api.example.com", 443);
+        assert!(
+            message.contains("after policy reload")
+                && message.contains("cause:policy_generation_stale")
+                && message.contains(&format!("captured_generation:{generation}"))
+                && message.contains(&format!("current_generation:{current}")),
+            "{message}"
+        );
+        assert!(!message.contains("credential"), "{message}");
+    }
 }
 
 #[cfg(test)]

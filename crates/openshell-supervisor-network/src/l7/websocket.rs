@@ -1142,7 +1142,7 @@ fn ensure_generation_guard_current(
         return Ok(());
     };
     guard.ensure_current().map_err(|error| {
-        crate::l7::relay::emit_policy_reload(guard, host, port, policy_name);
+        crate::l7::relay::emit_l7_stale_tunnel_close(guard, host, port, policy_name);
         terminate(WebSocketTerminationCause::PolicyReload, error)
     })
 }

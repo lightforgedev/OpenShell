@@ -251,6 +251,7 @@ impl ProviderProfile {
 pub enum DenyGroup {
     Bypass,
     ConnectPolicy,
+    CredentialStale,
     ForwardPolicy,
     L7ParseRejection,
     L7Policy,
@@ -265,6 +266,7 @@ impl DenyGroup {
         match self {
             Self::Bypass => "bypass",
             Self::ConnectPolicy => "connect_policy",
+            Self::CredentialStale => "credential_stale",
             Self::ForwardPolicy => "forward_policy",
             Self::L7ParseRejection => "l7_parse_rejection",
             Self::L7Policy => "l7_policy",
@@ -284,6 +286,7 @@ impl DenyGroup {
             "ssrf" => Self::Ssrf,
             "bypass" => Self::Bypass,
             "policy_stale" => Self::PolicyStale,
+            "credential_stale" => Self::CredentialStale,
             _ => Self::Unknown,
         }
     }

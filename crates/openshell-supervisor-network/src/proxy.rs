@@ -2651,12 +2651,15 @@ async fn handle_mediated_connection(
             &host_lc,
             port,
             activity_tx.as_ref(),
-            miette::miette!(
-                "policy changed while CONNECT was dialing upstream \
-                 [captured_generation:{} current_generation:{}]",
-                connect_generation_guard.captured_generation(),
-                connect_generation_guard.current_generation(),
-            ),
+            connect_generation_guard
+                .ensure_current()
+                .err()
+                .unwrap_or_else(|| {
+                    miette::Report::new(crate::opa::GenerationChannelClosed {
+                        captured_generation: connect_generation_guard.captured_generation(),
+                    })
+                })
+                .wrap_err("CONNECT upstream dial interrupted"),
         )
         .await?;
         return Ok(());
@@ -3453,16 +3456,29 @@ fn authorize_egress_intent(
 /// credential-epoch closes distinct; untyped errors are generation mismatches
 /// detected before a guard exists and are reported as policy changes.
 fn stale_close_evidence(error: &miette::Report) -> (&'static str, String) {
-    let (group, cause, reason) = match error.downcast_ref::<crate::opa::GuardStaleness>() {
-        Some(staleness @ crate::opa::GuardStaleness::CredentialEpoch { .. }) => (
+    use crate::opa::{GenerationChannelClosed, GuardStaleness};
+    // Walk the chain so a staleness wrapped with context keeps its cause.
+    let staleness = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<GuardStaleness>().copied());
+    let channel_closed = error
+        .chain()
+        .any(|cause| cause.downcast_ref::<GenerationChannelClosed>().is_some());
+    let (group, cause, reason) = match staleness {
+        Some(staleness @ GuardStaleness::CredentialEpoch { .. }) => (
             staleness.activity_group(),
             staleness.cause(),
             "provider credentials rotated",
         ),
-        Some(staleness @ crate::opa::GuardStaleness::PolicyGeneration { .. }) => (
+        Some(staleness @ GuardStaleness::PolicyGeneration { .. }) => (
             staleness.activity_group(),
             staleness.cause(),
             "policy changed",
+        ),
+        None if channel_closed => (
+            "policy_stale",
+            "generation_channel_closed",
+            "the policy engine shut down",
         ),
         None => ("policy_stale", "policy_generation_stale", "policy changed"),
     };
@@ -6673,6 +6689,37 @@ mod tests {
             "{message}"
         );
         assert!(!message.contains("credential"), "{message}");
+    }
+
+    #[test]
+    fn stale_close_evidence_keeps_cause_through_context_and_channel_close() {
+        use miette::WrapErr as _;
+        let wrapped = Err::<(), _>(miette::Report::new(
+            crate::opa::GuardStaleness::CredentialEpoch {
+                captured: 2,
+                current: 3,
+            },
+        ))
+        .wrap_err("forward relay setup")
+        .unwrap_err();
+        let (group, message) = stale_close_evidence(&wrapped);
+        assert_eq!(group, "credential_stale");
+        assert!(
+            message.contains("[cause:credential_epoch_stale]"),
+            "{message}"
+        );
+
+        let closed = miette::Report::new(crate::opa::GenerationChannelClosed {
+            captured_generation: 7,
+        });
+        let (group, message) = stale_close_evidence(&closed);
+        assert_eq!(group, "policy_stale");
+        assert!(
+            message.contains("[cause:generation_channel_closed]")
+                && message.contains("captured_generation:7")
+                && !message.contains("policy changed"),
+            "{message}"
+        );
     }
 
     #[test]

@@ -231,6 +231,14 @@ impl GuardStaleness {
     }
 }
 
+/// The guard's generation channel closed (engine teardown) while a relay was
+/// waiting for staleness. Distinct from a policy or credential change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, miette::Diagnostic)]
+#[error("policy generation channel closed [captured_generation:{captured_generation}]")]
+pub struct GenerationChannelClosed {
+    pub captured_generation: u64,
+}
+
 /// Generation guard captured when an HTTP tunnel or request path starts.
 #[derive(Clone, Debug)]
 ///
