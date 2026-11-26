@@ -5,7 +5,9 @@
 
 use super::{EgressDecision, L7RouteSnapshot, emit_l7_tunnel_close_after_policy_change};
 use crate::l7::relay::L7EvalContext;
-use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard, TunnelPolicyEngine};
+use crate::opa::{
+    CredentialDependency, NetworkAction, OpaEngine, PolicyGenerationGuard, TunnelPolicyEngine,
+};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::activity::ActivitySender;
 use openshell_core::endpoint_status::EndpointObservationSender;
@@ -104,11 +106,16 @@ pub(super) fn http_context(
 }
 
 /// Pin a generation for a relay or the forward HTTP single-request path.
+///
+/// `dependency` must be [`CredentialDependency::Dependent`] for any path that
+/// can resolve or inject provider credentials, so a credential-only
+/// activation still closes it.
 pub(super) fn pin_policy_generation(
     opa_engine: &OpaEngine,
     expected_generation: u64,
+    dependency: CredentialDependency,
 ) -> Result<PolicyGenerationGuard> {
-    opa_engine.generation_guard(expected_generation)
+    opa_engine.generation_guard_for(expected_generation, dependency)
 }
 
 /// Clone an L7 evaluator for a relay or the forward HTTP single-request path.
@@ -178,7 +185,12 @@ pub(super) fn prepare_http_relay<'a>(
             evaluator: Box::new(evaluator),
         }
     } else {
-        let generation_guard = match pin_policy_generation(opa_engine, decision.policy_generation) {
+        // Passthrough HTTP still rewrites credential placeholders.
+        let generation_guard = match pin_policy_generation(
+            opa_engine,
+            decision.policy_generation,
+            CredentialDependency::Dependent,
+        ) {
             Ok(guard) => guard,
             Err(error) => {
                 emit_l7_tunnel_close_after_policy_change(
@@ -202,10 +214,15 @@ pub(super) fn prepare_http_relay<'a>(
 /// Pin the generation used by a raw relay so policy activation or quarantine
 /// closes streams that otherwise have no request boundary at which to notice
 /// a stale decision.
+///
+/// A raw relay copies bytes and never resolves or injects credentials; the
+/// caller passes [`CredentialDependency::Dependent`] only when the endpoint is
+/// credential-bound (an explicitly allowed uninspected credential route).
 pub(super) fn prepare_raw_relay(
     route: Option<&L7RouteSnapshot>,
     opa_engine: &OpaEngine,
     decision: &EgressDecision,
+    dependency: CredentialDependency,
 ) -> Option<PolicyGenerationGuard> {
     if let Err(error) = validate_route_generation(route, decision.policy_generation) {
         emit_l7_tunnel_close_after_policy_change(
@@ -216,7 +233,7 @@ pub(super) fn prepare_raw_relay(
         return None;
     }
 
-    match pin_policy_generation(opa_engine, decision.policy_generation) {
+    match pin_policy_generation(opa_engine, decision.policy_generation, dependency) {
         Ok(guard) => Some(guard),
         Err(error) => {
             emit_l7_tunnel_close_after_policy_change(
@@ -456,7 +473,13 @@ mod tests {
         };
 
         assert!(
-            prepare_raw_relay(Some(&route), &engine, &decision).is_none(),
+            prepare_raw_relay(
+                Some(&route),
+                &engine,
+                &decision,
+                CredentialDependency::Independent
+            )
+            .is_none(),
             "a raw relay must not freshen a stale L4 allow"
         );
     }
@@ -496,6 +519,141 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), relay)
             .await
             .expect("raw relay should close when its generation becomes stale")
+            .expect("relay task should not panic")
+            .expect("stale relay closure should be clean");
+    }
+
+    /// Regression for WP-6 H5: the in-sandbox `session-create` POST crossed a
+    /// `tls: skip` passthrough route while a provider-env-only settings poll
+    /// activated credentials. The raw tunnel has no credential dependency, so
+    /// it must carry the full exchange instead of closing as stale.
+    #[tokio::test]
+    async fn h5_passthrough_tunnel_survives_provider_env_only_activation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
+        let decision = decision(engine.current_generation());
+        let guard = prepare_raw_relay(None, &engine, &decision, CredentialDependency::Independent)
+            .expect("current generation should pin a raw relay");
+        assert_eq!(
+            guard.credential_dependency(),
+            CredentialDependency::Independent
+        );
+        let request = request_context();
+        let (mut client_peer, mut proxy_client) = tokio::io::duplex(1024);
+        let (mut upstream_peer, mut proxy_upstream) = tokio::io::duplex(1024);
+        let relay_guard = guard.clone();
+        let relay = tokio::spawn(async move {
+            relay_tcp(
+                &mut proxy_client,
+                &mut proxy_upstream,
+                &relay_guard,
+                &request,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+
+        // Provider-env-only revision: same policy, new credential epoch.
+        engine.activate_credentials(|| {}).unwrap();
+        assert!(!guard.is_stale());
+
+        let request_bytes = b"POST /api/v1/sessions HTTP/1.1\r\nHost: host.docker.internal\r\n\r\n";
+        client_peer.write_all(request_bytes).await.unwrap();
+        let mut received = vec![0; request_bytes.len()];
+        upstream_peer.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, request_bytes);
+        let response_bytes = b"HTTP/1.1 201 Created\r\ncontent-length: 0\r\n\r\n";
+        upstream_peer.write_all(response_bytes).await.unwrap();
+        let mut returned = vec![0; response_bytes.len()];
+        client_peer.read_exact(&mut returned).await.unwrap();
+        assert_eq!(returned, response_bytes);
+
+        drop(client_peer);
+        drop(upstream_peer);
+        tokio::time::timeout(std::time::Duration::from_secs(5), relay)
+            .await
+            .expect("relay ends when both peers close")
+            .expect("relay task should not panic")
+            .expect("tunnel should complete cleanly");
+        assert!(!guard.is_stale());
+    }
+
+    #[tokio::test]
+    async fn credential_bound_raw_relay_closes_on_provider_env_activation() {
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
+        let decision = decision(engine.current_generation());
+        let guard = prepare_raw_relay(None, &engine, &decision, CredentialDependency::Dependent)
+            .expect("current generation should pin a raw relay");
+        let request = request_context();
+        // Peers stay open: only staleness can end this relay.
+        let (_client_peer, mut proxy_client) = tokio::io::duplex(64);
+        let (_upstream_peer, mut proxy_upstream) = tokio::io::duplex(64);
+        let relay = tokio::spawn(async move {
+            relay_tcp(&mut proxy_client, &mut proxy_upstream, &guard, &request).await
+        });
+        tokio::task::yield_now().await;
+
+        engine.activate_credentials(|| {}).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), relay)
+            .await
+            .expect("credential-bound relay should close on a new credential epoch")
+            .expect("relay task should not panic")
+            .expect("stale relay closure should be clean");
+    }
+
+    #[test]
+    fn credential_capable_http_relays_bind_the_credential_epoch() {
+        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let decision = decision(engine.current_generation());
+        let request = request_context();
+        let context = prepare_http_relay(None, &engine, &decision, &request)
+            .expect("current generation should prepare a relay");
+        let PreparedHttpPolicy::Passthrough { generation_guard } = context.policy else {
+            panic!("route-less relay should use a generation guard");
+        };
+        assert_eq!(
+            generation_guard.credential_dependency(),
+            CredentialDependency::Dependent,
+            "passthrough HTTP rewrites credential placeholders"
+        );
+        let evaluator = pin_l7_evaluator(&engine, decision.policy_generation).unwrap();
+        assert_eq!(evaluator.captured_credential_epoch(), Some(0));
+
+        engine.activate_credentials(|| {}).unwrap();
+
+        assert!(generation_guard.is_stale());
+        assert!(evaluator.is_stale());
+        // Relays prepared after the activation bind the new epoch.
+        let context = prepare_http_relay(None, &engine, &decision, &request)
+            .expect("policy is unchanged, so a new relay can start");
+        let PreparedHttpPolicy::Passthrough { generation_guard } = context.policy else {
+            panic!("route-less relay should use a generation guard");
+        };
+        assert_eq!(generation_guard.captured_credential_epoch(), Some(1));
+        assert!(!generation_guard.is_stale());
+    }
+
+    #[tokio::test]
+    async fn policy_only_raw_relay_still_closes_on_policy_reload() {
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
+        let decision = decision(engine.current_generation());
+        let guard = prepare_raw_relay(None, &engine, &decision, CredentialDependency::Independent)
+            .expect("current generation should pin a raw relay");
+        let request = request_context();
+        let (_client_peer, mut proxy_client) = tokio::io::duplex(64);
+        let (_upstream_peer, mut proxy_upstream) = tokio::io::duplex(64);
+        let relay = tokio::spawn(async move {
+            relay_tcp(&mut proxy_client, &mut proxy_upstream, &guard, &request).await
+        });
+        tokio::task::yield_now().await;
+
+        engine.reload(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), relay)
+            .await
+            .expect("an actual policy change still closes raw relays")
             .expect("relay task should not panic")
             .expect("stale relay closure should be clean");
     }

@@ -9,7 +9,7 @@ mod relay;
 
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
-use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
+use crate::opa::{CredentialDependency, NetworkAction, OpaEngine, PolicyGenerationGuard};
 #[cfg(target_os = "linux")]
 use crate::policy_dns::PolicyEndpointId;
 use crate::policy_dns::{MappingLookupError, ResolvedEndpointStore};
@@ -939,9 +939,16 @@ async fn handle_transparent_tcp_connection(
     // generation before correlating endpoint identity or constructing a
     // connector. This prevents combining an old DNS answer with a newer
     // policy decision (or vice versa).
-    let Ok(generation_guard) =
-        relay::pin_policy_generation(&opa_engine, decision.policy_generation)
-    else {
+    // Transparent TCP is a raw relay: it never resolves or injects provider
+    // credentials, so only a credential-bound endpoint couples it to the
+    // credential epoch.
+    let credential_dependency =
+        raw_relay_credential_dependency(&opa_engine, &decision, &host, port);
+    let Ok(generation_guard) = relay::pin_policy_generation(
+        &opa_engine,
+        decision.policy_generation,
+        credential_dependency,
+    ) else {
         emit_transparent_mapping_denial(workload_addr, original, MappingLookupError::StalePolicy);
         emit_activity(&activity_tx, true, "transparent_tcp_mapping");
         return Ok(());
@@ -2419,21 +2426,22 @@ async fn handle_mediated_connection(
         return Ok(());
     }
 
-    let connect_generation_guard =
-        match relay::pin_policy_generation(&opa_engine, decision.policy_generation) {
-            Ok(guard) => guard,
-            Err(error) => {
-                reject_stale_connect_policy(
-                    &mut client,
-                    &host_lc,
-                    port,
-                    activity_tx.as_ref(),
-                    error,
-                )
+    // This guard covers authorization through relay startup only. No provider
+    // credential material is read in that window, and every relay below
+    // re-pins its own guard with the matching credential dependency, so a
+    // credential-only activation must not reject the CONNECT here.
+    let connect_generation_guard = match relay::pin_policy_generation(
+        &opa_engine,
+        decision.policy_generation,
+        CredentialDependency::Independent,
+    ) {
+        Ok(guard) => guard,
+        Err(error) => {
+            reject_stale_connect_policy(&mut client, &host_lc, port, activity_tx.as_ref(), error)
                 .await?;
-                return Ok(());
-            }
-        };
+            return Ok(());
+        }
+    };
 
     // Resolve the route's TLS treatment up front. `query_tls_mode` reads only
     // the policy decision + host/port (no peeked bytes), so it is valid before
@@ -2444,6 +2452,7 @@ async fn handle_mediated_connection(
     hydrate_tls_mode(&mut decision);
     let effective_tls_skip = decision.endpoint.tls_mode == crate::l7::TlsMode::Skip;
     let credential_guard = query_endpoint_credential_guard(&opa_engine, &decision, &host_lc, port)?;
+    let raw_relay_dependency = credential_dependency_for_raw_relay(credential_guard);
     // Route materialization is safe before destination dialing and lets an
     // unambiguous MCP authority report local fail-closed outcomes that occur
     // before the HTTP request path becomes available.
@@ -2745,7 +2754,8 @@ async fn handle_mediated_connection(
             port = port,
             "tls: skip — bypassing TLS auto-detection, raw tunnel"
         );
-        let Some(generation_guard) = relay::prepare_raw_relay(l7_route, &opa_engine, &decision)
+        let Some(generation_guard) =
+            relay::prepare_raw_relay(l7_route, &opa_engine, &decision, raw_relay_dependency)
         else {
             return Ok(());
         };
@@ -2961,7 +2971,8 @@ async fn handle_mediated_connection(
             port = port,
             "Non-TLS non-HTTP traffic detected, raw tunnel"
         );
-        let Some(generation_guard) = relay::prepare_raw_relay(l7_route, &opa_engine, &decision)
+        let Some(generation_guard) =
+            relay::prepare_raw_relay(l7_route, &opa_engine, &decision, raw_relay_dependency)
         else {
             return Ok(());
         };
@@ -3599,6 +3610,37 @@ fn query_tls_mode(decision: &EgressDecision, _host: &str, _port: u16) -> crate::
         .policy_configs
         .first()
         .map_or(crate::l7::TlsMode::Auto, crate::l7::parse_tls_mode)
+}
+
+/// Credential dependency of a raw relay to an endpoint with `guard`.
+///
+/// Raw relays copy bytes and never resolve or inject provider credentials.
+/// A credential-bound endpoint (reachable raw only through an explicit
+/// uninspected-credential allowance) still couples the relay to the
+/// credential epoch so credential rotation or revocation closes it.
+fn credential_dependency_for_raw_relay(
+    guard: crate::l7::EndpointCredentialGuard,
+) -> CredentialDependency {
+    if guard.provider_credentialed {
+        CredentialDependency::Dependent
+    } else {
+        CredentialDependency::Independent
+    }
+}
+
+/// Fail-closed raw-relay credential dependency: an endpoint whose credential
+/// binding cannot be determined is treated as credential-dependent.
+#[cfg(target_os = "linux")]
+fn raw_relay_credential_dependency(
+    engine: &OpaEngine,
+    decision: &EgressDecision,
+    host: &str,
+    port: u16,
+) -> CredentialDependency {
+    query_endpoint_credential_guard(engine, decision, host, port)
+        .map_or(CredentialDependency::Dependent, |guard| {
+            credential_dependency_for_raw_relay(guard)
+        })
 }
 
 fn query_endpoint_credential_guard(
@@ -5104,9 +5146,11 @@ async fn handle_forward_proxy(
         "Forward proxy L4 policy decision"
     );
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
+    // Forward HTTP can rewrite credential placeholders on every request.
     let forward_generation_guard = match relay::pin_policy_generation(
         &opa_engine,
         decision.policy_generation,
+        CredentialDependency::Dependent,
     ) {
         Ok(guard) => guard,
         Err(e) => {
