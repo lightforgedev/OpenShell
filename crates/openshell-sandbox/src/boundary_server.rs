@@ -768,8 +768,15 @@ mod linux {
                     stream,
                     runtime: runtime.process_runtime.clone(),
                 };
-                if let Err(error) = serve_one(stream, &runtime, &principal) {
-                    tracing::warn!(%error, "Boundary gRPC exchange failed");
+                let mut phase = "read";
+                if let Err(error) = serve_one(stream, &runtime, &principal, &mut phase) {
+                    runtime.log_exchange_failure(
+                        "CK_boundary_exchange_failed",
+                        phase,
+                        &principal,
+                        &error,
+                        "Boundary gRPC exchange failed",
+                    );
                 }
             });
             Ok(tonic::Response::new(response))
@@ -788,8 +795,16 @@ mod linux {
                 bridge_grpc_server_stream(request.into_inner(), self.connection_closed.clone());
             let runtime = self.runtime.clone();
             tokio::spawn(async move {
+                let log_runtime = runtime.clone();
+                let log_principal = principal.clone();
                 if let Err(error) = serve_persistent_mediation(stream, runtime, principal).await {
-                    tracing::warn!(%error, "Persistent boundary mediation ended");
+                    log_runtime.log_exchange_failure(
+                        "CK_boundary_mediation_ended",
+                        "mediate",
+                        &log_principal,
+                        &error,
+                        "Persistent boundary mediation ended",
+                    );
                 }
             });
             Ok(tonic::Response::new(response))
@@ -1057,16 +1072,23 @@ mod linux {
         routes.lock().await.remove(&stream_id);
     }
 
+    /// Serve one control exchange. `phase` is updated to the request being
+    /// served so a failure can be attributed in logs.
     fn serve_one(
         mut stream: ControlStream,
-        runtime: &BoundaryRuntime,
+        runtime: &Arc<BoundaryRuntime>,
         principal: &SandboxProtocolPrincipal,
+        phase: &mut &'static str,
     ) -> Result<(), String> {
         stream
             .set_timeout(CONTROL_IO_TIMEOUT)
             .map_err(|error| format!("set control timeout: {error}"))?;
         let request: RequestEnvelope =
             read_frame(&mut stream).map_err(|error| format!("read control frame: {error}"))?;
+        *phase = request_phase(&request.request);
+        // A rejected request drops the stream. The supervisor treats that as
+        // a transport loss and re-attaches, which also covers a reconnect
+        // racing the boundary's view of the previous transport.
         runtime.authorize_request(principal, &request.request)?;
         if request.validate_payload_digest().is_err() {
             let response = ResponseEnvelope {
@@ -1257,23 +1279,27 @@ mod linux {
             }
             _ => {}
         }
-        let supervisor_instance_id = match &request.request {
+        let attach = match &request.request {
             Request::Attach {
                 supervisor_instance_id,
+                supervisor_generation,
                 ..
-            } => Some(*supervisor_instance_id),
+            } => Some((*supervisor_instance_id, supervisor_generation.clone())),
             _ => None,
         };
-        let is_attach = supervisor_instance_id.is_some();
         let is_confirm = matches!(&request.request, Request::Confirm);
         let response = ResponseEnvelope {
             request_id: request.request_id.clone(),
             response: runtime.dispatch(request),
         };
-        if is_attach && matches!(&response.response, Response::Attached { .. }) {
-            let supervisor_instance_id = supervisor_instance_id
-                .ok_or_else(|| "attach request lost supervisor instance identity".to_string())?;
-            runtime.commit_attach(principal, supervisor_instance_id)?;
+        if let Some((supervisor_instance_id, supervisor_generation)) = attach
+            && matches!(&response.response, Response::Attached { .. })
+        {
+            runtime.commit_attach_generation(
+                principal,
+                supervisor_instance_id,
+                supervisor_generation.as_ref(),
+            )?;
         }
         if is_confirm && matches!(&response.response, Response::Confirmed { .. }) {
             runtime.commit_confirm(principal)?;
@@ -1281,6 +1307,66 @@ mod linux {
         write_frame(&mut stream, &response)
             .map_err(|error| format!("write control frame: {error}"))?;
         Ok(())
+    }
+
+    fn request_phase(request: &Request) -> &'static str {
+        match request {
+            Request::DiscoverPolicy => "discover_policy",
+            Request::Attach { .. } => "attach",
+            Request::Confirm => "confirm",
+            Request::StartAgent { .. } => "start_agent",
+            Request::UpdateProviderEnvironment { .. } => "update_provider_environment",
+            Request::AttachProcess { .. } => "attach_process",
+            Request::Wait { .. } => "wait",
+            Request::Signal { .. } => "signal",
+            Request::Terminate { .. } => "terminate",
+            Request::TerminateBoundary => "terminate_boundary",
+            Request::Exec { .. } => "exec",
+            Request::ExecSignal { .. } => "exec_signal",
+            Request::Resize { .. } => "resize",
+            Request::LoopbackConnect { .. } => "loopback_connect",
+            Request::AcceptNetwork => "accept_network",
+            Request::OpenMediation => "open_mediation",
+        }
+    }
+
+    const MAX_LOGGED_CAUSE_BYTES: usize = 512;
+
+    /// Make an error safe to log: bearer credentials and JWT-shaped tokens
+    /// are replaced, control characters are flattened, and the text is
+    /// bounded.
+    fn redact_cause(cause: &str) -> String {
+        let mut redacted = Vec::new();
+        let mut redact_next = false;
+        for word in cause.split(' ') {
+            let looks_like_jwt = word.starts_with("eyJ") && word.matches('.').count() >= 2;
+            if redact_next || looks_like_jwt {
+                redacted.push("[REDACTED]".to_string());
+            } else {
+                redacted.push(word.to_string());
+            }
+            redact_next = word.eq_ignore_ascii_case("bearer");
+        }
+        let mut text = redacted
+            .join(" ")
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect::<String>();
+        if text.len() > MAX_LOGGED_CAUSE_BYTES {
+            let mut end = MAX_LOGGED_CAUSE_BYTES;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            text.push_str("...");
+        }
+        text
     }
 
     struct BoundaryRuntime {
@@ -1402,12 +1488,18 @@ mod linux {
         /// Provider environment is mutable runtime state. A replacement
         /// control must replay every immutable launch input exactly, then
         /// reconcile the current provider snapshot through the CAS update.
-        fn matches_replay(&self, other: &Self) -> bool {
-            self.sandbox_id == other.sandbox_id
-                && self.spec == other.spec
-                && self.policy == other.policy
-                && self.ca_cert == other.ca_cert
-                && self.ca_bundle == other.ca_bundle
+        /// Names of the immutable launch inputs that differ (never values).
+        fn replay_mismatches(&self, other: &Self) -> Vec<&'static str> {
+            [
+                ("sandbox_id", self.sandbox_id == other.sandbox_id),
+                ("spec", self.spec == other.spec),
+                ("policy", self.policy == other.policy),
+                ("ca_cert", self.ca_cert == other.ca_cert),
+                ("ca_bundle", self.ca_bundle == other.ca_bundle),
+            ]
+            .into_iter()
+            .filter_map(|(field, equal)| (!equal).then_some(field))
+            .collect()
         }
     }
 
@@ -1622,19 +1714,93 @@ mod linux {
             }
         }
 
+        #[cfg(test)]
         fn commit_attach(
-            &self,
+            self: &Arc<Self>,
             principal: &SandboxProtocolPrincipal,
             supervisor_instance_id: openshell_sandbox_backend::boundary_protocol::SupervisorInstanceId,
         ) -> Result<(), String> {
-            if let Some(replaced) = self
-                .connections
-                .attach(principal, supervisor_instance_id)
-                .map_err(|error| error.to_string())?
-            {
+            self.commit_attach_generation(principal, supervisor_instance_id, None)
+        }
+
+        /// Stage an attach under the supervisor generation handover rules.
+        /// A superseded generation's confirmed connection is treated as lost
+        /// supervision (the workload is frozen pending the new generation's
+        /// confirm) and closed before the new generation is accepted.
+        fn commit_attach_generation(
+            self: &Arc<Self>,
+            principal: &SandboxProtocolPrincipal,
+            supervisor_instance_id: openshell_sandbox_backend::boundary_protocol::SupervisorInstanceId,
+            supervisor_generation: Option<
+                &openshell_sandbox_backend::boundary_protocol::SupervisorGeneration,
+            >,
+        ) -> Result<(), String> {
+            let requested = supervisor_generation.map(|generation| generation.generation);
+            let outcome = match self.connections.attach_supervisor(
+                principal,
+                supervisor_instance_id,
+                supervisor_generation,
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let current = self.connections.supervisor_generation();
+                    tracing::warn!(
+                        code = "CK_supervisor_attach_rejected",
+                        phase = "attach",
+                        sandbox_id = %principal.session().sandbox_id.as_str(),
+                        runtime_generation = %self.config.generation,
+                        current_supervisor_generation = ?current,
+                        requested_supervisor_generation = ?requested,
+                        cause = %redact_cause(&error.to_string()),
+                        "Supervisor attach rejected"
+                    );
+                    return Err(error.to_string());
+                }
+            };
+            if let Some(fenced) = outcome.fenced_active {
+                self.begin_supervisor_recovery(fenced);
+                self.close_connection(fenced);
+            }
+            if let Some(replaced) = outcome.replaced_pending {
                 self.close_connection(replaced);
             }
+            if outcome.previous_generation != outcome.generation || outcome.fenced_active.is_some()
+            {
+                tracing::info!(
+                    code = "CK_supervisor_handover_accepted",
+                    phase = "attach",
+                    sandbox_id = %principal.session().sandbox_id.as_str(),
+                    runtime_generation = %self.config.generation,
+                    previous_supervisor_generation = ?outcome.previous_generation,
+                    supervisor_generation = ?outcome.generation,
+                    fenced_active = outcome.fenced_active.is_some(),
+                    "Supervisor generation accepted"
+                );
+            }
             Ok(())
+        }
+
+        /// Log a failed exchange with its attribution. Every line carries the
+        /// CK code, the request phase, the sandbox and both generations, and a
+        /// redacted cause.
+        fn log_exchange_failure(
+            &self,
+            code: &'static str,
+            phase: &str,
+            principal: &SandboxProtocolPrincipal,
+            error: &str,
+            message: &'static str,
+        ) {
+            let supervisor_generation = self.connections.supervisor_generation();
+            tracing::warn!(
+                code,
+                phase,
+                sandbox_id = %principal.session().sandbox_id.as_str(),
+                runtime_generation = %self.config.generation,
+                supervisor_generation = ?supervisor_generation,
+                cause = %redact_cause(error),
+                "{message}"
+            );
         }
 
         fn commit_confirm(&self, principal: &SandboxProtocolPrincipal) -> Result<(), String> {
@@ -1702,7 +1868,13 @@ mod linux {
             if !self.connections.disconnect(connection_id) {
                 return;
             }
+            self.begin_supervisor_recovery(connection_id);
+        }
 
+        /// The confirmed supervisor connection is gone (transport loss or a
+        /// generation handover). Freeze the workload and terminate it unless
+        /// an authenticated supervisor confirms before the deadline.
+        fn begin_supervisor_recovery(self: &Arc<Self>, connection_id: SandboxConnectionId) {
             let recovery_id = self.next_recovery_id.fetch_add(1, Ordering::Relaxed);
             let process = {
                 let state = lock(&self.state);
@@ -1899,6 +2071,7 @@ mod linux {
                 Request::DiscoverPolicy => Self::discover_image_policy(),
                 Request::Attach {
                     supervisor_instance_id: _,
+                    supervisor_generation: _,
                     policy,
                     resource_claims,
                 } => {
@@ -2407,10 +2580,21 @@ mod linux {
                 provider_env: provider_env.clone(),
             };
             if let RuntimeState::Running(process) = &*state {
-                return if lock(&self.started_agent)
+                let mismatches = lock(&self.started_agent)
                     .as_ref()
-                    .is_some_and(|accepted| accepted.matches_replay(&requested))
-                {
+                    .map(|accepted| accepted.replay_mismatches(&requested));
+                if let Some(mismatches) = mismatches.as_ref().filter(|m| !m.is_empty()) {
+                    tracing::warn!(
+                        code = "CK_start_agent_replay_rejected",
+                        phase = "start_agent",
+                        sandbox_id = %requested.sandbox_id,
+                        runtime_generation = %self.config.generation,
+                        supervisor_generation = ?self.connections.supervisor_generation(),
+                        cause = %format!("launch inputs differ: {}", mismatches.join(",")),
+                        "Replacement supervisor launch replay rejected"
+                    );
+                }
+                return if mismatches.is_some_and(|mismatches| mismatches.is_empty()) {
                     Response::Started {
                         process_id: process.process_id(),
                         provider_env_revision: process.provider_credentials.snapshot().revision,
@@ -4034,6 +4218,186 @@ mod linux {
             );
         }
 
+        fn test_supervisor_generation(
+            generation: u64,
+        ) -> openshell_sandbox_backend::boundary_protocol::SupervisorGeneration {
+            openshell_sandbox_backend::boundary_protocol::SupervisorGeneration {
+                sandbox_id: "availability".to_string(),
+                auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
+                generation,
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn supervisor_generation_handover_fences_previous_generation() {
+            let (runtime, token) = availability_test_runtime();
+            let first_id = SandboxConnectionId::new();
+            let first = runtime
+                .authenticate_request(first_id, bearer_request((), &token).metadata())
+                .expect("first principal");
+            let first_instance = test_supervisor_instance_id();
+            runtime
+                .commit_attach_generation(
+                    &first,
+                    first_instance,
+                    Some(&test_supervisor_generation(1)),
+                )
+                .expect("attach generation 1");
+            runtime
+                .commit_confirm(&first)
+                .expect("confirm generation 1");
+            let (first_shutdown, mut first_closed) = tokio::sync::watch::channel(());
+            runtime.register_connection(first_id, first_shutdown);
+
+            // Generation 2 attaches before generation 1's transport is gone.
+            let replacement_id = SandboxConnectionId::new();
+            let replacement = runtime
+                .authenticate_request(replacement_id, bearer_request((), &token).metadata())
+                .expect("replacement principal");
+            runtime
+                .commit_attach_generation(
+                    &replacement,
+                    test_supervisor_instance_id(),
+                    Some(&test_supervisor_generation(2)),
+                )
+                .expect("attach generation 2");
+            assert!(
+                first_closed.has_changed().unwrap_or(true),
+                "generation 1's connection must be closed when it is fenced"
+            );
+            let _ = first_closed.borrow_and_update();
+            let connection = *lock(&runtime.supervisor_connection);
+            let recovery_id = match connection {
+                SupervisorConnectionState::Frozen { recovery_id } => recovery_id,
+                state => panic!("fencing the confirmed generation must freeze, got {state:?}"),
+            };
+            assert!(
+                runtime
+                    .authorize_request(
+                        &first,
+                        &Request::Wait {
+                            process_id: "p".to_string()
+                        }
+                    )
+                    .unwrap_err()
+                    .contains("fenced"),
+                "requests from the fenced generation are rejected with the cause"
+            );
+            assert!(
+                runtime.commit_confirm(&first).is_err(),
+                "a stale-generation confirm is rejected"
+            );
+            // The fenced transport ending later is not a second recovery.
+            runtime.transport_disconnected(first_id);
+            assert_eq!(
+                *lock(&runtime.supervisor_connection),
+                SupervisorConnectionState::Frozen { recovery_id }
+            );
+
+            runtime
+                .commit_confirm(&replacement)
+                .expect("generation 2 confirms");
+            assert_eq!(
+                *lock(&runtime.supervisor_connection),
+                SupervisorConnectionState::Connected(replacement_id)
+            );
+            runtime.expire_recovery(recovery_id).await;
+            assert_eq!(
+                *lock(&runtime.supervisor_connection),
+                SupervisorConnectionState::Connected(replacement_id),
+                "the handover recovery deadline must not terminate a confirmed generation"
+            );
+
+            // Generation 1 reconnecting after generation 2 was accepted.
+            let reconnect = runtime
+                .authenticate_request(
+                    SandboxConnectionId::new(),
+                    bearer_request((), &token).metadata(),
+                )
+                .expect("reconnect principal");
+            assert!(
+                runtime
+                    .commit_attach_generation(
+                        &reconnect,
+                        first_instance,
+                        Some(&test_supervisor_generation(1))
+                    )
+                    .unwrap_err()
+                    .contains("stale")
+            );
+            runtime
+                .connections
+                .require_active(&replacement)
+                .expect("generation 2 remains active");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn supervisor_generation_handover_after_transport_loss() {
+            let (runtime, token) = availability_test_runtime();
+            let first_id = SandboxConnectionId::new();
+            let first = runtime
+                .authenticate_request(first_id, bearer_request((), &token).metadata())
+                .expect("first principal");
+            runtime
+                .commit_attach_generation(
+                    &first,
+                    test_supervisor_instance_id(),
+                    Some(&test_supervisor_generation(1)),
+                )
+                .expect("attach generation 1");
+            runtime
+                .commit_confirm(&first)
+                .expect("confirm generation 1");
+            // The gateway restart removed generation 1's sidecar first.
+            runtime.transport_disconnected(first_id);
+            assert!(matches!(
+                *lock(&runtime.supervisor_connection),
+                SupervisorConnectionState::Frozen { .. }
+            ));
+            let replacement_id = SandboxConnectionId::new();
+            let replacement = runtime
+                .authenticate_request(replacement_id, bearer_request((), &token).metadata())
+                .expect("replacement principal");
+            assert!(
+                runtime
+                    .commit_attach_generation(
+                        &replacement,
+                        test_supervisor_instance_id(),
+                        Some(&test_supervisor_generation(1)),
+                    )
+                    .is_err(),
+                "a new process cannot reuse the current generation"
+            );
+            runtime
+                .commit_attach_generation(
+                    &replacement,
+                    test_supervisor_instance_id(),
+                    Some(&test_supervisor_generation(2)),
+                )
+                .expect("attach generation 2");
+            runtime
+                .commit_confirm(&replacement)
+                .expect("confirm generation 2");
+            assert_eq!(
+                *lock(&runtime.supervisor_connection),
+                SupervisorConnectionState::Connected(replacement_id)
+            );
+        }
+
+        #[test]
+        fn logged_causes_are_redacted_and_bounded() {
+            let jwt = format!("eyJ{}.eyJ{}.{}", "header", "claims", "signature");
+            let redacted = redact_cause(&format!(
+                "rejected Bearer secret-token and {jwt}\nnext line"
+            ));
+            assert!(!redacted.contains("secret-token"), "{redacted}");
+            assert!(!redacted.contains(&jwt), "{redacted}");
+            assert!(!redacted.contains('\n'), "{redacted}");
+            assert!(redacted.contains("rejected Bearer [REDACTED] and [REDACTED]"));
+            let long = redact_cause(&"x".repeat(4096));
+            assert!(long.len() <= MAX_LOGGED_CAUSE_BYTES + 3);
+        }
+
         #[tokio::test(flavor = "multi_thread")]
         async fn expired_recovery_makes_the_session_terminal() {
             let (runtime, token) = availability_test_runtime();
@@ -4571,6 +4935,7 @@ mod linux {
                 supervisor_instance_id: test_supervisor_instance_id(),
                 policy: Box::new(policy),
                 resource_claims: std::collections::BTreeMap::new(),
+                supervisor_generation: None,
             })
             .expect("encode attach request");
             let request_stream = tokio_stream::iter([BoundaryChunk {

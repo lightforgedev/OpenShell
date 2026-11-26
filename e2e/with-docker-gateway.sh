@@ -550,6 +550,12 @@ if connect_current_container_to_docker_network "${DOCKER_NETWORK_NAME}"; then
   SUPERVISOR_GATEWAY_HOST="${GATEWAY_HOST_ALIAS_IP}"
 else
   GATEWAY_HOST_ALIAS_IP=""
+  # Docker Desktop runs host-networked supervisors inside its VM, where
+  # 127.0.0.1 is not the developer host. Let local runs point supervisors at
+  # a host alias such as host.docker.internal (already a default server SAN).
+  if [ -n "${OPENSHELL_E2E_DOCKER_SUPERVISOR_GATEWAY_HOST:-}" ]; then
+    SUPERVISOR_GATEWAY_HOST="${OPENSHELL_E2E_DOCKER_SUPERVISOR_GATEWAY_HOST}"
+  fi
 fi
 
 PKI_DIR="${WORKDIR}/pki"

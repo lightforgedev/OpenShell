@@ -46,9 +46,15 @@ pub fn openshell_bin() -> PathBuf {
 ///
 /// The command has `kill_on_drop(true)` set so that background child processes
 /// are cleaned up when the handle is dropped.
+///
+/// Stdin defaults to `/dev/null`; callers that feed stdin override it. An
+/// inherited stdin is shared with every other CLI the test spawns: the OpenSSH
+/// client behind `sandbox create`/`connect` sets `O_NONBLOCK` on it, after
+/// which a later `sandbox exec` (which reads a non-TTY stdin to EOF) fails
+/// with `EAGAIN` when the test runner's stdin is a pipe.
 pub fn openshell_cmd() -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(openshell_bin());
-    cmd.kill_on_drop(true);
+    cmd.kill_on_drop(true).stdin(std::process::Stdio::null());
     cmd
 }
 

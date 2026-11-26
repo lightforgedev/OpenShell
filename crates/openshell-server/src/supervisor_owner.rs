@@ -201,6 +201,48 @@ impl SupervisorOwnerIndex {
         }
     }
 
+    /// Release every owner record left by a previous gateway process.
+    ///
+    /// Only valid for single-replica stores, where the starting gateway is the
+    /// only possible owner: any existing record belongs to a process that has
+    /// exited (often without releasing it, e.g. on `SIGKILL`). Keeping those
+    /// records would make every re-adopted supervisor wait out [`OWNER_TTL`]
+    /// before its session is accepted. Call before serving supervisors.
+    pub async fn release_all_after_single_replica_restart(&self) -> Result<usize, OwnerError> {
+        if !self.store.is_single_replica() {
+            return Ok(0);
+        }
+        let mut released = 0;
+        loop {
+            let page = self
+                .store
+                .list_by_type(OWNER_OBJECT_TYPE, 256, 0)
+                .await
+                .map_err(OwnerError::Store)?;
+            if page.is_empty() {
+                return Ok(released);
+            }
+            let mut progressed = false;
+            for record in page {
+                match self
+                    .store
+                    .delete_if(OWNER_OBJECT_TYPE, &record.id, record.resource_version)
+                    .await
+                {
+                    Ok(true) => {
+                        released += 1;
+                        progressed = true;
+                    }
+                    Ok(false) | Err(PersistenceError::Conflict { .. }) => {}
+                    Err(error) => return Err(OwnerError::Store(error)),
+                }
+            }
+            if !progressed {
+                return Ok(released);
+            }
+        }
+    }
+
     pub async fn read(&self, sandbox_id: &str) -> Result<Option<OwnerRecord>, OwnerError> {
         let Some(record) = self
             .store
@@ -346,6 +388,35 @@ mod tests {
         let record = index.read("sbx").await.unwrap().unwrap();
         assert_eq!(record.session_id, guard.session_id);
         assert_eq!(record.owner_replica_id, "gw-1");
+    }
+
+    #[tokio::test]
+    async fn single_replica_restart_releases_owner_of_exited_gateway() {
+        let index = test_index(OWNER_TTL).await;
+        index
+            .publish("sbx", "s1", "old-supervisor", 1, "gw-1", "http://gw-1")
+            .await
+            .unwrap();
+        // A fresh record from another supervisor instance blocks takeover.
+        assert!(matches!(
+            index
+                .publish("sbx", "s2", "new-supervisor", 1, "gw-1", "http://gw-1")
+                .await,
+            Err(OwnerError::AlreadyOwned)
+        ));
+
+        assert_eq!(
+            index
+                .release_all_after_single_replica_restart()
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(index.read("sbx").await.unwrap().is_none());
+        index
+            .publish("sbx", "s2", "new-supervisor", 1, "gw-1", "http://gw-1")
+            .await
+            .expect("replacement supervisor owns the session after restart");
     }
 
     #[tokio::test]

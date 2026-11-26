@@ -882,6 +882,26 @@ pub(crate) async fn run_server(
             ))
         })?;
 
+    // A single-replica gateway is the only possible session owner, so owner
+    // records from the previous process are stale. Release them before
+    // supervisors reconnect, or a re-adopted sandbox's replacement supervisor
+    // is refused until the records expire.
+    match supervisor_owner::SupervisorOwnerIndex::new(store.clone(), supervisor_owner::OWNER_TTL)
+        .release_all_after_single_replica_restart()
+        .await
+    {
+        Ok(0) => {}
+        Ok(released) => info!(
+            code = "CK_supervisor_owner_released_at_startup",
+            released, "Released supervisor session owners of the previous gateway process"
+        ),
+        Err(error) => warn!(
+            code = "CK_supervisor_owner_release_failed",
+            %error,
+            "Failed to release supervisor session owners of the previous gateway process"
+        ),
+    }
+
     let gateway_listener = bind_gateway_listener(config.bind_address).await?;
 
     // Create the multiplexed service

@@ -3442,3 +3442,123 @@ async fn different_start_generation_is_rejected() {
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert!(error.message().contains("generation-one"));
 }
+
+fn write_supervisor_generation_fixture(directory: &Path, sandbox_id: &str, auth_epoch: u64) {
+    let mut authentication =
+        serde_json::from_slice::<SandboxLaunchAuthentication>(&test_launch_authentication())
+            .unwrap();
+    authentication.supervisor.auth_epoch = CredentialEpoch::new(auth_epoch).unwrap();
+    fs::write(
+        directory.join(SUPERVISOR_AUTH_BUNDLE_FILE),
+        serde_json::to_vec(&authentication.supervisor).unwrap(),
+    )
+    .unwrap();
+    let descriptor = SandboxRuntimeDescriptor {
+        boundary_id: sandbox_id.to_string(),
+        generation: "generation-1".to_string(),
+        session_id: openshell_core::SandboxSessionId::new(),
+        workload_identity: test_workload_identity(),
+        transport: openshell_sandbox_backend::boundary_protocol::SandboxTransport::Unix {
+            socket_path: PathBuf::from("/.openshell/channel/sandbox/control.sock"),
+        },
+        tls: SandboxTlsClientConfig {
+            server_name: "sandbox.test".to_string(),
+            trust_anchor_pem: "trust".to_string(),
+        },
+        host_gateway_ip: None,
+        resource_claims: std::collections::BTreeMap::new(),
+        outer_fence:
+            openshell_isolation_interface::contract::OuterFenceGuarantees::from_enforcement_evidence(
+                "generation-1",
+                [
+                    openshell_isolation_interface::contract::OuterFenceGuarantee::DefaultDenyEgress,
+                ],
+                b"test-docker-fence",
+            )
+            .unwrap(),
+        supervisor_generation: None,
+    };
+    fs::write(
+        directory.join(RUNTIME_DESCRIPTOR_FILE),
+        descriptor.backend_descriptor().unwrap().payload,
+    )
+    .unwrap();
+}
+
+fn descriptor_generation(directory: &Path) -> Option<u64> {
+    serde_json::from_slice::<SandboxRuntimeDescriptor>(
+        &fs::read(directory.join(RUNTIME_DESCRIPTOR_FILE)).unwrap(),
+    )
+    .unwrap()
+    .supervisor_generation
+    .map(|generation| generation.generation)
+}
+
+#[tokio::test]
+async fn each_supervisor_spawn_issues_a_strictly_larger_generation() {
+    let directory = TempDir::new().unwrap();
+    write_supervisor_generation_fixture(directory.path(), "sandbox-a", 1);
+
+    let first = advance_docker_supervisor_generation_in(directory.path(), "sandbox-a")
+        .await
+        .unwrap();
+    assert_eq!(first.generation, 1);
+    assert_eq!(first.sandbox_id, "sandbox-a");
+    assert_eq!(first.auth_epoch, CredentialEpoch::new(1).unwrap());
+    assert_eq!(descriptor_generation(directory.path()), Some(1));
+
+    // A gateway restart refreshes credentials; the replacement supervisor
+    // gets the next generation bound to the new epoch.
+    write_supervisor_generation_fixture(directory.path(), "sandbox-a", 2);
+    for expected in 2..=4 {
+        let next = advance_docker_supervisor_generation_in(directory.path(), "sandbox-a")
+            .await
+            .unwrap();
+        assert_eq!(next.generation, expected);
+        assert_eq!(next.auth_epoch, CredentialEpoch::new(2).unwrap());
+        assert_eq!(descriptor_generation(directory.path()), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn corrupt_or_foreign_supervisor_generation_fails_closed() {
+    let directory = TempDir::new().unwrap();
+    write_supervisor_generation_fixture(directory.path(), "sandbox-a", 1);
+    fs::write(directory.path().join(SUPERVISOR_GENERATION_FILE), b"").unwrap();
+    assert!(
+        advance_docker_supervisor_generation_in(directory.path(), "sandbox-a")
+            .await
+            .is_err(),
+        "a truncated counter must not restart at generation 1"
+    );
+
+    fs::write(
+        directory.path().join(SUPERVISOR_GENERATION_FILE),
+        br#"{"sandbox_id":"sandbox-b","auth_epoch":1,"generation":7}"#,
+    )
+    .unwrap();
+    assert!(
+        advance_docker_supervisor_generation_in(directory.path(), "sandbox-a")
+            .await
+            .is_err()
+    );
+    assert_eq!(descriptor_generation(directory.path()), None);
+}
+
+#[tokio::test]
+async fn proxy_ca_is_provisioned_once_and_reused() {
+    let directory = TempDir::new().unwrap();
+    let first = ensure_docker_proxy_ca_in(directory.path()).await.unwrap();
+    assert!(String::from_utf8_lossy(&first.0).contains("BEGIN CERTIFICATE"));
+    let second = ensure_docker_proxy_ca_in(directory.path()).await.unwrap();
+    assert_eq!(
+        first, second,
+        "a replacement supervisor must reuse the same CA"
+    );
+
+    fs::remove_file(directory.path().join(PROXY_CA_PRIVATE_KEY_FILE)).unwrap();
+    assert!(
+        ensure_docker_proxy_ca_in(directory.path()).await.is_err(),
+        "a certificate without its key fails closed"
+    );
+}

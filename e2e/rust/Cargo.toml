@@ -79,6 +79,11 @@ path = "tests/gateway_start.rs"
 required-features = ["e2e-docker"]
 
 [[test]]
+name = "docker_gateway_restart_readopt"
+path = "tests/docker_gateway_restart_readopt.rs"
+required-features = ["e2e-docker"]
+
+[[test]]
 name = "local_driver_token_restart"
 path = "tests/local_driver_token_restart.rs"
 required-features = ["e2e"]

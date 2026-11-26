@@ -291,6 +291,7 @@ impl Fixture {
                     supervisor_instance_id: client.supervisor_instance_id,
                     policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
                     resource_claims: std::collections::BTreeMap::new(),
+                    supervisor_generation: None,
                 })
                 .await
                 .unwrap();

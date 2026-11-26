@@ -95,11 +95,18 @@ where
             // Fallback: format non-OCSF events with basic format
             let level = meta.level();
             let target = meta.target();
-            // Extract message from the event fields
+            // Extract the message plus only the allow-listed lifecycle
+            // diagnostic fields (see `FALLBACK_FIELD_ALLOW_LIST`). Every other
+            // field stays out of this sink: existing call sites record values
+            // such as full command vectors that are not secret-free.
             let mut message = String::new();
-            event.record(&mut MessageVisitor(&mut message));
+            let mut fields = String::new();
+            event.record(&mut MessageVisitor {
+                message: &mut message,
+                fields: &mut fields,
+            });
             if let Ok(mut w) = self.writer.lock() {
-                let _ = writeln!(w, "{ts} {level} {target}: {message}");
+                let _ = writeln!(w, "{ts} {level} {target}: {message}{fields}");
             }
         }
     }
@@ -120,19 +127,80 @@ pub fn severity_rank(severity: SeverityId) -> u8 {
     }
 }
 
-/// Simple visitor that extracts the message field from tracing events.
-struct MessageVisitor<'a>(&'a mut String);
+/// Structured fields the non-OCSF fallback may render. These are the
+/// supervisor-lifecycle diagnostics (codes, phases, identities, generations
+/// and a cause that call sites redact before logging). Any other field is
+/// dropped: fields are opt-in, never opt-out.
+const FALLBACK_FIELD_ALLOW_LIST: &[&str] = &[
+    "code",
+    "phase",
+    "sandbox_id",
+    "runtime_generation",
+    "supervisor_generation",
+    "previous_supervisor_generation",
+    "current_supervisor_generation",
+    "requested_supervisor_generation",
+    "fenced_active",
+    "auth_epoch",
+    "cause",
+    "reason",
+    "released",
+];
+
+/// Upper bound on one rendered field value.
+const MAX_FALLBACK_FIELD_BYTES: usize = 512;
+
+/// Visitor that extracts the message field and renders allow-listed fields as
+/// ` key=value`, with control characters (including newlines) replaced and
+/// the value bounded, so one event stays one line.
+struct MessageVisitor<'a> {
+    message: &'a mut String,
+    fields: &'a mut String,
+}
+
+impl MessageVisitor<'_> {
+    fn push_field(&mut self, name: &str, value: &dyn std::fmt::Display) {
+        use std::fmt::Write as _;
+        if !FALLBACK_FIELD_ALLOW_LIST.contains(&name) {
+            return;
+        }
+        let mut rendered = value
+            .to_string()
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect::<String>();
+        if rendered.len() > MAX_FALLBACK_FIELD_BYTES {
+            let mut end = MAX_FALLBACK_FIELD_BYTES;
+            while !rendered.is_char_boundary(end) {
+                end -= 1;
+            }
+            rendered.truncate(end);
+            rendered.push_str("...");
+        }
+        let _ = write!(self.fields, " {name}={rendered}");
+    }
+}
 
 impl tracing::field::Visit for MessageVisitor<'_> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
-            *self.0 = format!("{value:?}");
+            *self.message = format!("{value:?}");
+        } else {
+            self.push_field(field.name(), &format_args!("{value:?}"));
         }
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         if field.name() == "message" {
-            *self.0 = value.to_string();
+            *self.message = value.to_string();
+        } else {
+            self.push_field(field.name(), &format_args!("{value:?}"));
         }
     }
 }
@@ -204,6 +272,99 @@ mod tests {
             line.contains("test message"),
             "Expected message, got: {line}"
         );
+    }
+
+    fn render_fallback(emit: impl FnOnce()) -> String {
+        use std::sync::Arc;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = SyncWriter(buffer.clone());
+        let layer = OcsfShorthandLayer::new(writer).with_non_ocsf(true);
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = subscriber.set_default();
+        emit();
+        let output = buffer.lock().unwrap();
+        String::from_utf8_lossy(&output).into_owned()
+    }
+
+    #[test]
+    fn test_non_ocsf_fallback_includes_allow_listed_lifecycle_fields() {
+        let line = render_fallback(|| {
+            tracing::warn!(
+                code = "CK_supervisor_attach_rejected",
+                phase = "attach",
+                sandbox_id = "sb-1",
+                current_supervisor_generation = ?Some(2),
+                requested_supervisor_generation = ?Some(1),
+                cause = "stale supervisor generation",
+                "Boundary rejected supervisor attach"
+            );
+        });
+        assert!(
+            line.contains(
+                "Boundary rejected supervisor attach code=\"CK_supervisor_attach_rejected\" \
+                 phase=\"attach\" sandbox_id=\"sb-1\" current_supervisor_generation=Some(2) \
+                 requested_supervisor_generation=Some(1) cause=\"stale supervisor generation\""
+            ),
+            "Expected message followed by lifecycle fields, got: {line}"
+        );
+    }
+
+    #[test]
+    fn test_non_ocsf_fallback_drops_fields_outside_the_allow_list() {
+        let command = vec![
+            "curl".to_string(),
+            "-H".to_string(),
+            "Authorization: Bearer sk-test-secret-value".to_string(),
+        ];
+        let line = render_fallback(|| {
+            tracing::info!(
+                command = ?command,
+                token = "tok-test-secret-value",
+                error = "upstream said password=hunter2",
+                phase = "exec",
+                "Starting supervised process"
+            );
+        });
+        for secret in [
+            "sk-test-secret-value",
+            "tok-test-secret-value",
+            "hunter2",
+            "command=",
+            "token=",
+            "error=",
+        ] {
+            assert!(!line.contains(secret), "fallback leaked {secret:?}: {line}");
+        }
+        assert!(
+            line.contains("Starting supervised process phase=\"exec\""),
+            "got: {line}"
+        );
+    }
+
+    #[test]
+    fn test_non_ocsf_fallback_field_values_stay_on_one_bounded_line() {
+        let injected = "first line\n2026-01-01T00:00:00Z INFO forged: line\r";
+        let long = "x".repeat(4096);
+        let line = render_fallback(|| {
+            tracing::warn!(cause = %injected, reason = %long, "Lifecycle failure");
+        });
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "one event must be one line: {line:?}"
+        );
+        assert!(
+            line.contains("cause=first line 2026-01-01T00:00:00Z INFO forged: line "),
+            "got: {line:?}"
+        );
+        assert!(
+            line.contains(&format!("reason={}...", "x".repeat(512))),
+            "value not bounded"
+        );
+        assert!(!line.contains(&"x".repeat(513)), "value not bounded");
     }
 
     #[test]

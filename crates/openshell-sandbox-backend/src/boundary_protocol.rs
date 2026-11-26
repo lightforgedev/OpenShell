@@ -258,6 +258,66 @@ impl<'de> Deserialize<'de> for SupervisorInstanceId {
 #[error("supervisor instance ID must be a non-nil canonical lowercase UUID")]
 pub struct SupervisorInstanceIdError;
 
+/// Driver-persisted generation of the supervisor process attached to one
+/// sandbox runtime.
+///
+/// A compute driver that replaces the supervisor of a still-running sandbox
+/// (for example after a gateway restart) issues the replacement a strictly
+/// larger generation. The boundary fences generation `N` (it rejects `N` and
+/// closes its connections) before it accepts `N + 1`, and it never accepts a
+/// generation lower than the current one. The record is bound to the sandbox
+/// identity and the credential epoch it was issued under, so it cannot be
+/// replayed against another sandbox or another epoch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorGeneration {
+    /// Sandbox the generation was issued for.
+    pub sandbox_id: String,
+    /// Credential epoch of the authentication bundle issued with it.
+    pub auth_epoch: openshell_core::jwt::CredentialEpoch,
+    /// Strictly increasing per sandbox, starting at 1.
+    pub generation: u64,
+}
+
+impl SupervisorGeneration {
+    /// Validate the record's own invariants.
+    pub fn validate(&self) -> Result<(), SupervisorGenerationError> {
+        if self.generation == 0 {
+            return Err(SupervisorGenerationError::Zero);
+        }
+        if self.sandbox_id.is_empty() || self.sandbox_id.trim() != self.sandbox_id {
+            return Err(SupervisorGenerationError::InvalidSandboxId);
+        }
+        Ok(())
+    }
+
+    /// The generation that replaces this one, issued under `auth_epoch`.
+    pub fn next(
+        &self,
+        auth_epoch: openshell_core::jwt::CredentialEpoch,
+    ) -> Result<Self, SupervisorGenerationError> {
+        Ok(Self {
+            sandbox_id: self.sandbox_id.clone(),
+            auth_epoch,
+            generation: self
+                .generation
+                .checked_add(1)
+                .ok_or(SupervisorGenerationError::Overflow)?,
+        })
+    }
+}
+
+/// A supervisor generation record is malformed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SupervisorGenerationError {
+    #[error("supervisor generation must be at least 1")]
+    Zero,
+    #[error("supervisor generation sandbox ID is invalid")]
+    InvalidSandboxId,
+    #[error("supervisor generation overflowed")]
+    Overflow,
+}
+
 /// Driver-selected byte-stream transport for the `OpenShell` Sandbox Protocol.
 /// Authentication is configured separately and is identical for every variant.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,6 +383,48 @@ impl fmt::Debug for SandboxTlsMaterial {
             .field("private_key_pem", &"<redacted>")
             .finish()
     }
+}
+
+/// Durable TLS-interception CA for a sandbox's network supervisor, as PEM.
+pub struct ProxyCaMaterial {
+    pub certificate_pem: String,
+    pub private_key_pem: String,
+}
+
+impl fmt::Debug for ProxyCaMaterial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProxyCaMaterial")
+            .field("certificate_pem", &self.certificate_pem)
+            .field("private_key_pem", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Generate a proxy CA that outlives any one supervisor process.
+///
+/// The workload trusts the CA installed at first launch. A replacement
+/// supervisor must load the same CA so its launch replay matches and the
+/// workload keeps trusting intercepted connections.
+pub fn generate_proxy_ca_material() -> Result<ProxyCaMaterial, BackendError> {
+    let key = KeyPair::generate()
+        .map_err(|error| BackendError::Descriptor(format!("generate proxy CA key: {error}")))?;
+    let mut params = CertificateParams::default();
+    params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "OpenShell Sandbox CA");
+    params
+        .distinguished_name
+        .push(DnType::OrganizationName, "OpenShell");
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let certificate = params.self_signed(&key).map_err(|error| {
+        BackendError::Descriptor(format!("generate proxy CA certificate: {error}"))
+    })?;
+    Ok(ProxyCaMaterial {
+        certificate_pem: certificate.pem(),
+        private_key_pem: key.serialize_pem(),
+    })
 }
 
 /// Generate a generation-pinned TLS server identity for the Sandbox Protocol.
@@ -428,6 +530,11 @@ pub struct SandboxRuntimeDescriptor {
     pub resource_claims: std::collections::BTreeMap<String, String>,
     /// Backend-neutral projection of the validated outer network fence.
     pub outer_fence: OuterFenceGuarantees,
+    /// Driver-persisted supervisor generation for this launch. Drivers that
+    /// replace the supervisor of a running sandbox must set it; the
+    /// supervisor presents it on attach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_generation: Option<SupervisorGeneration>,
 }
 
 impl fmt::Debug for SandboxRuntimeDescriptor {
@@ -442,6 +549,7 @@ impl fmt::Debug for SandboxRuntimeDescriptor {
             .field("host_gateway_ip", &self.host_gateway_ip)
             .field("resource_claims", &self.resource_claims)
             .field("outer_fence", &self.outer_fence)
+            .field("supervisor_generation", &self.supervisor_generation)
             .finish()
     }
 }
@@ -666,6 +774,9 @@ pub enum Request {
         supervisor_instance_id: SupervisorInstanceId,
         policy: Box<SandboxPolicyWire>,
         resource_claims: std::collections::BTreeMap<String, String>,
+        /// Driver-issued supervisor generation; absent for legacy supervisors.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supervisor_generation: Option<SupervisorGeneration>,
     },
     Confirm,
     StartAgent {
@@ -750,10 +861,12 @@ impl fmt::Debug for Request {
                 supervisor_instance_id: _,
                 policy: _,
                 resource_claims,
+                supervisor_generation,
             } => formatter
                 .debug_struct("Attach")
                 .field("policy", &"<redacted>")
                 .field("resource_claims", resource_claims)
+                .field("supervisor_generation", supervisor_generation)
                 .finish(),
             Self::Confirm => formatter.write_str("Confirm"),
             Self::StartAgent {

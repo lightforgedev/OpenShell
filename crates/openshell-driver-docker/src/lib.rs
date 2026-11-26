@@ -125,6 +125,9 @@ const BOUNDARY_CERTIFICATE_FILE: &str = "boundary-server.crt";
 const BOUNDARY_PRIVATE_KEY_FILE: &str = "boundary-server.key";
 const SUPERVISOR_AUTH_BUNDLE_FILE: &str = "supervisor-auth.json";
 const START_GENERATION_FILE: &str = "start-generation";
+const SUPERVISOR_GENERATION_FILE: &str = "supervisor-generation.json";
+const PROXY_CA_CERTIFICATE_FILE: &str = "proxy-ca.crt";
+const PROXY_CA_PRIVATE_KEY_FILE: &str = "proxy-ca.key";
 const HOST_OPEN_SHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 
@@ -2193,6 +2196,15 @@ impl DockerComputeDriver {
         self.lifecycle_event_fences
             .clear_stop(sandbox_id, sandbox_name);
         self.lifecycle_event_fences.begin_start(sandbox_id);
+        // Release the fence even when the caller abandons the start (for
+        // example the gateway's bounded startup re-attach deadline).
+        struct FinishStart<'a>(&'a DockerLifecycleEventFences, &'a str);
+        impl Drop for FinishStart<'_> {
+            fn drop(&mut self) {
+                self.0.finish_start(self.1);
+            }
+        }
+        let _finish_start = FinishStart(&self.lifecycle_event_fences, sandbox_id);
         let result = Box::pin(self.start_sandbox_with_lifecycle_fence(
             sandbox_id,
             sandbox_name,
@@ -2200,7 +2212,6 @@ impl DockerComputeDriver {
             launch_authentication,
         ))
         .await;
-        self.lifecycle_event_fences.finish_start(sandbox_id);
         span_status.finish(result)
     }
 
@@ -4472,6 +4483,23 @@ async fn docker_supervisor_bundle_archive(
         SUPERVISOR_GID,
         &auth_bundle,
     )?;
+    let (proxy_ca_certificate, proxy_ca_key) = ensure_docker_proxy_ca(&sandbox.id, config).await?;
+    append_docker_archive_file(
+        &mut archive,
+        PROXY_CA_CERTIFICATE_FILE,
+        0o600,
+        SUPERVISOR_UID,
+        SUPERVISOR_GID,
+        &proxy_ca_certificate,
+    )?;
+    append_docker_archive_file(
+        &mut archive,
+        PROXY_CA_PRIVATE_KEY_FILE,
+        0o600,
+        SUPERVISOR_UID,
+        SUPERVISOR_GID,
+        &proxy_ca_key,
+    )?;
     if let Some(tls) = &config.guest_tls {
         append_docker_archive_directory(
             &mut archive,
@@ -4626,6 +4654,195 @@ async fn refresh_docker_supervisor_authentication(
         &supervisor_auth,
     )
     .await
+}
+
+/// Issue the next supervisor generation for a sandbox and record it in the
+/// runtime descriptor the supervisor attaches with.
+///
+/// Every supervisor process the driver starts for a sandbox gets a strictly
+/// larger generation, bound to the sandbox and the credential epoch of the
+/// auth bundle it is started with. The boundary uses it to fence the previous
+/// supervisor before accepting a replacement, so a gateway restart can
+/// re-attach a running sandbox without restarting its workload. The counter
+/// is persisted atomically before use; a missing or corrupt counter for an
+/// existing record fails closed.
+async fn advance_docker_supervisor_generation(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<openshell_sandbox_backend::boundary_protocol::SupervisorGeneration, Status> {
+    let directory = docker_boundary_state_dir_by_id(sandbox_id, config)?;
+    advance_docker_supervisor_generation_in(&directory, sandbox_id).await
+}
+
+async fn advance_docker_supervisor_generation_in(
+    directory: &Path,
+    sandbox_id: &str,
+) -> Result<openshell_sandbox_backend::boundary_protocol::SupervisorGeneration, Status> {
+    use openshell_sandbox_backend::boundary_protocol::SupervisorGeneration;
+
+    let auth_bundle = tokio::fs::read(directory.join(SUPERVISOR_AUTH_BUNDLE_FILE))
+        .await
+        .map_err(|error| {
+            Status::failed_precondition(format!(
+                "read Docker supervisor auth bundle for supervisor generation: {error}"
+            ))
+        })?;
+    let auth_epoch =
+        serde_json::from_slice::<openshell_core::jwt::SupervisorAuthBundle>(&auth_bundle)
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "decode Docker supervisor auth bundle for supervisor generation: {error}"
+                ))
+            })?
+            .auth_epoch;
+    let path = directory.join(SUPERVISOR_GENERATION_FILE);
+    let previous = match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let previous =
+                serde_json::from_slice::<SupervisorGeneration>(&bytes).map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "decode Docker supervisor generation {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            previous.validate().map_err(|error| {
+                Status::failed_precondition(format!(
+                    "invalid Docker supervisor generation: {error}"
+                ))
+            })?;
+            if previous.sandbox_id != sandbox_id {
+                return Err(Status::failed_precondition(
+                    "Docker supervisor generation belongs to a different sandbox",
+                ));
+            }
+            Some(previous)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(Status::internal(format!(
+                "read Docker supervisor generation {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let next = match &previous {
+        Some(previous) => previous.next(auth_epoch).map_err(|error| {
+            Status::failed_precondition(format!("advance Docker supervisor generation: {error}"))
+        })?,
+        None => SupervisorGeneration {
+            sandbox_id: sandbox_id.to_string(),
+            auth_epoch,
+            generation: 1,
+        },
+    };
+    let encoded = serde_json::to_vec(&next).map_err(|error| {
+        Status::internal(format!("encode Docker supervisor generation: {error}"))
+    })?;
+    write_docker_boundary_file_atomically(&path, &encoded).await?;
+
+    let descriptor_path = directory.join(RUNTIME_DESCRIPTOR_FILE);
+    let descriptor_bytes = tokio::fs::read(&descriptor_path).await.map_err(|error| {
+        Status::failed_precondition(format!(
+            "read Docker runtime descriptor {} while issuing a supervisor generation: {error}",
+            descriptor_path.display()
+        ))
+    })?;
+    let mut runtime_descriptor =
+        serde_json::from_slice::<SandboxRuntimeDescriptor>(&descriptor_bytes).map_err(|error| {
+            Status::internal(format!(
+                "decode Docker runtime descriptor {}: {error}",
+                descriptor_path.display()
+            ))
+        })?;
+    runtime_descriptor.supervisor_generation = Some(next.clone());
+    let descriptor = runtime_descriptor
+        .backend_descriptor()
+        .map_err(|error| Status::internal(error.to_string()))?;
+    write_docker_boundary_file_atomically(&descriptor_path, &descriptor.payload).await?;
+    info!(
+        code = "CK_supervisor_generation_issued",
+        phase = "spawn_supervisor",
+        %sandbox_id,
+        previous_supervisor_generation = ?previous.as_ref().map(|previous| previous.generation),
+        supervisor_generation = next.generation,
+        auth_epoch = next.auth_epoch.get(),
+        "Issued Docker supervisor generation"
+    );
+    Ok(next)
+}
+
+/// Provision the sandbox's durable proxy CA on first use and return it.
+///
+/// The workload installs the proxy CA its first supervisor reports, and the
+/// boundary only accepts a launch replay with identical CA bytes. Keeping the
+/// CA in driver state lets a replacement supervisor re-attach after a gateway
+/// restart. The key is written before the certificate, so a certificate
+/// without its key is never produced; that state fails closed.
+async fn ensure_docker_proxy_ca(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<(Vec<u8>, Vec<u8>), Status> {
+    let directory = docker_boundary_state_dir_by_id(sandbox_id, config)?;
+    ensure_docker_proxy_ca_in(&directory).await
+}
+
+async fn ensure_docker_proxy_ca_in(directory: &Path) -> Result<(Vec<u8>, Vec<u8>), Status> {
+    let certificate_path = directory.join(PROXY_CA_CERTIFICATE_FILE);
+    let key_path = directory.join(PROXY_CA_PRIVATE_KEY_FILE);
+    let read_optional = |path: PathBuf| async move {
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(Status::internal(format!(
+                "read Docker proxy CA {}: {error}",
+                path.display()
+            ))),
+        }
+    };
+    let certificate = read_optional(certificate_path.clone()).await?;
+    let key = read_optional(key_path.clone()).await?;
+    match (certificate, key) {
+        (Some(certificate), Some(key)) => Ok((certificate, key)),
+        (Some(_), None) => Err(Status::failed_precondition(
+            "Docker proxy CA certificate exists without its private key",
+        )),
+        // No supervisor has used a CA yet: either fresh state, or a key whose
+        // certificate was never committed.
+        (None, _) => {
+            let material =
+                openshell_sandbox_backend::boundary_protocol::generate_proxy_ca_material()
+                    .map_err(|error| Status::internal(error.to_string()))?;
+            write_docker_boundary_file_atomically(&key_path, material.private_key_pem.as_bytes())
+                .await?;
+            write_docker_boundary_file_atomically(
+                &certificate_path,
+                material.certificate_pem.as_bytes(),
+            )
+            .await?;
+            Ok((
+                material.certificate_pem.into_bytes(),
+                material.private_key_pem.into_bytes(),
+            ))
+        }
+    }
+}
+
+/// Replace a boundary state file so a crash never leaves it truncated.
+async fn write_docker_boundary_file_atomically(path: &Path, contents: &[u8]) -> Result<(), Status> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            Status::internal(format!("invalid boundary file path {}", path.display()))
+        })?;
+    let staged = path.with_file_name(format!(".{file_name}.tmp"));
+    write_docker_boundary_file(&staged, contents).await?;
+    tokio::fs::rename(&staged, path).await.map_err(|error| {
+        Status::internal(format!(
+            "replace Docker boundary file {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 async fn read_docker_runtime_descriptor(
@@ -4861,6 +5078,14 @@ async fn spawn_docker_control_process(
             openshell_core::sandbox_env::PROXY_TLS_DIR
         ),
         format!(
+            "{}={SUPERVISOR_STATE_MOUNT_PATH}/{PROXY_CA_CERTIFICATE_FILE}",
+            openshell_core::sandbox_env::PROXY_CA_CERT
+        ),
+        format!(
+            "{}={SUPERVISOR_STATE_MOUNT_PATH}/{PROXY_CA_PRIVATE_KEY_FILE}",
+            openshell_core::sandbox_env::PROXY_CA_KEY
+        ),
+        format!(
             "{}={}",
             openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
             openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
@@ -4900,6 +5125,7 @@ async fn spawn_docker_control_process(
             openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET
         ));
     }
+    advance_docker_supervisor_generation(&sandbox.id, config).await?;
     let supervisor_archive = docker_supervisor_bundle_archive(sandbox, config).await?;
     stage_docker_supervisor_bundle(docker, sandbox, config, supervisor_archive).await?;
     let labels = HashMap::from([

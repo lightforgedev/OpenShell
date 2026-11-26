@@ -608,6 +608,9 @@ pub struct ComputeRuntime {
     /// clones: `ServerState` holds `ComputeRuntime` by value, so a per-clone
     /// table would make a token minted on one clone invisible to another.
     rootfs_tar_staging: Arc<rootfs_tar::RootfsTarStagingRegistry>,
+    /// Upper bound for re-attaching one retained sandbox during gateway
+    /// startup ([`STARTUP_REATTACH_TIMEOUT`] outside tests).
+    startup_reattach_timeout: Duration,
 }
 
 pub struct SandboxSyncGuard {
@@ -701,6 +704,7 @@ impl ComputeRuntime {
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             replica_id: lease::replica_id(),
             rootfs_tar_staging,
+            startup_reattach_timeout: STARTUP_REATTACH_TIMEOUT,
         })
     }
 
@@ -2934,8 +2938,12 @@ impl ComputeRuntime {
                 }
             };
             let expected_runtime_identity = sandbox_compute_runtime_identity(&sandbox);
-            match self
-                .await_provisioning_operation(
+            // Re-attaching a retained sandbox is bounded: a supervisor that
+            // never becomes ready must surface as a typed failure rather
+            // than leaving the sandbox Provisioning and the sweep blocked.
+            let start = tokio::time::timeout(
+                self.startup_reattach_timeout,
+                self.await_provisioning_operation(
                     &sandbox,
                     self.driver.call(
                         openshell_otel::rpc::START_SANDBOX,
@@ -2958,9 +2966,16 @@ impl ComputeRuntime {
                             }
                         },
                     ),
-                )
-                .await
-            {
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(Status::deadline_exceeded(format!(
+                    "sandbox supervisor did not re-attach within {}s of gateway startup",
+                    self.startup_reattach_timeout.as_secs()
+                )))
+            });
+            match start {
                 Ok(response) => {
                     let mut recovered_sandbox = sandbox.clone();
                     if self.supports_sandbox_authentication() {
@@ -3052,16 +3067,24 @@ impl ComputeRuntime {
                 }
                 Err(err) => {
                     authentication_failed(sandbox.object_id());
+                    let reason = if err.code() == Code::DeadlineExceeded {
+                        REATTACH_TIMED_OUT_REASON
+                    } else {
+                        "StartFailed"
+                    };
                     warn!(
+                        code = "CK_sandbox_startup_reattach_failed",
+                        phase = "gateway_startup",
                         sandbox_id = %sandbox.object_id(),
                         sandbox_name = %sandbox.object_name(),
+                        reason,
                         error = %err,
                         "Failed to start sandbox during gateway startup"
                     );
                     if !recoverable_error {
                         self.mark_sandbox_error(
                             &sandbox,
-                            "StartFailed",
+                            reason,
                             &format!(
                                 "Failed to start sandbox during gateway startup: {}",
                                 err.message()
@@ -4715,6 +4738,11 @@ fn is_failed_main_process_result(sandbox: &Sandbox) -> bool {
         })
 }
 
+/// Upper bound for re-attaching one retained sandbox during gateway startup.
+const STARTUP_REATTACH_TIMEOUT: Duration = Duration::from_mins(3);
+/// Typed failure reason when a retained sandbox does not re-attach in time.
+const REATTACH_TIMED_OUT_REASON: &str = "ReattachTimedOut";
+
 fn is_recoverable_start_error(sandbox: &Sandbox) -> bool {
     sandbox.phase() == SandboxPhase::Error as i32
         && sandbox.status.as_ref().is_some_and(|status| {
@@ -4723,7 +4751,7 @@ fn is_recoverable_start_error(sandbox: &Sandbox) -> bool {
                     && condition.status.eq_ignore_ascii_case("false")
                     && matches!(
                         condition.reason.as_str(),
-                        "ControlSupervisorExited" | "StartFailed"
+                        "ControlSupervisorExited" | "StartFailed" | REATTACH_TIMED_OUT_REASON
                     )
             })
         })
@@ -6100,6 +6128,7 @@ pub fn new_test_runtime_with_driver(
         lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
         replica_id: "test-replica".to_string(),
         rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
+        startup_reattach_timeout: STARTUP_REATTACH_TIMEOUT,
     }
 }
 
@@ -7136,6 +7165,7 @@ mod tests {
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             replica_id: "test-replica".to_string(),
             rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
+            startup_reattach_timeout: STARTUP_REATTACH_TIMEOUT,
         }
     }
 
@@ -12909,6 +12939,43 @@ mod tests {
         assert_eq!(
             restored.metadata.unwrap().annotations[COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
             "new-runtime-identity"
+        );
+    }
+
+    // Real time with a short bound: paused time auto-advances while the
+    // SQLite worker thread runs, which fires the pool acquire timeout.
+    #[tokio::test]
+    async fn startup_reattach_that_never_completes_fails_with_typed_reason() {
+        let driver = ControlledDriver::new();
+        driver.block_start();
+        let mut runtime =
+            test_runtime_with_gateway_managed_lifecycle(driver.clone(), "arbitrary").await;
+        runtime.startup_reattach_timeout = Duration::from_millis(200);
+        runtime
+            .store
+            .put_message(&sandbox_record("sb-1", "sandbox", SandboxPhase::Ready))
+            .await
+            .unwrap();
+
+        runtime.start_persisted_sandboxes().await.unwrap();
+
+        assert_eq!(driver.start_calls(), 1);
+        let sandbox = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .expect("sandbox is retained");
+        assert_eq!(sandbox.phase(), SandboxPhase::Error as i32);
+        let ready = sandbox
+            .status
+            .as_ref()
+            .and_then(|status| status.conditions.iter().find(|c| c.r#type == "Ready"))
+            .expect("ready condition");
+        assert_eq!(ready.reason, REATTACH_TIMED_OUT_REASON);
+        assert!(
+            is_recoverable_start_error(&sandbox),
+            "a timed-out re-attach can be retried by an explicit start"
         );
     }
 
