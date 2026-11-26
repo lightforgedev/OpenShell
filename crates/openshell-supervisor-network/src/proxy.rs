@@ -3447,7 +3447,39 @@ fn authorize_egress_intent(
     }
 }
 
-fn emit_l7_tunnel_close_after_policy_change(host: &str, port: u16, error: miette::Report) {
+/// Stale-state close evidence: activity deny group plus OCSF message.
+///
+/// A typed [`crate::opa::GuardStaleness`] keeps policy-generation and
+/// credential-epoch closes distinct; untyped errors are generation mismatches
+/// detected before a guard exists and are reported as policy changes.
+fn stale_close_evidence(error: &miette::Report) -> (&'static str, String) {
+    let (group, cause, reason) = match error.downcast_ref::<crate::opa::GuardStaleness>() {
+        Some(staleness @ crate::opa::GuardStaleness::CredentialEpoch { .. }) => (
+            staleness.activity_group(),
+            staleness.cause(),
+            "provider credentials rotated",
+        ),
+        Some(staleness @ crate::opa::GuardStaleness::PolicyGeneration { .. }) => (
+            staleness.activity_group(),
+            staleness.cause(),
+            "policy changed",
+        ),
+        None => ("policy_stale", "policy_generation_stale", "policy changed"),
+    };
+    (
+        group,
+        format!("L7 tunnel closed before inspection because {reason} [cause:{cause}]: {error}"),
+    )
+}
+
+/// Emit the OCSF close event for a stale guard and return the activity deny
+/// group matching its cause.
+fn emit_l7_tunnel_close_after_stale_state(
+    host: &str,
+    port: u16,
+    error: miette::Report,
+) -> &'static str {
+    let (group, message) = stale_close_evidence(&error);
     let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Open)
         .action(ActionId::Denied)
@@ -3455,11 +3487,10 @@ fn emit_l7_tunnel_close_after_policy_change(host: &str, port: u16, error: miette
         .severity(SeverityId::Medium)
         .status(StatusId::Failure)
         .dst_endpoint(Endpoint::from_domain(host, port))
-        .message(format!(
-            "L7 tunnel closed before inspection because policy changed: {error}"
-        ))
+        .message(message)
         .build();
     ocsf_emit!(event);
+    group
 }
 
 async fn reject_stale_connect_policy<C>(
@@ -3478,8 +3509,8 @@ where
         error = %error,
         "CONNECT rejected because policy changed after L4 authorization"
     );
-    emit_l7_tunnel_close_after_policy_change(host, port, error);
-    emit_activity_simple(activity_tx, true, "policy_stale");
+    let stale_group = emit_l7_tunnel_close_after_stale_state(host, port, error);
+    emit_activity_simple(activity_tx, true, stale_group);
     respond(
         client,
         &build_json_error_response(
@@ -5162,8 +5193,8 @@ async fn handle_forward_proxy(
                 error = %e,
                 "Forward proxy rejected request because policy generation changed after L4 decision"
             );
-            emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
-            emit_activity_simple(activity_tx, true, "policy_stale");
+            let stale_group = emit_l7_tunnel_close_after_stale_state(&host_lc, port, e);
+            emit_activity_simple(activity_tx, true, stale_group);
             respond(
                 client,
                 &build_json_error_response(
@@ -5281,7 +5312,7 @@ async fn handle_forward_proxy(
                 current_generation = opa_engine.current_generation(),
                 "Forward proxy rejected request because L7 route lookup used a different policy generation"
             );
-            emit_l7_tunnel_close_after_policy_change(
+            let stale_group = emit_l7_tunnel_close_after_stale_state(
                 &host_lc,
                 port,
                 miette::miette!(
@@ -5290,7 +5321,7 @@ async fn handle_forward_proxy(
                     route.l7_policy_generation,
                 ),
             );
-            emit_activity_simple(activity_tx, true, "policy_stale");
+            emit_activity_simple(activity_tx, true, stale_group);
             respond(
                 client,
                 &build_json_error_response(
@@ -5314,8 +5345,8 @@ async fn handle_forward_proxy(
                     error = %e,
                     "Forward proxy rejected request because L7 tunnel engine could not be cloned"
                 );
-                emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
-                emit_activity_simple(activity_tx, true, "policy_stale");
+                let stale_group = emit_l7_tunnel_close_after_stale_state(&host_lc, port, e);
+                emit_activity_simple(activity_tx, true, stale_group);
                 respond(
                     client,
                     &build_json_error_response(
@@ -5802,8 +5833,8 @@ async fn handle_forward_proxy(
             error = %e,
             "Forward proxy rejected request because policy changed before upstream connect"
         );
-        emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
-        emit_activity_simple(activity_tx, true, "policy_stale");
+        let stale_group = emit_l7_tunnel_close_after_stale_state(&host_lc, port, e);
+        emit_activity_simple(activity_tx, true, stale_group);
         respond(
             client,
             &build_json_error_response(
@@ -5829,7 +5860,7 @@ async fn handle_forward_proxy(
     let (chain, generation) =
         opa_engine.query_middleware_chain_with_generation(&middleware_input)?;
     if generation != forward_generation_guard.captured_generation() {
-        emit_l7_tunnel_close_after_policy_change(
+        emit_l7_tunnel_close_after_stale_state(
             &host_lc,
             port,
             miette::miette!(
@@ -6115,7 +6146,7 @@ async fn handle_forward_proxy(
             error = %e,
             "Forward proxy rejected request because policy changed before relay"
         );
-        emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+        emit_l7_tunnel_close_after_stale_state(&host_lc, port, e);
         if let Some(session) = middleware_session.take() {
             session
                 .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
@@ -6189,7 +6220,7 @@ async fn handle_forward_proxy(
             error = %e,
             "Forward proxy rejected request because policy changed during upstream connect"
         );
-        emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+        emit_l7_tunnel_close_after_stale_state(&host_lc, port, e);
         if let Some(session) = middleware_session.take() {
             session
                 .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
@@ -6583,6 +6614,66 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    /// #471: a credential-only activation must close credential-bound tunnels
+    /// as credential-epoch staleness, never as a policy change with equal
+    /// policy counters; a real policy reload keeps the policy cause.
+    #[test]
+    fn stale_close_evidence_distinguishes_credential_epoch_from_policy_change() {
+        const POLICY: &str = include_str!("../data/sandbox-policy.rego");
+        const DATA: &str = include_str!("../testdata/sandbox-policy.yaml");
+        let engine = OpaEngine::from_strings(POLICY, DATA).expect("load policy");
+        let generation = engine.current_generation();
+
+        let credential_bound = engine
+            .credential_bound_generation_guard(generation)
+            .expect("credential-bound guard");
+        engine
+            .activate_credentials(|| {})
+            .expect("activate credentials");
+        assert_eq!(engine.current_generation(), generation);
+
+        let error = credential_bound.ensure_current().unwrap_err();
+        let (group, message) = stale_close_evidence(&error);
+        assert_eq!(group, "credential_stale");
+        assert!(
+            message.contains("because provider credentials rotated")
+                && message.contains("[cause:credential_epoch_stale]")
+                && message.contains("captured_credential_epoch:0")
+                && message.contains("current_credential_epoch:1"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("policy changed") && !message.contains("policy generation"),
+            "credential-only staleness must not be reported as a policy change: {message}"
+        );
+        assert_eq!(
+            credential_bound.staleness(),
+            Some(crate::opa::GuardStaleness::CredentialEpoch {
+                captured: 0,
+                current: 1
+            })
+        );
+
+        let policy_bound = engine
+            .credential_bound_generation_guard(generation)
+            .expect("rebound guard");
+        engine.reload(POLICY, DATA).expect("policy reload");
+        let current = engine.current_generation();
+        assert_ne!(current, generation);
+
+        let error = policy_bound.ensure_current().unwrap_err();
+        let (group, message) = stale_close_evidence(&error);
+        assert_eq!(group, "policy_stale");
+        assert!(
+            message.contains("because policy changed")
+                && message.contains("[cause:policy_generation_stale]")
+                && message.contains(&format!("captured_generation:{generation}"))
+                && message.contains(&format!("current_generation:{current}")),
+            "{message}"
+        );
+        assert!(!message.contains("credential"), "{message}");
+    }
 
     #[test]
     fn supplied_identity_preserves_authorized_endpoint_metadata() {

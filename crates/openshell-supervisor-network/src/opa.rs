@@ -197,6 +197,40 @@ pub(crate) fn test_opa_query_count() -> u64 {
     TEST_OPA_QUERY_COUNT.load(Ordering::SeqCst)
 }
 
+/// Typed cause of a stale [`PolicyGenerationGuard`].
+///
+/// Policy staleness and credential-epoch staleness are distinct evidence:
+/// close events must report the counter pair that actually changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, miette::Diagnostic)]
+pub enum GuardStaleness {
+    #[error(
+        "policy generation is stale [captured_generation:{captured} current_generation:{current}]"
+    )]
+    PolicyGeneration { captured: u64, current: u64 },
+    #[error(
+        "provider credential epoch is stale [captured_credential_epoch:{captured} current_credential_epoch:{current}]"
+    )]
+    CredentialEpoch { captured: u64, current: u64 },
+}
+
+impl GuardStaleness {
+    /// Stable machine-readable cause carried in close evidence.
+    pub const fn cause(self) -> &'static str {
+        match self {
+            Self::PolicyGeneration { .. } => "policy_generation_stale",
+            Self::CredentialEpoch { .. } => "credential_epoch_stale",
+        }
+    }
+
+    /// Allow-listed activity deny group for this cause.
+    pub const fn activity_group(self) -> &'static str {
+        match self {
+            Self::PolicyGeneration { .. } => "policy_stale",
+            Self::CredentialEpoch { .. } => "credential_stale",
+        }
+    }
+}
+
 /// Generation guard captured when an HTTP tunnel or request path starts.
 #[derive(Clone, Debug)]
 ///
@@ -238,35 +272,28 @@ impl PolicyGenerationGuard {
         }
     }
 
-    fn policy_is_stale(&self) -> bool {
-        self.current_generation() != self.captured_generation
-    }
-
-    fn credentials_are_stale(&self) -> bool {
-        self.captured_credential_epoch
-            .is_some_and(|epoch| epoch != self.current_credential_epoch())
-    }
-
     pub fn is_stale(&self) -> bool {
-        self.policy_is_stale() || self.credentials_are_stale()
+        self.staleness().is_some()
+    }
+
+    /// Typed staleness, policy first: a policy change subsumes a credential
+    /// rotation published in the same activation.
+    pub fn staleness(&self) -> Option<GuardStaleness> {
+        let current = self.current_generation();
+        if current != self.captured_generation {
+            return Some(GuardStaleness::PolicyGeneration {
+                captured: self.captured_generation,
+                current,
+            });
+        }
+        let captured = self.captured_credential_epoch?;
+        let current = self.current_credential_epoch();
+        (captured != current).then_some(GuardStaleness::CredentialEpoch { captured, current })
     }
 
     pub fn ensure_current(&self) -> Result<()> {
-        if self.policy_is_stale() {
-            return Err(miette::miette!(
-                "policy generation is stale [captured_generation:{} current_generation:{}]",
-                self.captured_generation(),
-                self.current_generation(),
-            ));
-        }
-        if self.credentials_are_stale() {
-            return Err(miette::miette!(
-                "provider credential epoch is stale [captured_credential_epoch:{} current_credential_epoch:{}]",
-                self.captured_credential_epoch.unwrap_or_default(),
-                self.current_credential_epoch(),
-            ));
-        }
-        Ok(())
+        self.staleness()
+            .map_or(Ok(()), |staleness| Err(miette::Report::new(staleness)))
     }
 
     /// Wait until the policy generation changes.

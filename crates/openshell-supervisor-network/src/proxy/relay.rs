@@ -3,7 +3,7 @@
 
 //! Shared relay primitives for authorized explicit-proxy egress.
 
-use super::{EgressDecision, L7RouteSnapshot, emit_l7_tunnel_close_after_policy_change};
+use super::{EgressDecision, L7RouteSnapshot, emit_l7_tunnel_close_after_stale_state};
 use crate::l7::relay::L7EvalContext;
 use crate::opa::{
     CredentialDependency, NetworkAction, OpaEngine, PolicyGenerationGuard, TunnelPolicyEngine,
@@ -155,7 +155,7 @@ pub(super) fn prepare_http_relay<'a>(
     request: &'a L7EvalContext,
 ) -> Option<RelayContext<'a>> {
     if let Err(error) = validate_route_generation(route, decision.policy_generation) {
-        emit_l7_tunnel_close_after_policy_change(
+        emit_l7_tunnel_close_after_stale_state(
             &decision.intent.destination.host,
             decision.intent.destination.port,
             error,
@@ -167,7 +167,7 @@ pub(super) fn prepare_http_relay<'a>(
         let evaluator = match pin_l7_evaluator(opa_engine, decision.policy_generation) {
             Ok(evaluator) => evaluator,
             Err(error) => {
-                emit_l7_tunnel_close_after_policy_change(
+                emit_l7_tunnel_close_after_stale_state(
                     &decision.intent.destination.host,
                     decision.intent.destination.port,
                     error,
@@ -193,7 +193,7 @@ pub(super) fn prepare_http_relay<'a>(
         ) {
             Ok(guard) => guard,
             Err(error) => {
-                emit_l7_tunnel_close_after_policy_change(
+                emit_l7_tunnel_close_after_stale_state(
                     &decision.intent.destination.host,
                     decision.intent.destination.port,
                     error,
@@ -225,7 +225,7 @@ pub(super) fn prepare_raw_relay(
     dependency: CredentialDependency,
 ) -> Option<PolicyGenerationGuard> {
     if let Err(error) = validate_route_generation(route, decision.policy_generation) {
-        emit_l7_tunnel_close_after_policy_change(
+        emit_l7_tunnel_close_after_stale_state(
             &decision.intent.destination.host,
             decision.intent.destination.port,
             error,
@@ -236,7 +236,7 @@ pub(super) fn prepare_raw_relay(
     match pin_policy_generation(opa_engine, decision.policy_generation, dependency) {
         Ok(guard) => Some(guard),
         Err(error) => {
-            emit_l7_tunnel_close_after_policy_change(
+            emit_l7_tunnel_close_after_stale_state(
                 &decision.intent.destination.host,
                 decision.intent.destination.port,
                 error,
@@ -334,15 +334,16 @@ where
 }
 
 fn emit_stale_relay_close(request: &L7EvalContext, guard: &PolicyGenerationGuard) {
-    emit_l7_tunnel_close_after_policy_change(
-        &request.host,
-        request.port,
+    // `wait_until_stale` also returns when the generation channel closes; that
+    // is an engine teardown, reported with the policy counters it observed.
+    let error = guard.ensure_current().err().unwrap_or_else(|| {
         miette::miette!(
-            "policy generation is stale [captured_generation:{} current_generation:{}]",
+            "policy generation channel closed [captured_generation:{} current_generation:{}]",
             guard.captured_generation(),
             guard.current_generation(),
-        ),
-    );
+        )
+    });
+    emit_l7_tunnel_close_after_stale_state(&request.host, request.port, error);
 }
 
 #[cfg(test)]

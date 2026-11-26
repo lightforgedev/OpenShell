@@ -153,6 +153,7 @@ pub fn sanitize_deny_group(raw: &str) -> &'static str {
         "ssrf" => "ssrf",
         "bypass" => "bypass",
         "policy_stale" => "policy_stale",
+        "credential_stale" => "credential_stale",
         _ => "unknown",
     }
 }
@@ -176,6 +177,8 @@ mod tests {
     #[test]
     fn deny_group_sanitization_uses_allowlist() {
         assert_eq!(sanitize_deny_group("connect"), "connect_policy");
+        assert_eq!(sanitize_deny_group("policy_stale"), "policy_stale");
+        assert_eq!(sanitize_deny_group("credential_stale"), "credential_stale");
         assert_eq!(sanitize_deny_group("forward-l7-deny"), "l7_policy");
         assert_eq!(sanitize_deny_group("host=example.test/path"), "unknown");
         assert_eq!(sanitize_deny_group("acme.internal:443"), "unknown");
