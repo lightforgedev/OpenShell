@@ -36,6 +36,7 @@ mod readiness;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
+pub(crate) mod shutdown_disposition;
 mod ssh_sessions;
 mod storage_proto;
 mod supervisor_owner;
@@ -253,6 +254,7 @@ pub(crate) struct ServerStartupConfig {
     pub guest_tls: Option<compute::driver_config::GuestTlsPaths>,
     pub compute_driver: ComputeDriverSelection,
     pub legacy_compute_driver_env_seen: bool,
+    pub shutdown_disposition: shutdown_disposition::ShutdownDispositionConfig,
 }
 
 /// Server state shared across handlers.
@@ -531,6 +533,7 @@ pub(crate) async fn run_server(
         guest_tls,
         compute_driver,
         legacy_compute_driver_env_seen: _,
+        shutdown_disposition,
     } = startup;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -1041,9 +1044,21 @@ pub(crate) async fn run_server(
         warn!(error = %err, "Gateway listener task failed during shutdown");
     }
 
+    // Resolve after the signal so a disposition file carries the host's
+    // choice for this shutdown. Anything but an exact known value sweeps.
+    let disposition = shutdown_disposition.resolve();
+    if let Some(fallback) = disposition.fallback {
+        warn!(
+            code = "CK_gateway_shutdown_disposition_fallback",
+            source = disposition.source.as_str(),
+            reason = fallback.as_str(),
+            mode = disposition.mode.as_str(),
+            "Shutdown disposition unusable; stopping running sandboxes"
+        );
+    }
     state
         .compute
-        .cleanup_on_shutdown()
+        .cleanup_on_shutdown(disposition)
         .await
         .map_err(|err| Error::execution(format!("gateway shutdown cleanup failed: {err}")))?;
 

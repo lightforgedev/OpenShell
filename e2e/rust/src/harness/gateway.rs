@@ -58,6 +58,12 @@ impl ManagedGateway {
 
     /// Start the gateway if it is not already running.
     pub fn start(&self) -> Result<(), String> {
+        self.start_with_args(&[])
+    }
+
+    /// Start the gateway with `extra` appended to the wrapper's arguments, if
+    /// it is not already running. A later [`Self::start`] drops them again.
+    pub fn start_with_args(&self, extra: &[&str]) -> Result<(), String> {
         if let Some(pid) = self.current_pid()? {
             if process_running(pid)? {
                 return Ok(());
@@ -65,7 +71,8 @@ impl ManagedGateway {
             let _ = fs::remove_file(&self.pid_file);
         }
 
-        let args = self.gateway_args()?;
+        let mut args = self.gateway_args()?;
+        args.extend(extra.iter().map(|arg| (*arg).to_string()));
         let mut log = OpenOptions::new()
             .create(true)
             .append(true)
@@ -120,6 +127,40 @@ impl ManagedGateway {
         send_signal(pid, Some("-9"))?;
         let _ = fs::remove_file(&self.pid_file);
         Ok(())
+    }
+
+    /// Send `SIGTERM` and wait for the gateway's graceful shutdown to finish.
+    ///
+    /// Unlike [`Self::stop`], this never escalates to `SIGKILL`: a gateway
+    /// that does not exit within `timeout` is an error, so callers can rely
+    /// on graceful shutdown cleanup having run. Only the PID recorded by this
+    /// e2e run is signalled.
+    pub fn terminate(&self, timeout: Duration) -> Result<(), String> {
+        let Some(pid) = self.current_pid()? else {
+            return Err("gateway is not running".to_string());
+        };
+        if !process_running(pid)? {
+            let _ = fs::remove_file(&self.pid_file);
+            return Err(format!("gateway process {pid} already exited"));
+        }
+        send_signal(pid, None)?;
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if !process_running(pid)? {
+                let _ = fs::remove_file(&self.pid_file);
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        Err(format!(
+            "gateway process {pid} did not exit within {}s of SIGTERM",
+            timeout.as_secs()
+        ))
+    }
+
+    /// The gateway log shared by every start in this e2e run.
+    pub fn log_path(&self) -> &std::path::Path {
+        &self.log
     }
 
     /// Kill the gateway with `SIGKILL`, skipping graceful shutdown.

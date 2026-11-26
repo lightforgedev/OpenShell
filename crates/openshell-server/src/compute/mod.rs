@@ -16,6 +16,7 @@ use crate::persistence::{
 };
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
+use crate::shutdown_disposition::{ResolvedDisposition, ShutdownDisposition};
 use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
 use crate::supervisor_session::SupervisorSessionRegistry;
 use crate::tracing_bus::TracingLogBus;
@@ -2706,8 +2707,57 @@ impl ComputeRuntime {
         }
     }
 
-    pub async fn cleanup_on_shutdown(&self) -> Result<(), String> {
-        let stop_result = self.stop_persisted_sandboxes_on_shutdown().await;
+    /// Run graceful-shutdown compute cleanup.
+    ///
+    /// `disposition` selects only whether the sandbox stop sweep runs. The
+    /// managed driver process is shut down in both modes, and one bounded
+    /// `CK_gateway_shutdown_disposition` receipt records the mode and the
+    /// number of running-intent sandboxes left for the next gateway.
+    pub async fn cleanup_on_shutdown(
+        &self,
+        disposition: ResolvedDisposition,
+    ) -> Result<(), String> {
+        let stop_result = match disposition.mode {
+            ShutdownDisposition::StopRunningSandboxes => {
+                let result = self.stop_persisted_sandboxes_on_shutdown().await;
+                info!(
+                    code = "CK_gateway_shutdown_disposition",
+                    mode = disposition.mode.as_str(),
+                    source = disposition.source.as_str(),
+                    retained = 0usize,
+                    sweep_ok = result.is_ok(),
+                    "Gateway shutdown stopped running sandboxes"
+                );
+                result
+            }
+            ShutdownDisposition::RetainRunningSandboxes => {
+                match self.count_running_intent_sandboxes().await {
+                    Ok(retained) => {
+                        info!(
+                            code = "CK_gateway_shutdown_disposition",
+                            mode = disposition.mode.as_str(),
+                            source = disposition.source.as_str(),
+                            retained,
+                            "Gateway shutdown retained running sandboxes for re-adoption"
+                        );
+                        Ok(())
+                    }
+                    // Counting is for the receipt only; retain never stops a
+                    // sandbox, so a store error does not fail shutdown.
+                    Err(err) => {
+                        warn!(
+                            code = "CK_gateway_shutdown_disposition",
+                            mode = disposition.mode.as_str(),
+                            source = disposition.source.as_str(),
+                            retained = "unknown",
+                            error = %err,
+                            "Gateway shutdown retained running sandboxes; count unavailable"
+                        );
+                        Ok(())
+                    }
+                }
+            }
+        };
 
         #[cfg(unix)]
         let process_result = if let Some(process) = &self.driver_process {
@@ -2727,6 +2777,25 @@ impl ComputeRuntime {
                 "{stop_err}; managed driver process shutdown failed: {process_err}"
             )),
         }
+    }
+
+    /// Count persisted sandboxes whose phase carries running intent, the
+    /// set the stop sweep would have stopped.
+    async fn count_running_intent_sandboxes(&self) -> Result<usize, String> {
+        let records = self
+            .store
+            .collect_records(Sandbox::object_type(), ObjectListQuery::AllWorkspaces)
+            .await
+            .map_err(|err| format!("failed to list sandboxes for gateway shutdown: {err}"))?;
+        Ok(records
+            .iter()
+            .filter_map(|record| Sandbox::decode(record.payload.as_slice()).ok())
+            .filter(|sandbox| {
+                sandbox_phase_should_be_running(
+                    SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown),
+                )
+            })
+            .count())
     }
 
     /// Stop local compute during graceful gateway shutdown without changing
@@ -12655,6 +12724,127 @@ mod tests {
             SandboxPhase::Ready,
             "gateway shutdown must retain logical running intent"
         );
+    }
+
+    async fn runtime_with_running_and_stopped_sandboxes(
+        driver: Arc<ControlledDriver>,
+    ) -> ComputeRuntime {
+        let runtime =
+            test_runtime_with_gateway_managed_lifecycle(driver.clone(), "arbitrary").await;
+        for (id, name, phase) in [
+            ("sb-ready", "ready", SandboxPhase::Ready),
+            ("sb-prov", "prov", SandboxPhase::Provisioning),
+            ("sb-stopped", "stopped", SandboxPhase::Stopped),
+        ] {
+            runtime
+                .store
+                .put_message(&sandbox_record(id, name, phase))
+                .await
+                .unwrap();
+        }
+        runtime
+    }
+
+    fn disposition(value: Option<&str>) -> ResolvedDisposition {
+        crate::shutdown_disposition::ShutdownDispositionConfig {
+            value: value.map(str::to_owned),
+            file: None,
+        }
+        .resolve()
+    }
+
+    fn sorted_stop_ids(driver: &ControlledDriver) -> Vec<String> {
+        let mut ids = driver
+            .stop_requests()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn cleanup_on_shutdown_default_disposition_runs_stop_sweep() {
+        let driver = ControlledDriver::new();
+        let runtime = runtime_with_running_and_stopped_sandboxes(driver.clone()).await;
+
+        runtime
+            .cleanup_on_shutdown(disposition(None))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sorted_stop_ids(&driver),
+            vec!["sb-prov".to_string(), "sb-ready".to_string()],
+            "an unset disposition must keep the historical stop sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_on_shutdown_unknown_disposition_runs_stop_sweep() {
+        for raw in ["", "retain", "skip-cleanup", "Retain-Running-Sandboxes"] {
+            let driver = ControlledDriver::new();
+            let runtime = runtime_with_running_and_stopped_sandboxes(driver.clone()).await;
+
+            runtime
+                .cleanup_on_shutdown(disposition(Some(raw)))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                sorted_stop_ids(&driver),
+                vec!["sb-prov".to_string(), "sb-ready".to_string()],
+                "unknown disposition {raw:?} must select the stop sweep"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_on_shutdown_retain_skips_only_the_stop_sweep() {
+        let driver = ControlledDriver::new();
+        let mut runtime = runtime_with_running_and_stopped_sandboxes(driver.clone()).await;
+
+        // A managed driver process must still be shut down in retain mode.
+        let dir = tempfile::tempdir().unwrap();
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        runtime.driver_process = Some(Arc::new(ManagedDriverProcess::new(
+            child,
+            dir.path().join("driver.sock"),
+        )));
+
+        runtime
+            .cleanup_on_shutdown(disposition(Some("retain-running-sandboxes")))
+            .await
+            .unwrap();
+
+        assert_eq!(driver.stop_calls(), 0, "retain must not stop any sandbox");
+        for (id, phase) in [
+            ("sb-ready", SandboxPhase::Ready),
+            ("sb-prov", SandboxPhase::Provisioning),
+        ] {
+            let stored = runtime
+                .store
+                .get_message::<Sandbox>(id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                SandboxPhase::try_from(stored.phase()).unwrap(),
+                phase,
+                "retain must keep running intent for {id}"
+            );
+        }
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.cast_signed()), None).is_err(),
+            "retain must still shut down the managed driver process"
+        );
+        assert_eq!(runtime.count_running_intent_sandboxes().await.unwrap(), 2);
     }
 
     #[tokio::test]
